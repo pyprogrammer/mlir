@@ -31,7 +31,7 @@
 #bound_map2 = (i)[s] -> (i + s, i - s)
 
 // All maps appear in arbitrary order before all sets, in arbitrary order.
-// CHECK-EMPTY
+// CHECK-NOT: Placeholder
 
 // CHECK-DAG: #set{{[0-9]+}} = (d0)[s0, s1] : (d0 >= 0, -d0 + s0 >= 0, s0 - 5 == 0, -d0 + s1 + 1 >= 0)
 #set0 = (i)[N, M] : (i >= 0, -i + N >= 0, N - 5 == 0, -i + M + 1 >= 0)
@@ -526,7 +526,6 @@ func @externalfuncattr() -> ()
 
 // CHECK-LABEL: func @funcattrempty
 func @funcattrempty() -> ()
-  // CHECK-EMPTY
   attributes {}
 
 // CHECK-LABEL: func @funcattr
@@ -539,7 +538,6 @@ func @funcattr() -> ()
 
 // CHECK-LABEL: func @funcattrwithblock
 func @funcattrwithblock() -> ()
-  // CHECK-EMPTY
   attributes {} {
 ^bb0:
   return
@@ -862,5 +860,16 @@ func @pretty_dialect_type() {
 
   // CHECK: %2 = "foo.unknown_op"() : () -> !foo.complextype<abcd<f32>>
   %2 = "foo.unknown_op"() : () -> !foo.complextype<abcd<f32>>
+
+  // CHECK: %3 = "foo.unknown_op"() : () -> !foo.complextype<abcd<[f]$$[32]>>
+  %3 = "foo.unknown_op"() : () -> !foo.complextype<abcd<[f]$$[32]>>
+
+  // CHECK: %4 = "foo.unknown_op"() : () -> !foo.dialect<!x@#!@#>
+  %4 = "foo.unknown_op"() : () -> !foo.dialect<!x@#!@#>
+
+  // Extraneous extra > character can't use the pretty syntax.
+  // CHECK: %5 = "foo.unknown_op"() : () -> !foo<"dialect<!x@#!@#>>">
+  %5 = "foo.unknown_op"() : () -> !foo<"dialect<!x@#!@#>>">
+
   return
 }

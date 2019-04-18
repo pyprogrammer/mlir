@@ -21,11 +21,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Support/STLExtras.h"
+#include "mlir/TableGen/Format.h"
 #include "mlir/TableGen/GenInfo.h"
 #include "mlir/TableGen/OpTrait.h"
 #include "mlir/TableGen/Operator.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/TableGen/Error.h"
 #include "llvm/TableGen/Record.h"
@@ -33,8 +33,7 @@
 
 using namespace llvm;
 using namespace mlir;
-
-using mlir::tblgen::Operator;
+using namespace mlir::tblgen;
 
 static const char *const tblgenNamePrefix = "tblgen_";
 static const char *const generatedArgName = "tblgen_arg";
@@ -51,31 +50,12 @@ static const char *const opCommentHeader = R"(
 // Utility structs and functions
 //===----------------------------------------------------------------------===//
 
-// Variation of method in FormatVariadic.h which takes a StringRef as input
-// instead.
-template <typename... Ts>
-inline auto formatv(StringRef fmt, Ts &&... vals) -> formatv_object<decltype(
-    std::make_tuple(detail::build_format_adapter(std::forward<Ts>(vals))...))> {
-  using ParamTuple = decltype(
-      std::make_tuple(detail::build_format_adapter(std::forward<Ts>(vals))...));
-  return llvm::formatv_object<ParamTuple>(
-      fmt,
-      std::make_tuple(detail::build_format_adapter(std::forward<Ts>(vals))...));
-}
-
 // Returns whether the record has a value of the given name that can be returned
 // via getValueAsString.
 static inline bool hasStringAttribute(const Record &record,
                                       StringRef fieldName) {
   auto valueInit = record.getValueInit(fieldName);
   return isa<CodeInit>(valueInit) || isa<StringInit>(valueInit);
-}
-
-// Returns the given `op`'s qualified C++ class name.
-static std::string getOpQualClassName(const Record &op) {
-  SmallVector<StringRef, 2> splittedName;
-  llvm::SplitString(op.getName(), splittedName, "_");
-  return llvm::join(splittedName, "::");
 }
 
 static std::string getArgumentName(const Operator &op, int index) {
@@ -145,6 +125,7 @@ public:
 
   OpMethodBody &operator<<(Twine content);
   OpMethodBody &operator<<(int content);
+  OpMethodBody &operator<<(const FmtObjectBase &content);
 
   void writeTo(raw_ostream &os) const;
 
@@ -260,6 +241,12 @@ OpMethodBody &OpMethodBody::operator<<(Twine content) {
 OpMethodBody &OpMethodBody::operator<<(int content) {
   if (isEffective)
     body.append(std::to_string(content));
+  return *this;
+}
+
+OpMethodBody &OpMethodBody::operator<<(const FmtObjectBase &content) {
+  if (isEffective)
+    body.append(content.str());
   return *this;
 }
 
@@ -429,46 +416,41 @@ void OpEmitter::emitDecl(raw_ostream &os) { opClass.writeDeclTo(os); }
 void OpEmitter::emitDef(raw_ostream &os) { opClass.writeDefTo(os); }
 
 void OpEmitter::genAttrGetters() {
+  FmtContext fctx;
+  fctx.withBuilder("mlir::Builder(this->getContext())");
   for (auto &namedAttr : op.getAttributes()) {
-    auto name = namedAttr.getName();
+    const auto &name = namedAttr.name;
     const auto &attr = namedAttr.attr;
 
-    // Determine the name of the attribute getter. The name matches the
-    // attribute name excluding dialect prefix.
-    StringRef getter = name;
-    auto it = getter.split('.');
-    if (!it.second.empty())
-      getter = it.second;
-
-    auto &method = opClass.newMethod(attr.getReturnType(), getter,
-                                     /*params=*/"");
+    auto &method = opClass.newMethod(attr.getReturnType(), name);
+    auto &body = method.body();
 
     // Emit the derived attribute body.
     if (attr.isDerivedAttr()) {
-      method.body() << "  " << attr.getDerivedCodeBody() << "\n";
+      body << "  " << attr.getDerivedCodeBody() << "\n";
       continue;
     }
 
     // Emit normal emitter.
 
     // Return the queried attribute with the correct return type.
-    std::string attrVal =
-        formatv("this->getAttr(\"{1}\").dyn_cast_or_null<{0}>()",
-                attr.getStorageType(), name);
-    method.body() << "  auto attr = " << attrVal << ";\n";
-    if (attr.hasDefaultValue()) {
+    auto attrVal = formatv("this->getAttr(\"{0}\").dyn_cast_or_null<{1}>()",
+                           name, attr.getStorageType());
+    body << "  auto attr = " << attrVal << ";\n";
+    if (attr.hasDefaultValueInitializer()) {
       // Returns the default value if not set.
       // TODO: this is inefficient, we are recreating the attribute for every
       // call. This should be set instead.
-      method.body() << "    if (!attr)\n"
-                       "      return "
-                    << formatv(attr.getConvertFromStorageCall(),
-                               formatv(attr.getDefaultValueTemplate(),
-                                       "mlir::Builder(this->getContext())"))
-                    << ";\n";
+      std::string defaultValue = tgfmt(attr.getConstBuilderTemplate(), &fctx,
+                                       attr.getDefaultValueInitializer());
+      body << "    if (!attr)\n      return "
+           << tgfmt(attr.getConvertFromStorageCall(),
+                    &fctx.withSelf(defaultValue))
+           << ";\n";
     }
-    method.body() << "  return "
-                  << formatv(attr.getConvertFromStorageCall(), "attr") << ";\n";
+    body << "  return "
+         << tgfmt(attr.getConvertFromStorageCall(), &fctx.withSelf("attr"))
+         << ";\n";
   }
 }
 
@@ -566,6 +548,8 @@ void OpEmitter::genStandaloneParamBuilder(bool useOperandType,
   auto &method =
       opClass.newMethod("void", "build", paramList, OpMethod::MP_Static);
 
+  bool hasVariadicOperand = op.hasVariadicOperand();
+
   // Push all result types to the result
   if (numResults > 0) {
     if (!useOperandType && !useAttrType) {
@@ -596,7 +580,10 @@ void OpEmitter::genStandaloneParamBuilder(bool useOperandType,
           resultType = formatv("{0}.getType()", namedAttr.name);
         }
       } else {
-        resultType = formatv("{0}->getType()", getArgumentName(op, 0)).str();
+        const char *index =
+            (numOperands == 1 && hasVariadicOperand) ? ".front()" : "";
+        resultType =
+            formatv("{0}{1}->getType()", getArgumentName(op, 0), index).str();
       }
       method.body() << "  " << builderOpState << "->addTypes({" << resultType;
       for (unsigned i = 1; i != numResults; ++i)
@@ -606,7 +593,6 @@ void OpEmitter::genStandaloneParamBuilder(bool useOperandType,
   }
 
   // Push all operands to the result
-  bool hasVariadicOperand = op.hasVariadicOperand();
   int numNonVariadicOperands =
       numOperands - static_cast<int>(hasVariadicOperand);
   if (numNonVariadicOperands > 0) {
@@ -629,9 +615,8 @@ void OpEmitter::genStandaloneParamBuilder(bool useOperandType,
       if (emitNotNullCheck) {
         method.body() << formatv("  if ({0}) ", namedAttr.name) << "{\n";
       }
-      method.body() << formatv("  {0}->addAttribute(\"{1}\", {2});\n",
-                               builderOpState, namedAttr.getName(),
-                               namedAttr.name);
+      method.body() << formatv("  {0}->addAttribute(\"{1}\", {1});\n",
+                               builderOpState, namedAttr.name);
       if (emitNotNullCheck) {
         method.body() << "  }\n";
       }
@@ -696,16 +681,18 @@ void OpEmitter::genBuilder() {
   auto &body = m.body();
 
   // Result types
-  body << "  assert(resultTypes.size()" << (hasVariadicResult ? " >= " : " == ")
-       << numNonVariadicResults
-       << "u && \"mismatched number of return types\");\n"
-       << "  " << builderOpState << "->addTypes(resultTypes);\n";
+  if (!(hasVariadicResult && numNonVariadicResults == 0))
+    body << "  assert(resultTypes.size()"
+         << (hasVariadicResult ? " >= " : " == ") << numNonVariadicResults
+         << "u && \"mismatched number of return types\");\n";
+  body << "  " << builderOpState << "->addTypes(resultTypes);\n";
 
   // Operands
-  body << "  assert(operands.size()" << (hasVariadicOperand ? " >= " : " == ")
-       << numNonVariadicOperands
-       << "u && \"mismatched number of parameters\");\n"
-       << "  " << builderOpState << "->addOperands(operands);\n\n";
+  if (!(hasVariadicOperand && numNonVariadicOperands == 0))
+    body << "  assert(operands.size()" << (hasVariadicOperand ? " >= " : " == ")
+         << numNonVariadicOperands
+         << "u && \"mismatched number of parameters\");\n";
+  body << "  " << builderOpState << "->addOperands(operands);\n\n";
 
   // Attributes
   body << "  for (const auto& pair : attributes)\n"
@@ -792,6 +779,8 @@ void OpEmitter::genVerifier() {
 
   auto &method = opClass.newMethod("LogicalResult", "verify", /*params=*/"");
   auto &body = method.body();
+  FmtContext fctx;
+  fctx.withOp("(*this->getOperation())");
 
   // Verify the attributes have the correct type.
   for (const auto &namedAttr : op.getAttributes()) {
@@ -800,13 +789,14 @@ void OpEmitter::genVerifier() {
     if (attr.isDerivedAttr())
       continue;
 
-    auto attrName = namedAttr.getName();
+    auto attrName = namedAttr.name;
     // Prefix with `tblgen_` to avoid hiding the attribute accessor.
-    auto varName = tblgenNamePrefix + namedAttr.name;
+    auto varName = tblgenNamePrefix + attrName;
     body << formatv("  auto {0} = this->getAttr(\"{1}\");\n", varName,
                     attrName);
 
-    bool allowMissingAttr = attr.hasDefaultValue() || attr.isOptional();
+    bool allowMissingAttr =
+        attr.hasDefaultValueInitializer() || attr.isOptional();
     if (allowMissingAttr) {
       // If the attribute has a default value, then only verify the predicate if
       // set. This does effectively assume that the default value is valid.
@@ -820,10 +810,11 @@ void OpEmitter::genVerifier() {
 
     auto attrPred = attr.getPredicate();
     if (!attrPred.isNull()) {
-      body << formatv("    if (!({0})) return emitOpError(\"attribute '{1}' "
-                      "failed to satisfy constraint: {2}\");\n",
-                      formatv(attrPred.getCondition(), varName), attrName,
-                      attr.getDescription());
+      body << tgfmt("    if (!($0)) return emitOpError(\"attribute '$1' "
+                    "failed to satisfy constraint: $2\");\n",
+                    /*ctx=*/nullptr,
+                    tgfmt(attrPred.getCondition(), &fctx.withSelf(varName)),
+                    attrName, attr.getDescription());
     }
 
     body << "  }\n";
@@ -841,10 +832,10 @@ void OpEmitter::genVerifier() {
     if (value.hasPredicate()) {
       auto description = value.constraint.getDescription();
       body << "  if (!("
-           << formatv(value.constraint.getConditionTemplate(),
-                      "this->getOperation()->get" +
-                          Twine(isOperand ? "Operand" : "Result") + "(" +
-                          Twine(index) + ")->getType()")
+           << tgfmt(value.constraint.getConditionTemplate(),
+                    &fctx.withSelf("this->getOperation()->get" +
+                                   Twine(isOperand ? "Operand" : "Result") +
+                                   "(" + Twine(index) + ")->getType()"))
            << "))\n";
       body << "    return emitOpError(\"" << (isOperand ? "operand" : "result")
            << " #" << index
@@ -864,11 +855,10 @@ void OpEmitter::genVerifier() {
 
   for (auto &trait : op.getTraits()) {
     if (auto t = dyn_cast<tblgen::PredOpTrait>(&trait)) {
-      body << "  if (!("
-           << formatv(t->getPredTemplate().c_str(), "(*this->getOperation())")
-           << "))\n";
-      body << "    return emitOpError(\"failed to verify that "
-           << t->getDescription() << "\");\n";
+      body << tgfmt("  if (!($0))\n    return emitOpError(\""
+                    "failed to verify that $1\");\n",
+                    &fctx, tgfmt(t->getPredTemplate(), &fctx),
+                    t->getDescription());
     }
   }
 
@@ -919,17 +909,7 @@ void OpEmitter::genTraits() {
       opClass.addTrait("AtLeastNOperands<" + Twine(numOperands - 1) +
                        ">::Impl");
   } else {
-    switch (numOperands) {
-    case 0:
-      opClass.addTrait("ZeroOperands");
-      break;
-    case 1:
-      opClass.addTrait("OneOperand");
-      break;
-    default:
-      opClass.addTrait("NOperands<" + Twine(numOperands) + ">::Impl");
-      break;
-    }
+    opClass.addTrait("NOperands<" + Twine(numOperands) + ">::Impl");
   }
 }
 
@@ -945,10 +925,14 @@ static void emitOpClasses(const std::vector<Record *> &defs, raw_ostream &os,
   IfDefScope scope("GET_OP_CLASSES", os);
   for (auto *def : defs) {
     if (emitDecl) {
-      os << formatv(opCommentHeader, getOpQualClassName(*def), "declarations");
+      os << formatv(opCommentHeader,
+                    Operator::getQualCppClassName(def->getName()),
+                    "declarations");
       OpEmitter::emitDecl(*def, os);
     } else {
-      os << formatv(opCommentHeader, getOpQualClassName(*def), "definitions");
+      os << formatv(opCommentHeader,
+                    Operator::getQualCppClassName(def->getName()),
+                    "definitions");
       OpEmitter::emitDef(*def, os);
     }
   }
@@ -959,7 +943,10 @@ static void emitOpList(const std::vector<Record *> &defs, raw_ostream &os) {
   IfDefScope scope("GET_OP_LIST", os);
 
   interleave(
-      defs, [&os](Record *def) { os << getOpQualClassName(*def); },
+      defs,
+      [&os](Record *def) {
+        os << Operator::getQualCppClassName(def->getName());
+      },
       [&os]() { os << ",\n"; });
 }
 

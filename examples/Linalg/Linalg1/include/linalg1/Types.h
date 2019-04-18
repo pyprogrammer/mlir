@@ -23,9 +23,9 @@
 namespace linalg {
 
 enum LinalgTypes {
-  Range = mlir::Type::FIRST_LINALG_TYPE,
+  Range = mlir::Type::FIRST_PRIVATE_EXPERIMENTAL_0_TYPE,
   View,
-  LAST_USED_LINALG_TYPE = View,
+  FIRST_PRIVATE_EXPERIMENTAL_0_TYPE = View,
 };
 
 } // namespace linalg

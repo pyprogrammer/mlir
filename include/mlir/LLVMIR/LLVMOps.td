@@ -29,7 +29,7 @@ include "mlir/IR/OpBase.td"
 #endif // OP_BASE
 
 // LLVM IR type wrapped in MLIR.
-def LLVM_Type : Type<CPred<"{0}.isa<::mlir::LLVM::LLVMType>()">,
+def LLVM_Type : Type<CPred<"$_self.isa<::mlir::LLVM::LLVMType>()">,
                      "LLVM dialect type">;
 
 // Base class for LLVM operations.  All operations get an "llvm." prefix in
@@ -148,6 +148,9 @@ def LLVM_UDivOp : LLVM_ArithmeticOp<"udiv", "CreateUDiv">;
 def LLVM_SDivOp : LLVM_ArithmeticOp<"sdiv", "CreateSDiv">;
 def LLVM_URemOp : LLVM_ArithmeticOp<"urem", "CreateURem">;
 def LLVM_SRemOp : LLVM_ArithmeticOp<"srem", "CreateSRem">;
+def LLVM_AndOp : LLVM_ArithmeticOp<"and", "CreateAnd">;
+def LLVM_OrOp : LLVM_ArithmeticOp<"or", "CreateOr">;
+def LLVM_XOrOp : LLVM_ArithmeticOp<"xor", "CreateXor">;
 
 // Other integer operations.
 def LLVM_ICmpOp : LLVM_OneResultOp<"icmp", [NoSideEffect]>,
