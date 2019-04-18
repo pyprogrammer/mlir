@@ -1,5 +1,6 @@
 include_directories(include/)
 add_subdirectory(lib)
+add_subdirectory(test/)
 
 set(LLVM_LINK_COMPONENTS
         Core
@@ -7,4 +8,5 @@ set(LLVM_LINK_COMPONENTS
         )
 
 add_custom_target(ConstellationCompiler)
+
 add_dependencies(ConstellationCompiler ConstellationCore)

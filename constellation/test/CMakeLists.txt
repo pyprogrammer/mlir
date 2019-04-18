@@ -1,11 +1,11 @@
-add_llvm_library(ConstellationCore
-        ConstellationDialect.cpp
-        Lattice.cpp
-        )
+add_llvm_example(
+        const-input-1
+        ConstellationInputExample.cpp
+)
 
-target_link_libraries(
-        ConstellationCore
+target_link_libraries(const-input-1
         PRIVATE
+        ConstellationCore
         MLIRAnalysis
         MLIRDialect
         MLIREDSC
@@ -14,4 +14,4 @@ target_link_libraries(
         MLIRParser
         MLIRPass
         MLIRTransforms
-)
+        )
