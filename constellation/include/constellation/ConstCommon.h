@@ -35,5 +35,45 @@
 // For Printing
 #include "mlir/Support/LLVM.h"
 #include "mlir/IR/OpDefinition.h"
+#include "mlir/IR/OpImplementation.h"
+
+/// A basic function builder
+inline mlir::Function *makeFunction(mlir::Module &module, llvm::StringRef name,
+                                    llvm::ArrayRef<mlir::Type> types,
+                                    llvm::ArrayRef<mlir::Type> resultTypes) {
+    auto *context = module.getContext();
+    auto *function = new mlir::Function(
+            mlir::UnknownLoc::get(context), name,
+            mlir::FunctionType::get({types}, resultTypes, context));
+    function->addEntryBlock();
+    module.getFunctions().push_back(function);
+    return function;
+}
+
+/// A basic pass manager pre-populated with cleanup passes.
+inline std::unique_ptr<mlir::PassManager> cleanupPassManager() {
+    std::unique_ptr<mlir::PassManager> pm(new mlir::PassManager());
+    pm->addPass(mlir::createCanonicalizerPass());
+    pm->addPass(mlir::createSimplifyAffineStructuresPass());
+    pm->addPass(mlir::createCSEPass());
+    pm->addPass(mlir::createCanonicalizerPass());
+    return pm;
+}
+
+inline void cleanupAndPrintFunction(mlir::Function *f) {
+    bool printToOuts = true;
+    auto check = [f, &printToOuts](mlir::LogicalResult result) {
+        if (failed(result)) {
+            f->getContext()->emitError(f->getLoc(),
+                                       "Verification and cleanup passes failed");
+            printToOuts = false;
+        }
+    };
+    auto pm = cleanupPassManager();
+    check(f->getModule()->verify());
+    check(pm->run(f->getModule()));
+    if (printToOuts)
+        f->print(llvm::outs());
+}
 
 #endif //LLVM_CONSTELLATION_COMMON_H

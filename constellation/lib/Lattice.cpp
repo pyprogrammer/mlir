@@ -11,13 +11,12 @@ namespace constellation {
         assert(params->getType().isa<mlir::RankedTensorType>() && "Lattice parameters should be a ranked tensor.");
 
         result->addOperands({input, params});
-        result->addTypes({params->getType().cast<mlir::VectorType>().getElementType()});
+        result->addTypes({params->getType().cast<mlir::RankedTensorType>().getElementType()});
         result->addAttribute("type", b->getIntegerAttr(b->getIntegerType(sizeof(LatticeType)), latticeType));
     }
 
     bool LatticeOp::parse(mlir::OpAsmParser *parser, mlir::OperationState *result) {
         llvm_unreachable("Cannot parse LatticeOp");
-        return false;
     }
 
     unsigned LatticeOp::ndim() {
@@ -27,7 +26,7 @@ namespace constellation {
     mlir::LogicalResult LatticeOp::verify() {
         unsigned param_dim = getOperand(1)->getType().cast<mlir::RankedTensorType>().getRank();
         // check if all dimensions agree
-        if (ndim()  == param_dim) {
+        if (ndim() != param_dim) {
             return emitOpError("Lattice input and parameter dimensions should agree.");
         }
         return mlir::success();
@@ -47,6 +46,15 @@ namespace constellation {
     }
 
     void LatticeOp::print(mlir::OpAsmPrinter *p) {
-        *p << getOperationName();
+        *p << getOperationName() << " " << TypeToString(getLatticeType()) << " " << input() << " " << params() << ":"
+        << "(" << input()->getType() << ")" << "[" << params()->getType() << "]" << " -> " << getType();
+    }
+
+    mlir::Value* LatticeOp::input() {
+        return getOperand(0);
+    }
+
+    mlir::Value* LatticeOp::params() {
+        return getOperand(1);
     }
 }

@@ -6,13 +6,12 @@
 #define LLVM_CONSTELLATION_INTRINSICS_H
 
 #include "mlir/EDSC/Intrinsics.h"
+#include "constellation/Lattice.h"
 
 namespace constellation {
 namespace intrinsics {
 
-using range = mlir::edsc::intrinsics::ValueBuilder<RangeOp>;
-using slice = mlir::edsc::intrinsics::ValueBuilder<SliceOp>;
-using view = mlir::edsc::intrinsics::ValueBuilder<ViewOp>;
+using lattice = mlir::edsc::intrinsics::ValueBuilder<LatticeOp>;
 
 }
 }

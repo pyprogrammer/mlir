@@ -5,6 +5,7 @@
 #include "mlir/IR/Dialect.h"
 
 #include "constellation/ConstCommon.h"
+#include "constellation/ConstellationOps.h"
 
 #ifndef LLVM_CONSTELLATION_CONSTELLATIONDIALECT_H
 #define LLVM_CONSTELLATION_CONSTELLATIONDIALECT_H

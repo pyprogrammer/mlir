@@ -22,21 +22,43 @@
 #include "mlir/IR/Function.h"
 
 #include "constellation/ConstCommon.h"
+#include "constellation/Intrinsics.h"
 
 using namespace mlir;
 using namespace mlir::edsc;
 using namespace mlir::edsc::intrinsics;
 
-TEST_FUNC(view_op) {
+/*
+ * /// A basic function builder
+inline mlir::Function *makeFunction(mlir::Module &module, llvm::StringRef name,
+                                    llvm::ArrayRef<mlir::Type> types,
+                                    llvm::ArrayRef<mlir::Type> resultTypes) {
+  auto *context = module.getContext();
+  auto *function = new mlir::Function(
+      mlir::UnknownLoc::get(context), name,
+      mlir::FunctionType::get({types}, resultTypes, context));
+  function->addEntryBlock();
+  module.getFunctions().push_back(function);
+  return function;
+}
+ */
+
+TEST_FUNC(simplex_lattice) {
     MLIRContext context;
     Module module(&context);
 
-    // Let's be lazy and define some custom ops that prevent DCE.
-//    CustomOperation<OperationHandle> some_consumer("some_consumer");
-//
-//    some_consumer();
-//    ret();
-
+    auto fltType = mlir::FloatType::getF64(&context);
+    auto vecType = mlir::VectorType::get({5}, fltType);
+    auto paramType = mlir::RankedTensorType::get({2, 4, 8, 16, 32}, fltType);
+    {
+        Function* f = makeFunction(module, "constellation.lattice", {vecType, paramType}, {fltType});
+        ScopedContext sc(f);
+        ValueHandle in(f->getArgument(0));
+        ValueHandle params(f->getArgument(1));
+        auto lat = constellation::intrinsics::lattice({in, params, constellation::LatticeOp::SIMPLEX});
+        ret(lat.getValue());
+        cleanupAndPrintFunction(f);
+    }
 }
 
 int main() {

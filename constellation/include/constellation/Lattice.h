@@ -21,6 +21,8 @@ namespace constellation {
             HYPERCUBE
         };
 
+        using Op::Op;
+
         //////////////////////////////////////////////////////////////////////////////
         // Hooks to customize the behavior of this op.
         //////////////////////////////////////////////////////////////////////////////
@@ -37,6 +39,9 @@ namespace constellation {
         //////////////////////////////////////////////////////////////////////////////
         unsigned ndim();
         LatticeType getLatticeType();
+
+        mlir::Value* input();
+        mlir::Value* params();
 
     private:
         static std::map<LatticeType, std::string> name_map_;
