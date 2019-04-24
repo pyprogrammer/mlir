@@ -15,7 +15,7 @@ namespace constellation {
         using mlir::edsc::intrinsics::OperationBuilder;
         using lattice = ValueBuilder<lattice::LatticeOp>;
         using read = ValueBuilder<IO::ReadOp>;
-        using write = OperationBuilder<IO::WriteOp>;
+        using write = ValueBuilder<IO::WriteOp>;
     }
 }
 

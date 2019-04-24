@@ -30,6 +30,7 @@ namespace constellation {
             setAccessMode(b, state, accessMode);
             state->addAttribute("url", b->getStringAttr(url));
             state->addOperands({data});
+            state->addTypes({b->getIntegerType(8)});
         }
 
         mlir::LogicalResult WriteOp::verify() {

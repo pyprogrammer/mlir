@@ -61,8 +61,7 @@ namespace constellation {
             //////////////////////////////////////////////////////////////////////////////
         };
 
-        class WriteOp : public mlir::Op<WriteOp, mlir::OpTrait::OneOperand, mlir::OpTrait::ZeroResult,
-                mlir::OpTrait::IsTerminator>,
+        class WriteOp : public mlir::Op<WriteOp, mlir::OpTrait::OneOperand, mlir::OpTrait::OneResult>,
                         public internal::HasAccessMode<WriteOp> {
         public:
 
