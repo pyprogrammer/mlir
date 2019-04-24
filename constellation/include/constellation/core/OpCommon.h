@@ -5,7 +5,7 @@
 #ifndef CONSTELLATION_OPCOMMON_H
 #define CONSTELLATION_OPCOMMON_H
 
-#include "constellation/EnumUtils.h"
-#include "constellation/Memory.h"
+#include "EnumUtils.h"
+#include "Memory.h"
 
 #endif //CONSTELLATION_OPCOMMON_H

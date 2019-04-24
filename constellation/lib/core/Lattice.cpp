@@ -2,7 +2,7 @@
 // Created by Nathan Zhang on 4/17/19.
 //
 
-#include "constellation/Lattice.h"
+#include "constellation/core/Lattice.h"
 
 namespace constellation {
     namespace lattice {

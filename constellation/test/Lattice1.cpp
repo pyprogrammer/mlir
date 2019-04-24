@@ -17,12 +17,12 @@
 
 // RUN: %p/test | FileCheck %s
 
-#include <constellation/ConstellationDialect.h>
+#include <constellation/core/ConstellationDialect.h>
 #include "TestHarness.h"
 #include "mlir/IR/Function.h"
 
-#include "constellation/ConstCommon.h"
-#include "constellation/Intrinsics.h"
+#include "constellation/core/ConstCommon.h"
+#include "constellation/core/Intrinsics.h"
 
 using namespace mlir;
 using namespace mlir::edsc;

@@ -4,8 +4,8 @@
 
 #include "mlir/IR/Dialect.h"
 
-#include "constellation/ConstCommon.h"
-#include "constellation/ConstellationOps.h"
+#include "ConstCommon.h"
+#include "ConstellationOps.h"
 
 #ifndef CONSTELLATION_CONSTELLATIONDIALECT_H
 #define CONSTELLATION_CONSTELLATIONDIALECT_H

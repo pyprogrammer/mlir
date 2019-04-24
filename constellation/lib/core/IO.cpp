@@ -2,7 +2,7 @@
 // Created by Nathan Zhang on 4/19/19.
 //
 
-#include "constellation/IO.h"
+#include "constellation/core/IO.h"
 
 namespace constellation {
     namespace IO {

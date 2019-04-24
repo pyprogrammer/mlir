@@ -6,8 +6,8 @@
 #define CONSTELLATION_INTRINSICS_H
 
 #include "mlir/EDSC/Intrinsics.h"
-#include "constellation/Lattice.h"
-#include "constellation/IO.h"
+#include "Lattice.h"
+#include "IO.h"
 
 namespace constellation {
     namespace intrinsics {

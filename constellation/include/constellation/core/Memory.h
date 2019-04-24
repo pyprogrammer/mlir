@@ -10,7 +10,7 @@
 #include "mlir/IR/TypeSupport.h"
 #include "mlir/IR/Types.h"
 
-#include "constellation/ConstexprUtils.h"
+#include "ConstexprUtils.h"
 
 namespace constellation {
     class Memory {

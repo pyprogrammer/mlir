@@ -2,7 +2,7 @@
 // Created by Nathan Zhang on 4/10/19.
 //
 
-#include "constellation/ConstellationDialect.h"
+#include "constellation/core/ConstellationDialect.h"
 
 namespace constellation {
     ConstellationDialect::ConstellationDialect(mlir::MLIRContext *ctx) : mlir::Dialect("constellation", ctx) {

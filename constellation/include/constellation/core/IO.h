@@ -7,8 +7,8 @@
 
 #include <map>
 
-#include "constellation/ConstCommon.h"
-#include "constellation/OpCommon.h"
+#include "ConstCommon.h"
+#include "OpCommon.h"
 
 
 namespace constellation {
