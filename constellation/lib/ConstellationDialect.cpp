@@ -5,8 +5,8 @@
 #include "constellation/ConstellationDialect.h"
 
 namespace constellation {
-    ConstellationDialect::ConstellationDialect(mlir::MLIRContext *ctx): mlir::Dialect("constellation", ctx) {
-        addOperations<lattice::LatticeOp, IO::ReadOp>();
+    ConstellationDialect::ConstellationDialect(mlir::MLIRContext *ctx) : mlir::Dialect("constellation", ctx) {
+        addOperations<lattice::LatticeOp, IO::ReadOp, IO::WriteOp>();
     };
 
     mlir::Type ConstellationDialect::parseType(llvm::StringRef spec, mlir::Location loc) const {

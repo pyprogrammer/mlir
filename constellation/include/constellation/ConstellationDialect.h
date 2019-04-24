@@ -15,7 +15,7 @@ namespace constellation {
     class ConstellationDialect : public mlir::Dialect {
 
     public:
-        explicit ConstellationDialect(mlir::MLIRContext* ctx);
+        explicit ConstellationDialect(mlir::MLIRContext *ctx);
 
         /// Parse a type registered to this dialect.
         mlir::Type parseType(llvm::StringRef spec, mlir::Location loc) const override;

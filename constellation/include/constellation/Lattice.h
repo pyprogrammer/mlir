@@ -24,7 +24,7 @@ namespace constellation {
         class LatticeOp : public mlir::Op<LatticeOp, mlir::OpTrait::NOperands<2>::Impl,
                 mlir::OpTrait::OneResult,
                 mlir::OpTrait::HasNoSideEffect,
-                mlir::OpTrait::ResultsAreFloatLike>{
+                mlir::OpTrait::ResultsAreFloatLike> {
         public:
 
             using Op::Op;

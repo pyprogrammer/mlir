@@ -36,7 +36,7 @@ TEST_FUNC(simplex_lattice) {
     auto vecType = mlir::VectorType::get({5}, fltType);
     auto paramType = mlir::RankedTensorType::get({2, 4, 8, 16, 32}, fltType);
     {
-        Function* f = makeFunction(module, "lattice", {vecType, paramType}, {fltType});
+        Function *f = makeFunction(module, "lattice", {vecType, paramType}, {fltType});
         ScopedContext sc(f);
         ValueHandle in(f->getArgument(0));
         ValueHandle params(f->getArgument(1));

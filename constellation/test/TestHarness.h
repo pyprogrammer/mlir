@@ -25,18 +25,18 @@ namespace test_detail {
 // Returns a mutable list of known test functions.  Used internally by test
 // macros to add and run tests.  This function is static to ensure it creates a
 // new list in each test file.
-static std::vector<std::function<void()>> &tests() {
-  static std::vector<std::function<void()>> list;
-  return list;
-}
+    static std::vector<std::function<void()>> &tests() {
+        static std::vector<std::function<void()>> list;
+        return list;
+    }
 
 // Test registration class.  Used internally by test macros to register tests
 // during static allocation.
-struct TestRegistration {
-  explicit TestRegistration(std::function<void()> func) {
-    test_detail::tests().push_back(func);
-  }
-};
+    struct TestRegistration {
+        explicit TestRegistration(std::function<void()> func) {
+            test_detail::tests().push_back(func);
+        }
+    };
 } // end namespace test_detail
 
 /// Declares a test function with the given name and adds it to the list of

@@ -10,10 +10,9 @@ namespace constellation {
                            constellation::IO::AccessMode accessMode, mlir::Type resultType) {
             // The type of the result should match the type of the file, but isn't checkable since the file doesn't
             // necessarily have to exist.
-            result->addTypes({resultType});
             setAccessMode(b, result, accessMode);
-
             result->addAttribute("url", b->getStringAttr(url));
+            result->addTypes({resultType});
         }
 
         mlir::LogicalResult ReadOp::verify() {
@@ -22,8 +21,24 @@ namespace constellation {
             return mlir::success();
         }
 
-        bool ReadOp::parse(mlir::OpAsmParser *parser, mlir::OperationState *result) {
-            llvm_unreachable("Parse not implemented for ReadOp");
+//        bool ReadOp::parse(mlir::OpAsmParser *parser, mlir::OperationState *result) {
+//            llvm_unreachable("Parse not implemented for ReadOp");
+//        }
+
+        void WriteOp::build(mlir::Builder *b, mlir::OperationState *result, std::string url,
+                            constellation::IO::AccessMode accessMode, mlir::Value *data) {
+            setAccessMode(b, result, accessMode);
+            result->addAttribute("url", b->getStringAttr(url));
+            result->addOperands({data});
         }
+
+        mlir::LogicalResult WriteOp::verify() {
+            getAccessMode();
+            return mlir::success();
+        }
+
+//        bool WriteOp::parse(mlir::OpAsmParser *parser, mlir::OperationState *result) {
+//            llvm_unreachable("Parse not implemented for WriteOp");
+//        }
     }
 }

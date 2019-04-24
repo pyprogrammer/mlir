@@ -54,11 +54,31 @@ namespace constellation {
 
             mlir::LogicalResult verify();
 
-            static bool parse(mlir::OpAsmParser *parser, mlir::OperationState *result);
+//            static bool parse(mlir::OpAsmParser *parser, mlir::OperationState *result);
 
             //////////////////////////////////////////////////////////////////////////////
             // Op-specific functionality.
             //////////////////////////////////////////////////////////////////////////////
+        };
+
+        class WriteOp : public mlir::Op<WriteOp, mlir::OpTrait::OneOperand, mlir::OpTrait::ZeroResult,
+                mlir::OpTrait::IsTerminator>,
+                        public internal::HasAccessMode<WriteOp> {
+        public:
+
+            using Op::Op;
+
+            //////////////////////////////////////////////////////////////////////////////
+            // Hooks to customize the behavior of this op.
+            //////////////////////////////////////////////////////////////////////////////
+            static llvm::StringRef getOperationName() { return "constellation.write"; }
+
+            static void build(mlir::Builder *b, mlir::OperationState *result, std::string url,
+                              IO::AccessMode accessMode, mlir::Value *data);
+
+            mlir::LogicalResult verify();
+
+//        static bool parse(mlir::OpAsmParser *parser, mlir::OperationState *result);
         };
     }
 }

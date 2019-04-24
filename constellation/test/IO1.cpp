@@ -36,13 +36,14 @@ TEST_FUNC(simplex_with_io) {
     auto vecType = mlir::VectorType::get({5}, fltType);
     auto paramType = mlir::RankedTensorType::get({2, 4, 8, 16, 32}, fltType);
     {
-        Function* f = makeFunction(module, "load_lattice", {vecType}, {fltType});
+        Function *f = makeFunction(module, "load_lattice", {vecType}, {});
         ScopedContext sc(f);
         ValueHandle in(f->getArgument(0));
         std::string path = "/dev/null";
         auto params = constellation::intrinsics::read({path, constellation::IO::AccessMode::FULL, paramType});
         auto lat = constellation::intrinsics::lattice({in, params, constellation::lattice::LatticeType::SIMPLEX});
-        ret(lat.getValue());
+        (void) constellation::intrinsics::write({path, constellation::IO::AccessMode::STREAM, lat.getValue()});
+//        ret(lat.getValue());
         cleanupAndPrintFunction(f);
     }
 }
