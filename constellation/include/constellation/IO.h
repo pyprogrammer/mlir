@@ -49,7 +49,7 @@ namespace constellation {
             //////////////////////////////////////////////////////////////////////////////
             static llvm::StringRef getOperationName() { return "constellation.read"; }
 
-            static void build(mlir::Builder *b, mlir::OperationState *result, std::string url,
+            static void build(mlir::Builder *b, mlir::OperationState *state, std::string url,
                               IO::AccessMode accessMode, mlir::Type resultType);
 
             mlir::LogicalResult verify();
@@ -73,7 +73,7 @@ namespace constellation {
             //////////////////////////////////////////////////////////////////////////////
             static llvm::StringRef getOperationName() { return "constellation.write"; }
 
-            static void build(mlir::Builder *b, mlir::OperationState *result, std::string url,
+            static void build(mlir::Builder *b, mlir::OperationState *state, std::string url,
                               IO::AccessMode accessMode, mlir::Value *data);
 
             mlir::LogicalResult verify();

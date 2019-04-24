@@ -35,12 +35,10 @@ namespace constellation {
             static llvm::StringRef getOperationName() { return "constellation.lattice"; }
 
             // Simplex: Params: sizes: List[dim_sizes], Params: List[len(sizes)]
-            static void build(mlir::Builder *b, mlir::OperationState *result,
+            static void build(mlir::Builder *b, mlir::OperationState *state,
                               mlir::Value *input, mlir::Value *params, LatticeType latticeType);
 
             mlir::LogicalResult verify();
-
-            static bool parse(mlir::OpAsmParser *parser, mlir::OperationState *result);
 
             //////////////////////////////////////////////////////////////////////////////
             // Op-specific functionality.

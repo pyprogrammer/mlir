@@ -6,13 +6,13 @@
 
 namespace constellation {
     namespace IO {
-        void ReadOp::build(mlir::Builder *b, mlir::OperationState *result, std::string url,
-                           constellation::IO::AccessMode accessMode, mlir::Type resultType) {
+        void ReadOp::build(mlir::Builder *b, mlir::OperationState *state, std::string url,
+                           constellation::IO::AccessMode accessMode, mlir::Type stateType) {
             // The type of the result should match the type of the file, but isn't checkable since the file doesn't
             // necessarily have to exist.
-            setAccessMode(b, result, accessMode);
-            result->addAttribute("url", b->getStringAttr(url));
-            result->addTypes({resultType});
+            setAccessMode(b, state, accessMode);
+            state->addAttribute("url", b->getStringAttr(url));
+            state->addTypes({stateType});
         }
 
         mlir::LogicalResult ReadOp::verify() {
@@ -21,15 +21,15 @@ namespace constellation {
             return mlir::success();
         }
 
-//        bool ReadOp::parse(mlir::OpAsmParser *parser, mlir::OperationState *result) {
+//        bool ReadOp::parse(mlir::OpAsmParser *parser, mlir::OperationState *state) {
 //            llvm_unreachable("Parse not implemented for ReadOp");
 //        }
 
-        void WriteOp::build(mlir::Builder *b, mlir::OperationState *result, std::string url,
+        void WriteOp::build(mlir::Builder *b, mlir::OperationState *state, std::string url,
                             constellation::IO::AccessMode accessMode, mlir::Value *data) {
-            setAccessMode(b, result, accessMode);
-            result->addAttribute("url", b->getStringAttr(url));
-            result->addOperands({data});
+            setAccessMode(b, state, accessMode);
+            state->addAttribute("url", b->getStringAttr(url));
+            state->addOperands({data});
         }
 
         mlir::LogicalResult WriteOp::verify() {
@@ -37,7 +37,7 @@ namespace constellation {
             return mlir::success();
         }
 
-//        bool WriteOp::parse(mlir::OpAsmParser *parser, mlir::OperationState *result) {
+//        bool WriteOp::parse(mlir::OpAsmParser *parser, mlir::OperationState *state) {
 //            llvm_unreachable("Parse not implemented for WriteOp");
 //        }
     }
