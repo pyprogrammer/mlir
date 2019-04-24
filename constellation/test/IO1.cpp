@@ -42,8 +42,8 @@ TEST_FUNC(simplex_with_io) {
         std::string path = "/dev/null";
         auto params = constellation::intrinsics::read({path, constellation::IO::AccessMode::FULL, paramType});
         auto lat = constellation::intrinsics::lattice({in, params, constellation::lattice::LatticeType::SIMPLEX});
-        auto writeval = constellation::intrinsics::write({path, constellation::IO::AccessMode::STREAM, lat.getValue()});
-        ret(writeval.getValue());
+        (void) constellation::intrinsics::write({path, constellation::IO::AccessMode::STREAM, lat.getValue()});
+        ret();
         cleanupAndPrintFunction(f);
     }
 }

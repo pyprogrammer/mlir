@@ -2,8 +2,8 @@
 // Created by Nathan Zhang on 4/17/19.
 //
 
-#ifndef LLVM_CONSTELLATION_COMMON_H
-#define LLVM_CONSTELLATION_COMMON_H
+#ifndef CONSTELLATION_COMMON_H
+#define CONSTELLATION_COMMON_H
 
 #include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/SliceAnalysis.h"
@@ -76,4 +76,4 @@ inline void cleanupAndPrintFunction(mlir::Function *f) {
         f->print(llvm::outs());
 }
 
-#endif //LLVM_CONSTELLATION_COMMON_H
+#endif //CONSTELLATION_COMMON_H

@@ -2,8 +2,8 @@
 // Created by Nathan Zhang on 4/17/19.
 //
 
-#ifndef LLVM_CONSTELLATION_SIMPLEXLATTICE_H
-#define LLVM_CONSTELLATION_SIMPLEXLATTICE_H
+#ifndef CONSTELLATION_SIMPLEXLATTICE_H
+#define CONSTELLATION_SIMPLEXLATTICE_H
 
 #include <string>
 #include <map>
@@ -52,4 +52,4 @@ namespace constellation {
     }
 }
 
-#endif //LLVM_CONSTELLATION_SIMPLEXLATTICE_H
+#endif //CONSTELLATION_SIMPLEXLATTICE_H

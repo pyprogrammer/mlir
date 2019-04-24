@@ -2,8 +2,8 @@
 // Created by Nathan Zhang on 4/17/19.
 //
 
-#ifndef LLVM_CONSTELLATION_INTRINSICS_H
-#define LLVM_CONSTELLATION_INTRINSICS_H
+#ifndef CONSTELLATION_INTRINSICS_H
+#define CONSTELLATION_INTRINSICS_H
 
 #include "mlir/EDSC/Intrinsics.h"
 #include "constellation/Lattice.h"
@@ -19,4 +19,4 @@ namespace constellation {
     }
 }
 
-#endif //LLVM_CONSTELLATION_INTRINSICS_H
+#endif //CONSTELLATION_INTRINSICS_H

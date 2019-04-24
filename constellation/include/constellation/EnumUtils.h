@@ -2,8 +2,8 @@
 // Created by Nathan Zhang on 4/19/19.
 //
 
-#ifndef LLVM_CONSTELLATION_ENUMUTILS_H
-#define LLVM_CONSTELLATION_ENUMUTILS_H
+#ifndef CONSTELLATION_ENUMUTILS_H
+#define CONSTELLATION_ENUMUTILS_H
 
 #include <type_traits>
 
@@ -36,4 +36,4 @@ namespace constellation {
     }
 }
 
-#endif //LLVM_CONSTELLATION_ENUMUTILS_H
+#endif //CONSTELLATION_ENUMUTILS_H

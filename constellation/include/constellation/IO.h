@@ -2,8 +2,8 @@
 // Created by Nathan Zhang on 4/19/19.
 //
 
-#ifndef LLVM_CONSTELLATION_IO_H
-#define LLVM_CONSTELLATION_IO_H
+#ifndef CONSTELLATION_IO_H
+#define CONSTELLATION_IO_H
 
 #include <map>
 
@@ -83,4 +83,4 @@ namespace constellation {
 }
 
 
-#endif //LLVM_CONSTELLATION_IO_H
+#endif //CONSTELLATION_IO_H

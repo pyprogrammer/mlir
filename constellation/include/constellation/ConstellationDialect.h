@@ -7,8 +7,8 @@
 #include "constellation/ConstCommon.h"
 #include "constellation/ConstellationOps.h"
 
-#ifndef LLVM_CONSTELLATION_CONSTELLATIONDIALECT_H
-#define LLVM_CONSTELLATION_CONSTELLATIONDIALECT_H
+#ifndef CONSTELLATION_CONSTELLATIONDIALECT_H
+#define CONSTELLATION_CONSTELLATIONDIALECT_H
 
 namespace constellation {
 
@@ -25,4 +25,4 @@ namespace constellation {
     };
 }
 
-#endif //LLVM_CONSTELLATION_CONSTELLATIONDIALECT_H
+#endif //CONSTELLATION_CONSTELLATIONDIALECT_H
