@@ -7,12 +7,13 @@
 
 #include "mlir/EDSC/Intrinsics.h"
 #include "constellation/Lattice.h"
+#include "constellation/IO.h"
 
 namespace constellation {
 namespace intrinsics {
-
-using lattice = mlir::edsc::intrinsics::ValueBuilder<LatticeOp>;
-
+using mlir::edsc::intrinsics::ValueBuilder;
+using lattice = ValueBuilder<lattice::LatticeOp>;
+using read = ValueBuilder<IO::ReadOp>;
 }
 }
 

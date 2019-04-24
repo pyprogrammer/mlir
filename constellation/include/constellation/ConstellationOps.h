@@ -6,5 +6,6 @@
 #define LLVM_CONSTELLATION_CONSTELLATIONOPS_H
 
 #include "constellation/Lattice.h"
+#include "constellation/IO.h"
 
 #endif //LLVM_CONSTELLATION_CONSTELLATIONOPS_H
