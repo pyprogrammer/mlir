@@ -77,8 +77,8 @@ public:
   // specifies an attribute constraint.
   bool isAttrMatcher() const;
 
-  // Returns true if this DAG leaf is transforming an attribute.
-  bool isAttrTransformer() const;
+  // Returns true if this DAG leaf is wrapping native code call.
+  bool isNativeCodeCall() const;
 
   // Returns true if this DAG leaf is specifying a constant attribute.
   bool isConstantAttr() const;
@@ -100,9 +100,9 @@ public:
   // leaf is an operand/attribute matcher and asserts otherwise.
   std::string getConditionTemplate() const;
 
-  // Returns the transformation template inside this DAG leaf. Assumes the
-  // leaf is an attribute transformation and asserts otherwise.
-  std::string getTransformationTemplate() const;
+  // Returns the native code call template inside this DAG leaf.
+  // Precondition: isNativeCodeCall()
+  llvm::StringRef getNativeCodeTemplate() const;
 
 private:
   // Returns true if the TableGen Init `def` in this DagLeaf is a DefInit and
@@ -162,10 +162,6 @@ public:
   // Returns the specified name of the `index`-th argument.
   llvm::StringRef getArgName(unsigned index) const;
 
-  // Returns the native builder for the pattern.
-  // Precondition: isNativeCodeBuilder.
-  llvm::StringRef getNativeCodeBuilder() const;
-
   // Returns true if this DAG construct means to replace with an existing SSA
   // value.
   bool isReplaceWithValue() const;
@@ -173,16 +169,12 @@ public:
   // Returns true if this DAG node is the `verifyUnusedValue` directive.
   bool isVerifyUnusedValue() const;
 
-  // Returns true if this DAG construct is meant to invoke a native code
-  // constructor.
-  bool isNativeCodeBuilder() const;
+  // Returns true if this DAG node is wrapping native code call.
+  bool isNativeCodeCall() const;
 
-  // Returns true if this DAG construct is transforming attributes.
-  bool isAttrTransformer() const;
-
-  // Returns the transformation template inside this DAG construct.
-  // Precondition: isAttrTransformer.
-  std::string getTransformationTemplate() const;
+  // Returns the native code call template inside this DAG node.
+  // Precondition: isNativeCodeCall()
+  llvm::StringRef getNativeCodeTemplate() const;
 
 private:
   const llvm::DagInit *node; // nullptr means null DagNode
@@ -205,23 +197,15 @@ public:
   // Returns the DAG tree root node of the `index`-th result pattern.
   DagNode getResultPattern(unsigned index) const;
 
-  // Returns true if an argument with the given `name` is bound in source
-  // pattern.
-  bool isArgBoundInSourcePattern(llvm::StringRef name) const;
-
-  // Returns true if an argument with the given `name` is bound as result of
-  // op in pattern.
-  bool isResultBoundInSourcePattern(llvm::StringRef name) const;
-
-  // Checks whether an argument with the given `name` is bound in source
-  // pattern. Prints fatal error if not; does nothing otherwise.
-  void ensureArgBoundInSourcePattern(llvm::StringRef name) const;
+  // Checks whether an argument or op with the given `name` is bound in
+  // source pattern. Prints fatal error if not; does nothing otherwise.
+  void ensureBoundInSourcePattern(llvm::StringRef name) const;
 
   // Returns a reference to all the bound arguments in the source pattern.
   llvm::StringMap<Argument> &getSourcePatternBoundArgs();
 
-  // Returns a reference to all the bound results in the source pattern.
-  llvm::StringSet<> &getSourcePatternBoundResults();
+  // Returns a reference to all the bound ops in the source pattern.
+  llvm::StringSet<> &getSourcePatternBoundOps();
 
   // Returns the op that the root node of the source pattern matches.
   const Operator &getSourceRootOp();
@@ -247,11 +231,11 @@ private:
   // All operators.
   RecordOperatorMap *recordOpMap;
 
-  // All bound arguments.
+  // All bound op arguments.
   llvm::StringMap<Argument> boundArguments;
 
-  // All bound results.
-  llvm::StringSet<> boundResults;
+  // All bound ops.
+  llvm::StringSet<> boundOps;
 };
 
 } // end namespace tblgen

@@ -41,19 +41,12 @@ using namespace llvm;
 using namespace mlir;
 using namespace mlir::tblgen;
 
-static const char *const tblgenNamePrefix = "tblgen_";
-
-// Returns the bound value for the given op result `symbol`.
-static Twine getBoundResult(const StringRef &symbol) {
-  return tblgenNamePrefix + symbol;
-}
-
-// Returns the bound value for the given op argument `symbol`.
+// Returns the bound symbol for the given op argument or op named `symbol`.
 //
-// Arguments bound in the source pattern are grouped into a transient
-// `PatternState` struct. This struct can be accessed in both `match()` and
-// `rewrite()` via the local variable named as `s`.
-static Twine getBoundArgument(const StringRef &symbol) {
+// Arguments and ops bound in the source pattern are grouped into a
+// transient `PatternState` struct. This struct can be accessed in both
+// `match()` and `rewrite()` via the local variable named as `s`.
+static Twine getBoundSymbol(const StringRef &symbol) {
   return Twine("s.") + symbol;
 }
 
@@ -64,8 +57,8 @@ static Twine getBoundArgument(const StringRef &symbol) {
 namespace {
 // A class for resolving symbols bound in patterns.
 //
-// Symbols can be bound to op arguments/results in the source pattern and op
-// results in result patterns. For example, in
+// Symbols can be bound to op arguments and ops in the source pattern and ops
+// in result patterns. For example, in
 //
 // ```
 // def : Pattern<(SrcOp:$op1 $arg0, %arg1),
@@ -79,13 +72,13 @@ namespace {
 // values.
 //
 // Note that we also generate local variables for unnamed DAG nodes, like
-// `(ResOp3)` in the above. Since we don't bind a symbol to the result, the
+// `(ResOp3)` in the above. Since we don't bind a symbol to the op, the
 // generated local variable will be implicitly named. Those implicit names are
 // not tracked in this class.
 class PatternSymbolResolver {
 public:
   PatternSymbolResolver(const StringMap<Argument> &srcArgs,
-                        const StringSet<> &srcResults);
+                        const StringSet<> &srcOperations);
 
   // Marks the given `symbol` as bound.  Returns false if the `symbol` is
   // already bound.
@@ -105,8 +98,8 @@ private:
 } // end anonymous namespace
 
 PatternSymbolResolver::PatternSymbolResolver(const StringMap<Argument> &srcArgs,
-                                             const StringSet<> &srcResults)
-    : sourceArguments(srcArgs), sourceOps(srcResults) {}
+                                             const StringSet<> &srcOperations)
+    : sourceArguments(srcArgs), sourceOps(srcOperations) {}
 
 bool PatternSymbolResolver::add(StringRef symbol) {
   return resultOps.insert(symbol).second;
@@ -121,12 +114,12 @@ std::string PatternSymbolResolver::query(StringRef symbol) const {
   {
     auto it = sourceArguments.find(symbol);
     if (it != sourceArguments.end())
-      return getBoundArgument(symbol).str();
+      return getBoundSymbol(symbol).str();
   }
   {
     auto it = sourceOps.find(symbol);
     if (it != sourceOps.end())
-      return getBoundResult(symbol).str();
+      return getBoundSymbol(symbol).str();
   }
   return {};
 }
@@ -173,9 +166,9 @@ private:
   std::string handleRewritePattern(DagNode resultTree, int resultIndex,
                                    int depth);
 
-  // Emits the C++ statement to replace the matched DAG with a native C++ built
-  // value.
-  std::string emitReplaceWithNativeBuilder(DagNode resultTree);
+  // Emits the C++ statement to replace the matched DAG with a value built via
+  // calling native C++ code.
+  std::string emitReplaceWithNativeCodeCall(DagNode resultTree);
 
   // Returns the C++ expression referencing the old value serving as the
   // replacement.
@@ -199,9 +192,6 @@ private:
   // Returns the C++ expression to build an argument from the given DAG `leaf`.
   // `patArgName` is used to bound the argument to the source pattern.
   std::string handleOpArgument(DagLeaf leaf, llvm::StringRef patArgName);
-
-  // Returns the C++ expression to build an argument from the given DAG `tree`.
-  std::string handleOpArgument(DagNode tree);
 
   // Marks the symbol attached to DagNode `node` as bound. Aborts if the symbol
   // is already bound.
@@ -235,7 +225,7 @@ PatternEmitter::PatternEmitter(Record *pat, RecordOperatorMap *mapper,
                                raw_ostream &os)
     : loc(pat->getLoc()), opMap(mapper), pattern(pat, mapper),
       symbolResolver(pattern.getSourcePatternBoundArgs(),
-                     pattern.getSourcePatternBoundResults()),
+                     pattern.getSourcePatternBoundOps()),
       nextValueId(0), os(os) {
   matchCtx.withBuilder("mlir::Builder(ctx)");
   rewriteCtx.withBuilder("rewriter");
@@ -274,7 +264,7 @@ void PatternEmitter::emitOpMatch(DagNode tree, int depth) {
   // If the operand's name is set, set to that variable.
   auto name = tree.getOpName();
   if (!name.empty())
-    os.indent(indent) << formatv("{0} = op{1};\n", getBoundResult(name), depth);
+    os.indent(indent) << formatv("{0} = op{1};\n", getBoundSymbol(name), depth);
 
   for (int i = 0, e = tree.getNumArgs(); i != e; ++i) {
     auto opArg = op.getArg(i);
@@ -330,7 +320,7 @@ void PatternEmitter::emitOperandMatch(DagNode tree, int index, int depth,
   // Capture the value
   auto name = tree.getArgName(index);
   if (!name.empty()) {
-    os.indent(indent) << getBoundArgument(name) << " = op" << depth
+    os.indent(indent) << getBoundSymbol(name) << " = op" << depth
                       << "->getOperand(" << index << ");\n";
   }
 }
@@ -380,7 +370,7 @@ void PatternEmitter::emitAttributeMatch(DagNode tree, int index, int depth,
   // Capture the value
   auto name = tree.getArgName(index);
   if (!name.empty()) {
-    os.indent(indent) << getBoundArgument(name) << " = attr;\n";
+    os.indent(indent) << getBoundSymbol(name) << " = attr;\n";
   }
 
   indent -= 2;
@@ -404,10 +394,6 @@ void PatternEmitter::emitMatchMethod(DagNode tree) {
       handleVerifyUnusedValue(resultTree, i);
     }
   }
-
-  for (auto &res : pattern.getSourcePatternBoundResults())
-    os.indent(4) << formatv("mlir::Operation* {0}; (void){0};\n",
-                            getBoundResult(res.first()));
 
   emitOpMatch(tree, 0);
 
@@ -472,8 +458,11 @@ void PatternEmitter::emit(StringRef rewriteName) {
       os.indent(4) << namedAttr->attr.getStorageType() << " " << fieldName
                    << ";\n";
     } else {
-      os.indent(4) << "Value* " << fieldName << ";\n";
+      os.indent(4) << "Value *" << fieldName << ";\n";
     }
+  }
+  for (const auto &result : pattern.getSourcePatternBoundOps()) {
+    os.indent(4) << "Operation *" << result.getKey() << ";\n";
   }
   os << "  };\n";
 
@@ -523,8 +512,8 @@ std::string PatternEmitter::getUniqueValueName(const Operator *op) {
 
 std::string PatternEmitter::handleRewritePattern(DagNode resultTree,
                                                  int resultIndex, int depth) {
-  if (resultTree.isNativeCodeBuilder())
-    return emitReplaceWithNativeBuilder(resultTree);
+  if (resultTree.isNativeCodeCall())
+    return emitReplaceWithNativeCodeCall(resultTree);
 
   if (resultTree.isVerifyUnusedValue()) {
     if (depth > 0) {
@@ -564,9 +553,9 @@ std::string PatternEmitter::handleReplaceWithValue(DagNode tree) {
   }
 
   auto name = tree.getArgName(0);
-  pattern.ensureArgBoundInSourcePattern(name);
+  pattern.ensureBoundInSourcePattern(name);
 
-  return getBoundArgument(name).str();
+  return getBoundSymbol(name).str();
 }
 
 void PatternEmitter::handleVerifyUnusedValue(DagNode tree, int index) {
@@ -587,27 +576,23 @@ std::string PatternEmitter::handleOpArgument(DagLeaf leaf,
     auto enumCase = leaf.getAsEnumAttrCase();
     return handleConstantAttr(enumCase, enumCase.getSymbol());
   }
-  pattern.ensureArgBoundInSourcePattern(argName);
-  std::string result = getBoundArgument(argName).str();
+  pattern.ensureBoundInSourcePattern(argName);
+  std::string result = getBoundSymbol(argName).str();
   if (leaf.isUnspecified() || leaf.isOperandMatcher()) {
     return result;
   }
-  if (leaf.isAttrTransformer()) {
-    return tgfmt(leaf.getTransformationTemplate(),
-                 &rewriteCtx.withSelf(result));
+  if (leaf.isNativeCodeCall()) {
+    return tgfmt(leaf.getNativeCodeTemplate(), &rewriteCtx.withSelf(result));
   }
   PrintFatalError(loc, "unhandled case when rewriting op");
 }
 
-std::string PatternEmitter::handleOpArgument(DagNode tree) {
-  if (!tree.isAttrTransformer()) {
-    PrintFatalError(loc, "only tAttr is supported in nested dag attribute");
-  }
-  auto fmt = tree.getTransformationTemplate();
+std::string PatternEmitter::emitReplaceWithNativeCodeCall(DagNode tree) {
+  auto fmt = tree.getNativeCodeTemplate();
   // TODO(fengliuai): replace formatv arguments with the exact specified args.
   SmallVector<std::string, 8> attrs(8);
   if (tree.getNumArgs() > 8) {
-    PrintFatalError(loc, "unsupported tAttr argument numbers: " +
+    PrintFatalError(loc, "unsupported NativeCodeCall argument numbers: " +
                              Twine(tree.getNumArgs()));
   }
   for (unsigned i = 0, e = tree.getNumArgs(); i != e; ++i) {
@@ -700,7 +685,9 @@ std::string PatternEmitter::emitOpCreate(DagNode tree, int resultIndex,
   // Create the builder call for the result.
   // Add operands.
   int i = 0;
-  for (auto operand : resultOp.getOperands()) {
+  for (int e = resultOp.getNumOperands(); i < e; ++i) {
+    const auto &operand = resultOp.getOperand(i);
+
     // Start each operand on its own line.
     (os << ",\n").indent(6);
 
@@ -710,11 +697,15 @@ std::string PatternEmitter::emitOpCreate(DagNode tree, int resultIndex,
     if (tree.isNestedDagArg(i)) {
       os << childNodeNames[i];
     } else {
-      os << resolveSymbol(tree.getArgName(i));
+      DagLeaf leaf = tree.getArgAsLeaf(i);
+      auto symbol = resolveSymbol(tree.getArgName(i));
+      if (leaf.isNativeCodeCall()) {
+        os << tgfmt(leaf.getNativeCodeTemplate(), &rewriteCtx.withSelf(symbol));
+      } else {
+        os << symbol;
+      }
     }
-
     // TODO(jpienaar): verify types
-    ++i;
   }
 
   // Add attributes.
@@ -724,7 +715,11 @@ std::string PatternEmitter::emitOpCreate(DagNode tree, int resultIndex,
     // The argument in the op definition.
     auto opArgName = resultOp.getArgName(i);
     if (auto subTree = tree.getArgAsNestedDag(i)) {
-      os << formatv("/*{0}=*/{1}", opArgName, handleOpArgument(subTree));
+      if (!subTree.isNativeCodeCall())
+        PrintFatalError(loc, "only NativeCodeCall allowed in nested dag node "
+                             "for creating attribute");
+      os << formatv("/*{0}=*/{1}", opArgName,
+                    emitReplaceWithNativeCodeCall(subTree));
     } else {
       auto leaf = tree.getArgAsLeaf(i);
       // The argument in the result DAG pattern.
@@ -745,36 +740,6 @@ std::string PatternEmitter::emitOpCreate(DagNode tree, int resultIndex,
   os << "\n    );\n";
 
   return resultValue;
-}
-
-std::string PatternEmitter::emitReplaceWithNativeBuilder(DagNode resultTree) {
-  // The variable's name for holding the result of this native builder call
-  std::string value = formatv("v{0}", nextValueId++).str();
-
-  os.indent(4) << "auto " << value << " = " << resultTree.getNativeCodeBuilder()
-               << "(op, {";
-  const auto &boundedValues = pattern.getSourcePatternBoundArgs();
-  bool first = true;
-  bool printingAttr = false;
-  for (int i = 0, e = resultTree.getNumArgs(); i != e; ++i) {
-    auto name = resultTree.getArgName(i);
-    pattern.ensureArgBoundInSourcePattern(name);
-    const auto &val = boundedValues.find(name);
-    if (val->second.dyn_cast<NamedAttribute *>() && !printingAttr) {
-      os << "}, {";
-      first = true;
-      printingAttr = true;
-    }
-    if (!first)
-      os << ",";
-    os << getBoundArgument(name);
-    first = false;
-  }
-  if (!printingAttr)
-    os << "},{";
-  os << "}, rewriter);\n";
-
-  return value;
 }
 
 void PatternEmitter::emit(StringRef rewriteName, Record *p,

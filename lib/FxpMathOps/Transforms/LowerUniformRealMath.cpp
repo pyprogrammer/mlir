@@ -15,17 +15,17 @@
 // limitations under the License.
 // =============================================================================
 
+#include "UniformKernelUtils.h"
+
 #include "mlir/FxpMathOps/FxpMathOps.h"
 #include "mlir/FxpMathOps/Passes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Quantization/QuantOps.h"
-#include "mlir/Quantization/UniformSupport.h"
-
-#include <functional>
+#include "mlir/StandardOps/Ops.h"
 
 using namespace mlir;
 using namespace mlir::fxpmath;
+using namespace mlir::fxpmath::detail;
 using namespace mlir::quant;
 
 namespace {
@@ -35,107 +35,121 @@ struct LowerUniformRealMathPass
   void runOnFunction() override;
 };
 
-UniformQuantizedType getUniformElementType(Type t) {
-  return QuantizedType::getQuantizedElementType(t)
-      .dyn_cast_or_null<UniformQuantizedType>();
+struct LowerUniformCastsPass : public FunctionPass<LowerUniformCastsPass> {
+  void runOnFunction() override;
+};
+
+} // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Dequantize
+//===----------------------------------------------------------------------===//
+
+static Value *emitUniformPerLayerDequantize(Location loc, Value *input,
+                                            UniformQuantizedType elementType,
+                                            PatternRewriter &rewriter) {
+  // Pre-conditions.
+  if (!elementType.isSigned()) {
+    // TODO: Support unsigned storage type.
+    return rewriter.getContext()->emitDiagnostic(
+               loc, "unimplemented: dequantize signed uniform",
+               MLIRContext::DiagnosticKind::Warning),
+           nullptr;
+  }
+
+  Type storageType = elementType.castToStorageType(input->getType());
+  Type realType = elementType.castToExpressedType(input->getType());
+  Type intermediateType =
+      castElementType(storageType, IntegerType::get(32, rewriter.getContext()));
+  assert(storageType && "cannot cast to storage type");
+  assert(realType && "cannot cast to expressed type");
+
+  // Cast to storage type.
+  input = rewriter.create<StorageCastOp>(loc, storageType, input);
+
+  // Promote to intermediate type.
+  input = rewriter.create<ConvertISOp>(loc, intermediateType, input);
+
+  // Apply zero-point offset.
+  if (elementType.getZeroPoint() != 0) {
+    Value *negZeroPointConst = rewriter.create<ConstantOp>(
+        loc, broadcastScalarConstIntValue(intermediateType,
+                                          -elementType.getZeroPoint()));
+    input = rewriter.create<AddIOp>(loc, input, negZeroPointConst);
+  }
+
+  // Convert to float.
+  input = rewriter.create<ConvertISToFOp>(loc, realType, input);
+
+  // Mul by scale.
+  Value *scaleConst = rewriter.create<ConstantOp>(
+      loc, broadcastScalarConstFloatValue(realType,
+                                          APFloat(elementType.getScale())));
+  return rewriter.create<MulFOp>(loc, input, scaleConst);
 }
 
-/// Computes the log2(x), rounded to an integral value. Returns whether 'x' can
-/// be considered an exact integral value.
-template <typename F> bool integralLog2(F x, int &log2Result) {
-  const F xLog2 = std::log(x) * (1.0 / std::log(2.0));
-  const F xLog2Rounded = std::round(xLog2);
-  const F xLog2Frac = xLog2 - xLog2Rounded;
-  log2Result = static_cast<int>(xLog2Rounded);
-  // Allow small comparison slop below the level that would make a difference
-  // for 2^16 levels.
-  return std::abs(xLog2Frac) < 1e-6;
+static Value *
+emitUniformPerAxisDequantize(Location loc, Value *input,
+                             UniformQuantizedPerAxisType elementType,
+                             PatternRewriter &rewriter) {
+  // TODO: Support per-axis dequantize.
+  return rewriter.getContext()->emitDiagnostic(
+             loc, "unimplemented: per-axis uniform dequantization",
+             MLIRContext::DiagnosticKind::Warning),
+         nullptr;
+
+  return input->getDefiningOp()->emitWarning(
+             "unimplemented: per-axis uniform dequantization"),
+         nullptr;
 }
 
-/// Helper class for operating on binary operations where all operands
-/// and the result are a UniformQuantizedType.
-struct RealBinaryOpInfo {
-  RealBinaryOpInfo(Operation *op, Value *lhs, Value *rhs,
-                   Optional<APFloat> clampMin, Optional<APFloat> clampMax)
-      : op(op), lhs(lhs), rhs(rhs), clampMin(clampMin), clampMax(clampMax),
-        lhsType(getUniformElementType(lhs->getType())),
-        rhsType(getUniformElementType(rhs->getType())),
-        resultType(getUniformElementType(*op->result_type_begin())),
-        lhsStorageType(QuantizedType::castToStorageType(lhs->getType())),
-        rhsStorageType(QuantizedType::castToStorageType(rhs->getType())),
-        resultStorageType(
-            QuantizedType::castToStorageType(*op->result_type_begin())) {}
-
-  /// Returns whether this info is valid (all types defined, etc).
-  bool isValid() const {
-    return lhsType && rhsType && resultType && lhsStorageType &&
-           rhsStorageType && resultStorageType;
+static Value *emitDequantize(Location loc, Value *input,
+                             PatternRewriter &rewriter) {
+  Type inputType = input->getType();
+  QuantizedType qElementType =
+      QuantizedType::getQuantizedElementType(inputType);
+  if (auto uperLayerElementType =
+          qElementType.dyn_cast_or_null<UniformQuantizedType>()) {
+    return emitUniformPerLayerDequantize(loc, input, uperLayerElementType,
+                                         rewriter);
+  } else if (auto uperAxisElementType =
+                 qElementType.dyn_cast_or_null<UniformQuantizedPerAxisType>()) {
+    return emitUniformPerAxisDequantize(loc, input, uperAxisElementType,
+                                        rewriter);
+  } else {
+    return nullptr;
   }
+}
 
-  /// Returns whether the storage type of all operands is identical.
-  bool isSameStorageType() const {
-    return lhsType.getStorageType() == rhsType.getStorageType() &&
-           lhsType.getStorageType() == resultType.getStorageType();
-  }
+namespace {
 
-  /// Returns whether all operands and result are considered fixedpoint power
-  /// of two, setting the lhs, rhs, and result log2 scale references.
-  bool isFixedPointPOT(int &lhsLog2Scale, int &rhsLog2Scale,
-                       int &resultLog2Scale) const {
-    if (!lhsType.isFixedPoint() || !rhsType.isFixedPoint() ||
-        !resultType.isFixedPoint()) {
-      return false;
+struct UniformDequantizePattern : public RewritePattern {
+  UniformDequantizePattern(MLIRContext *context)
+      : RewritePattern(DequantizeCastOp::getOperationName(), 1, context) {}
+
+  PatternMatchResult matchAndRewrite(Operation *op,
+                                     PatternRewriter &rewriter) const {
+    auto dcastOp = op->cast<DequantizeCastOp>();
+    Type inputType = dcastOp.arg()->getType();
+    Type outputType = dcastOp.getResult()->getType();
+
+    QuantizedType inputElementType =
+        QuantizedType::getQuantizedElementType(inputType);
+    Type expressedOutputType = inputElementType.castToExpressedType(inputType);
+    if (expressedOutputType != outputType) {
+      // Not a valid uniform cast.
+      return matchFailure();
     }
 
-    if (!integralLog2(lhsType.getScale(), lhsLog2Scale) ||
-        !integralLog2(rhsType.getScale(), rhsLog2Scale) ||
-        !integralLog2(resultType.getScale(), resultLog2Scale)) {
-      return false;
+    Value *dequantizedValue =
+        emitDequantize(dcastOp.getLoc(), dcastOp.arg(), rewriter);
+    if (!dequantizedValue) {
+      return matchFailure();
     }
 
-    return true;
+    rewriter.replaceOp(op, dequantizedValue);
+    return matchSuccess();
   }
-
-  /// Gets the result integer clamp range given the result quantized type
-  // and any explicit clamp provided as attributes.
-  std::pair<IntegerAttr, IntegerAttr> getClampMinMax() const {
-    int64_t typeMin = resultType.getStorageTypeMin();
-    int64_t typeMax = resultType.getStorageTypeMax();
-
-    if (clampMin || clampMax) {
-      UniformQuantizedValueConverter conv(resultType);
-      if (clampMin) {
-        typeMin = std::max(typeMin, conv.quantizeFloatToInt64(*clampMin));
-      }
-      if (clampMax) {
-        typeMax = std::min(typeMax, conv.quantizeFloatToInt64(*clampMax));
-      }
-    }
-
-    // The quantized, integral ops expect clamps as 32bit ints.
-    return {
-        IntegerAttr::get(IntegerType::get(32, resultType.getContext()),
-                         typeMin),
-        IntegerAttr::get(IntegerType::get(32, resultType.getContext()),
-                         typeMax),
-    };
-  }
-
-  Operation *op;
-  Value *lhs;
-  Value *rhs;
-  Optional<APFloat> clampMin;
-  Optional<APFloat> clampMax;
-
-  // Element UniformQuantizedType for operands/result.
-  UniformQuantizedType lhsType;
-  UniformQuantizedType rhsType;
-  UniformQuantizedType resultType;
-
-  // Full storage-based types.
-  Type lhsStorageType;
-  Type rhsStorageType;
-  Type resultStorageType;
 };
 
 } // end anonymous namespace
@@ -143,78 +157,171 @@ struct RealBinaryOpInfo {
 //===----------------------------------------------------------------------===//
 // Elementwise add
 //===----------------------------------------------------------------------===//
-/// Attempts to rewrite a fixed point power-of-two addition of two integers.
-/// This supports a limited number of cases, but when supported, represents
-/// the simplest computation.
-static LogicalResult tryRewriteFixedPOTAddEw(const RealBinaryOpInfo &constInfo,
-                                             PatternRewriter &rewriter) {
-  if (!constInfo.isSameStorageType()) {
+
+static LogicalResult
+tryRewriteAffineAddEwIsomorphicSigned(const UniformBinaryOpInfo &info,
+                                      PatternRewriter &rewriter) {
+  if (!info.resultType.isSigned() || info.lhsType != info.resultType ||
+      info.rhsType != info.resultType) {
     return failure();
   }
 
-  int lhsLog2Scale;
-  int rhsLog2Scale;
-  int resultLog2Scale;
-  if (!constInfo.isFixedPointPOT(lhsLog2Scale, rhsLog2Scale, resultLog2Scale)) {
-    return failure();
-  }
-
-  // Adjust shifts to be relative to the output.
-  // Left shift of one input scale is supported. The other must match the result
-  // scale.
-  int lhsScaleShift = lhsLog2Scale - resultLog2Scale;
-  int rhsScaleShift = rhsLog2Scale - resultLog2Scale;
-  if (lhsScaleShift != 0 && rhsScaleShift != 0) {
-    return failure();
-  }
-  if (lhsScaleShift > 0 || rhsScaleShift > 0) {
-    return failure();
-  }
-
-  // State accessed by the closure.
-  Operation *mathOp = constInfo.op;
-  const auto clampMinMax = constInfo.getClampMinMax();
-  Value *lhs = constInfo.lhs;
-  Value *rhs = constInfo.rhs;
-  Type lhsStorageType = constInfo.lhsStorageType;
-  Type rhsStorageType = constInfo.rhsStorageType;
-
-  // If the lhs operand is the one requiring a shift, swap it so that the shift
-  // happens the rhs operand.
-  if (lhsScaleShift != 0) {
-    std::swap(lhs, rhs);
-    std::swap(lhsStorageType, rhsStorageType);
-    std::swap(lhsScaleShift, rhsScaleShift);
-  }
-  int rhsRightShift = -rhsScaleShift;
+  // Choose a byte aligned intermediate width big enough to perform the
+  // calculation without overflow.
+  // TODO: This should probably be made just big enough to avoid overflow and
+  // leave the downstream tooling to decide how to align that to machine
+  // word sizes.
+  unsigned intermediateWidth =
+      info.resultType.getStorageTypeIntegralWidth() <= 8 ? 16 : 32;
+  IntegerType intermediateElementType =
+      IntegerType::get(intermediateWidth, rewriter.getContext());
+  Type intermediateType =
+      castElementType(info.resultStorageType, intermediateElementType);
 
   // Cast operands to storage type.
-  Value *lhsStorageValue =
-      rewriter.create<StorageCastOp>(mathOp->getLoc(), lhsStorageType, lhs)
-          .getResult();
-  Value *rhsStorageValue =
-      rewriter.create<StorageCastOp>(mathOp->getLoc(), rhsStorageType, rhs)
-          .getResult();
+  Value *lhsValue = rewriter
+                        .create<StorageCastOp>(info.op->getLoc(),
+                                               info.lhsStorageType, info.lhs)
+                        .getResult();
+  Value *rhsValue = rewriter
+                        .create<StorageCastOp>(info.op->getLoc(),
+                                               info.rhsStorageType, info.rhs)
+                        .getResult();
 
-  // Rescale the rhs operand if needed.
-  if (rhsRightShift != 0) {
-    rhsStorageValue =
-        rewriter
-            .create<RoundingDivideByPotFxpOp>(
-                mathOp->getLoc(), rhsStorageValue,
-                IntegerAttr::get(IntegerType::get(32, rewriter.getContext()),
-                                 rhsRightShift))
-            .getResult();
-  }
+  // Cast to the intermediate sized type.
+  lhsValue = rewriter.create<ConvertISOp>(info.op->getLoc(), intermediateType,
+                                          lhsValue);
+  rhsValue = rewriter.create<ConvertISOp>(info.op->getLoc(), intermediateType,
+                                          rhsValue);
 
   // Add.
-  Value *sumValue = rewriter.create<SaturatingAddFxpOp>(
-      mathOp->getLoc(), lhsStorageValue, rhsStorageValue, clampMinMax.first,
-      clampMinMax.second);
+  Value *resultValue =
+      rewriter.create<AddIOp>(info.op->getLoc(), lhsValue, rhsValue);
+
+  // Zero point offset adjustment.
+  // result = (lhs - zp) + (rhs - zp) + zp
+  // zpOffset = -zp
+  int zpOffset = -1 * info.resultType.getZeroPoint();
+  if (zpOffset != 0) {
+    Value *zpOffsetConst = rewriter.create<ConstantOp>(
+        info.op->getLoc(),
+        broadcastScalarConstIntValue(intermediateType, zpOffset));
+    resultValue =
+        rewriter.create<AddIOp>(info.op->getLoc(), resultValue, zpOffsetConst);
+  }
+
+  // Clamp.
+  auto clampMinMax = info.getClampMinMax(intermediateElementType);
+  resultValue = rewriter.create<ClampISOp>(
+      info.op->getLoc(), resultValue, clampMinMax.first, clampMinMax.second);
+
+  // Convert back to original type.
+  resultValue = rewriter.create<ConvertISOp>(
+      info.op->getLoc(), info.resultStorageType, resultValue);
 
   // Cast back for new result.
   rewriter.replaceOpWithNewOp<StorageCastOp>(
-      mathOp, *mathOp->result_type_begin(), sumValue);
+      info.op, info.getQuantizedResultType(), resultValue);
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Elementwise mul
+//===----------------------------------------------------------------------===//
+
+static LogicalResult
+tryRewriteAffineMulEwSigned(const UniformBinaryOpInfo &info,
+                            PatternRewriter &rewriter) {
+  if (!info.resultType.isSigned()) {
+    return failure();
+  }
+
+  double outputMultiplierReal = info.lhsType.getScale() *
+                                info.rhsType.getScale() /
+                                info.resultType.getScale();
+  if (outputMultiplierReal > 1.0) {
+    info.op->emitWarning("unimplemented: cannot multiply with multipler > 1.0");
+    return failure();
+  }
+
+  // TODO: Choose an appropriate intermediate width for muls > 8 bits to
+  // avoid overflow.
+  unsigned intermediateWidth = 32;
+  IntegerType intermediateElementType =
+      IntegerType::get(intermediateWidth, rewriter.getContext());
+  Type intermediateType =
+      castElementType(info.resultStorageType, intermediateElementType);
+
+  // Cast operands to storage type.
+  Value *lhsValue = rewriter
+                        .create<StorageCastOp>(info.op->getLoc(),
+                                               info.lhsStorageType, info.lhs)
+                        .getResult();
+  Value *rhsValue = rewriter
+                        .create<StorageCastOp>(info.op->getLoc(),
+                                               info.rhsStorageType, info.rhs)
+                        .getResult();
+
+  // Cast to the intermediate sized type.
+  lhsValue = rewriter.create<ConvertISOp>(info.op->getLoc(), intermediateType,
+                                          lhsValue);
+  rhsValue = rewriter.create<ConvertISOp>(info.op->getLoc(), intermediateType,
+                                          rhsValue);
+
+  // Apply argument zeroPoints.
+  if (info.lhsType.getZeroPoint() != 0) {
+    Value *zpOffsetConst = rewriter.create<ConstantOp>(
+        info.op->getLoc(), broadcastScalarConstIntValue(
+                               intermediateType, -info.lhsType.getZeroPoint()));
+    lhsValue =
+        rewriter.create<AddIOp>(info.op->getLoc(), lhsValue, zpOffsetConst);
+  }
+
+  if (info.rhsType.getZeroPoint() != 0) {
+    Value *zpOffsetConst = rewriter.create<ConstantOp>(
+        info.op->getLoc(), broadcastScalarConstIntValue(
+                               intermediateType, -info.rhsType.getZeroPoint()));
+    rhsValue =
+        rewriter.create<AddIOp>(info.op->getLoc(), rhsValue, zpOffsetConst);
+  }
+
+  // Mul.
+  Value *resultValue =
+      rewriter.create<MulIOp>(info.op->getLoc(), lhsValue, rhsValue);
+
+  // Scale output.
+  QuantizedMultiplierSmallerThanOneExp outputMultiplier(outputMultiplierReal);
+  resultValue = rewriter.create<VecScalarSaturatingRoundingDoublingHighMulISOp>(
+      info.op->getLoc(), resultValue,
+      IntegerAttr::get(intermediateElementType, outputMultiplier.multiplier));
+  resultValue = rewriter.create<RoundingDivideByPotISOp>(
+      info.op->getLoc(), resultValue,
+      IntegerAttr::get(intermediateElementType, -outputMultiplier.exponent));
+
+  // Zero point offset adjustment.
+  if (info.resultType.getZeroPoint() != 0) {
+    Value *zpOffsetConst = rewriter.create<ConstantOp>(
+        info.op->getLoc(),
+        broadcastScalarConstIntValue(intermediateType,
+                                     info.resultType.getZeroPoint()));
+    resultValue =
+        rewriter.create<AddIOp>(info.op->getLoc(), resultValue, zpOffsetConst);
+  }
+
+  // Clamp.
+  auto clampMinMax = info.getClampMinMax(intermediateElementType);
+  resultValue = rewriter.create<ClampISOp>(
+      info.op->getLoc(), resultValue, clampMinMax.first, clampMinMax.second);
+
+  // Convert back to original type.
+  resultValue = rewriter.create<ConvertISOp>(
+      info.op->getLoc(), info.resultStorageType, resultValue);
+
+  // Cast back for new result.
+  rewriter.replaceOpWithNewOp<StorageCastOp>(
+      info.op, info.getQuantizedResultType(), resultValue);
+
   return success();
 }
 
@@ -227,14 +334,36 @@ struct UniformRealAddEwPattern : public RewritePattern {
   PatternMatchResult matchAndRewrite(Operation *op,
                                      PatternRewriter &rewriter) const {
     auto addOp = op->cast<RealAddEwOp>();
-    const RealBinaryOpInfo info(op, addOp.x(), addOp.y(), addOp.clamp_min(),
-                                addOp.clamp_max());
+    const UniformBinaryOpInfo info(op, addOp.x(), addOp.y(), addOp.clamp_min(),
+                                   addOp.clamp_max());
     if (!info.isValid()) {
       return matchFailure();
     }
 
     // Try all of the permutations we support.
-    if (succeeded(tryRewriteFixedPOTAddEw(info, rewriter))) {
+    if (succeeded(tryRewriteAffineAddEwIsomorphicSigned(info, rewriter))) {
+      return matchSuccess();
+    }
+
+    return matchFailure();
+  }
+};
+
+struct UniformRealMulEwPattern : public RewritePattern {
+  UniformRealMulEwPattern(MLIRContext *context)
+      : RewritePattern(RealMulEwOp::getOperationName(), 1, context) {}
+
+  PatternMatchResult matchAndRewrite(Operation *op,
+                                     PatternRewriter &rewriter) const {
+    auto mulOp = op->cast<RealMulEwOp>();
+    const UniformBinaryOpInfo info(op, mulOp.x(), mulOp.y(), mulOp.clamp_min(),
+                                   mulOp.clamp_max());
+    if (!info.isValid()) {
+      return matchFailure();
+    }
+
+    // Try all of the permutations we support.
+    if (succeeded(tryRewriteAffineMulEwSigned(info, rewriter))) {
       return matchSuccess();
     }
 
@@ -244,11 +373,16 @@ struct UniformRealAddEwPattern : public RewritePattern {
 
 } // end anonymous namespace
 
+//===----------------------------------------------------------------------===//
+// LowerUniformRealMath pass
+//===----------------------------------------------------------------------===//
+
 void LowerUniformRealMathPass::runOnFunction() {
   auto &fn = getFunction();
   OwningRewritePatternList patterns;
   auto *context = &getContext();
   patterns.push_back(llvm::make_unique<UniformRealAddEwPattern>(context));
+  patterns.push_back(llvm::make_unique<UniformRealMulEwPattern>(context));
   applyPatternsGreedily(fn, std::move(patterns));
 }
 
@@ -256,6 +390,26 @@ FunctionPassBase *createLowerUniformRealMathPass() {
   return new LowerUniformRealMathPass();
 }
 
-static PassRegistration<LowerUniformRealMathPass>
-    pass("fxpmath-lower-uniform-real-math",
-         "Lowers uniform-quantized real math ops to integer arithmetic.");
+static PassRegistration<LowerUniformRealMathPass> lowerUniformRealMathPass(
+    "fxpmath-lower-uniform-real-math",
+    "Lowers uniform-quantized real math ops to integer arithmetic.");
+
+//===----------------------------------------------------------------------===//
+// LowerUniformCasts pass
+//===----------------------------------------------------------------------===//
+
+void LowerUniformCastsPass::runOnFunction() {
+  auto &fn = getFunction();
+  OwningRewritePatternList patterns;
+  auto *context = &getContext();
+  patterns.push_back(llvm::make_unique<UniformDequantizePattern>(context));
+  applyPatternsGreedily(fn, std::move(patterns));
+}
+
+FunctionPassBase *createLowerUniformCastsPass() {
+  return new LowerUniformCastsPass();
+}
+
+static PassRegistration<LowerUniformCastsPass>
+    lowerUniformCastsPass("fxpmath-lower-uniform-casts",
+                          "Lowers uniform-quantized casts.");
