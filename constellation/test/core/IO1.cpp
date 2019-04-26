@@ -18,7 +18,7 @@
 // RUN: %p/test | FileCheck %s
 
 #include <constellation/core/ConstellationDialect.h>
-#include "TestHarness.h"
+#include "../test_include/TestHarness.h"
 #include "mlir/IR/Function.h"
 
 #include "constellation/core/ConstCommon.h"
@@ -28,7 +28,7 @@ using namespace mlir;
 using namespace mlir::edsc;
 using namespace mlir::edsc::intrinsics;
 
-TEST_FUNC(simplex_lattice) {
+TEST_FUNC(simplex_with_io) {
     MLIRContext context;
     Module module(&context);
 
@@ -36,12 +36,14 @@ TEST_FUNC(simplex_lattice) {
     auto vecType = mlir::VectorType::get({5}, fltType);
     auto paramType = mlir::RankedTensorType::get({2, 4, 8, 16, 32}, fltType);
     {
-        Function *f = makeFunction(module, "lattice", {vecType, paramType}, {fltType});
+        Function *f = makeFunction(module, "load_lattice", {vecType}, {});
         ScopedContext sc(f);
         ValueHandle in(f->getArgument(0));
-        ValueHandle params(f->getArgument(1));
+        std::string path = "/dev/null";
+        auto params = constellation::intrinsics::read({path, constellation::IO::AccessMode::FULL, paramType});
         auto lat = constellation::intrinsics::lattice({in, params, constellation::lattice::LatticeType::SIMPLEX});
-        ret(lat.getValue());
+        (void) constellation::intrinsics::write({path, constellation::IO::AccessMode::STREAM, lat.getValue()});
+        ret();
         cleanupAndPrintFunction(f);
     }
 }
