@@ -6,6 +6,7 @@
 
 #include "ConstCommon.h"
 #include "ConstellationOps.h"
+#include "Types.h"
 
 #ifndef CONSTELLATION_CONSTELLATIONDIALECT_H
 #define CONSTELLATION_CONSTELLATIONDIALECT_H

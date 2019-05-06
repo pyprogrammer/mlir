@@ -6,7 +6,8 @@
 
 namespace constellation {
     ConstellationDialect::ConstellationDialect(mlir::MLIRContext *ctx) : mlir::Dialect("constellation", ctx) {
-        addOperations<lattice::LatticeOp, IO::ReadOp, IO::WriteOp>();
+        addOperations<lattice::LatticeOp, IO::ReadOp, IO::WriteOp, IO::TransferOp>();
+        addTypes<ConstNum<CONST_FIX>, ConstNum<CONST_FLOAT>>();
     };
 
     mlir::Type ConstellationDialect::parseType(llvm::StringRef spec, mlir::Location loc) const {

@@ -16,6 +16,7 @@ namespace constellation {
         using lattice = ValueBuilder<lattice::LatticeOp>;
         using read = ValueBuilder<IO::ReadOp>;
         using write = ValueBuilder<IO::WriteOp>;
+        using transfer = ValueBuilder<IO::TransferOp>;
     }
 }
 

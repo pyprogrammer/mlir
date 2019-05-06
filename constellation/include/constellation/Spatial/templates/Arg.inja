@@ -1,6 +1,5 @@
 R"CONST(
 ## for arg in args
-val arg{{ loop.index }} = DRAM[{{ arg.typestr }}]({% for shape in arg.shape %}{{ shape }}{% if not loop.is_last %}, {% endif %}{% endfor %})
-setMem(arg{{ loop.index }}, load[{{ arg.typestr }}](args({{ loop.index }})))
+val arg{{ loop.index }} = load[{{ arg.typestr }}](args({{ loop.index }}), Seq({% for shape in arg.shape %}{{ shape }}{% if not loop.is_last %}, {% endif %}{% endfor %}));
 ## endfor
 )CONST"

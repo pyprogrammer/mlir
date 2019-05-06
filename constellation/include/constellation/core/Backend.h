@@ -8,10 +8,12 @@
 #include <regex>
 #include <string>
 #include <vector>
+#include <memory>
 
 #include <inja.hpp>
 #include <nlohmann/json.hpp>
 
+#include "mlir/Pass/PassManager.h"
 #include "mlir/IR/Module.h"
 #include "mlir/IR/Function.h"
 #include "llvm/Support/raw_ostream.h"
@@ -20,9 +22,15 @@ namespace constellation {
 
 // These are meant to be cheap, throwaway objects, useful for parallel codegen of different parameters.
 
+    template<typename Derived>
     class BackendFunc {
     public:
-        explicit BackendFunc(mlir::Function *func) : func_(func) {}
+        explicit BackendFunc(mlir::Function *func) : func_(func) {
+            Derived::initPassManager(pm_.get());
+            if (mlir::failed(pm_->run(func_->getModule()))) {
+                func_->getContext()->emitError(func_->getLoc(), "Backend-specific passes failed");
+            }
+        }
 
         virtual ~BackendFunc() = default;
 
@@ -30,8 +38,12 @@ namespace constellation {
             llvm_unreachable("Emit not defined on BackendFunc.");
         }
 
+        static void initPassManager(mlir::PassManager*) {}
+
     protected:
+
         mlir::Function *func_;
+        std::unique_ptr<mlir::PassManager> pm_ = std::make_unique<mlir::PassManager>();
     };
 }
 

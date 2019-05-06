@@ -26,6 +26,7 @@
 #include "../test_include/TestHarness.h"
 
 #include "constellation/Spatial/SpatialBackend.h"
+#include "constellation/core/Memory.h"
 
 using namespace mlir;
 using namespace mlir::edsc;
@@ -44,10 +45,17 @@ TEST_FUNC(simplex_with_io) {
         ValueHandle in(f->getArgument(0));
         std::string path = "/dev/null";
         auto params = constellation::intrinsics::read({path, constellation::IO::AccessMode::FULL, paramType});
-        auto lat = constellation::intrinsics::lattice({in, params, constellation::lattice::LatticeType::SIMPLEX});
-        (void) constellation::intrinsics::write({path, constellation::IO::AccessMode::STREAM, lat.getValue()});
+        auto trans = constellation::intrinsics::transfer({constellation::IO::AccessMode::FULL,
+                                                          params,
+                                                          constellation::Memory(constellation::Memory::Location::CPU, 0),
+                                                          constellation::Memory(constellation::Memory::Location::FPGA, 0)});
+        auto lat = constellation::intrinsics::lattice({in, trans, constellation::lattice::LatticeType::SIMPLEX});
+        auto transback = constellation::intrinsics::transfer({constellation::IO::AccessMode::FULL, lat,
+                                                              constellation::Memory(constellation::Memory::Location::FPGA, 0),
+                                                              constellation::Memory(constellation::Memory::Location::CPU, 0)});
+        (void) constellation::intrinsics::write({path, constellation::IO::AccessMode::STREAM, transback.getValue()});
         ret();
-//        cleanupAndPrintFunction(f);
+        cleanupAndPrintFunction(f);
         constellation::spatial::SpatialFunc spatialFunc(f);
         spatialFunc.emit(&llvm::outs());
     }
