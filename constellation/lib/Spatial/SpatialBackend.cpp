@@ -42,7 +42,7 @@ namespace constellation::spatial {
         for (const auto attr: op->getAttrs()) {
             if (attr.first.str().find(constellation::HasAttrBase::kCodeGenPrefix) == 0) {
                 if (auto intAttr = attr.second.dyn_cast<mlir::IntegerAttr>()) {
-                    metaparams.push_back(intAttr.getInt());
+                    metaparams.push_back(attr.first.str() + "=" + std::to_string(intAttr.getInt()));
                 }
             }
         }
