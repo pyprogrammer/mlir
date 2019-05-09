@@ -2,7 +2,6 @@
 // Created by Nathan Zhang on 4/25/19.
 //
 
-#include <constellation/core/Lattice.h>
 #include "constellation/Spatial/SpatialBackend.h"
 
 namespace constellation::spatial {
@@ -35,8 +34,19 @@ namespace constellation::spatial {
             args.push_back("v" + std::to_string(core::passes::ValueIDPass::getID(operand->getDefiningOp())));
         }
 
-        // Need a way for ops to add extra parameters.
         callParams["args"] = args;
+
+        auto metaparams = nlohmann::json::array();
+
+        // Need a way for ops to add extra parameters.
+        for (const auto attr: op->getAttrs()) {
+            if (attr.first.str().find(constellation::HasAttrBase::kCodeGenPrefix) == 0) {
+                if (auto intAttr = attr.second.dyn_cast<mlir::IntegerAttr>()) {
+                    metaparams.push_back(intAttr.getInt());
+                }
+            }
+        }
+        callParams["params"] = metaparams;
         *stream << inja::render(templates::kGenericCallTemplate, callParams);
     }
 

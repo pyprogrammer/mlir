@@ -3,6 +3,7 @@ add_llvm_library(ConstellationCore
         Lattice.cpp
         IO.cpp
         ValueIDPass.cpp
+        OpUtils.cpp
         )
 
 target_link_libraries(

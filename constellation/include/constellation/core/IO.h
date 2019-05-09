@@ -10,6 +10,7 @@
 #include "ConstCommon.h"
 #include "OpCommon.h"
 #include "Memory.h"
+#include "OpUtils.h"
 
 
 namespace constellation::IO {
@@ -20,31 +21,9 @@ namespace constellation::IO {
         ENUM_LAST = BACKED
     };
 
-    namespace internal {
-        template<typename T, typename E, int attr_id=0>
-        class HasEnumAttr {
-        public:
-            template<int i=0, typename = typename std::enable_if<i == attr_id>::type >
-            E getEnumAttr() {
-                return fromIntegerAttr<E>(
-                        static_cast<T *>(this)->template getAttrOfType<mlir::IntegerAttr>(getAttrName()));
-            }
-
-        protected:
-            template<int i=0, typename = typename std::enable_if<i == attr_id>::type >
-            static void setEnumAttr(mlir::Builder *b, mlir::OperationState *result, E val) {
-                result->addAttribute(getAttrName(), toIntegerAttr(b, val));
-            }
-        private:
-            static std::string getAttrName() {
-                return "_EnumAttr" + std::to_string(attr_id);
-            }
-        };
-    }
-
     class ReadOp : public mlir::Op<ReadOp, mlir::OpTrait::ZeroOperands,
             mlir::OpTrait::OneResult,
-            mlir::OpTrait::HasNoSideEffect>, public internal::HasEnumAttr<ReadOp, AccessMode> {
+            mlir::OpTrait::HasNoSideEffect>, public HasEnumAttr<ReadOp, AccessMode, true> {
     public:
 
         using Op::Op;
@@ -65,7 +44,7 @@ namespace constellation::IO {
     };
 
     class WriteOp : public mlir::Op<WriteOp, mlir::OpTrait::OneOperand, mlir::OpTrait::OneResult>,
-                    public internal::HasEnumAttr<ReadOp, AccessMode> {
+                    public HasEnumAttr<ReadOp, AccessMode, true> {
     public:
 
         using Op::Op;
@@ -82,7 +61,7 @@ namespace constellation::IO {
     };
 
     class TransferOp : public mlir::Op<TransferOp, mlir::OpTrait::OneOperand, mlir::OpTrait::OneResult>,
-                       public internal::HasEnumAttr<TransferOp, AccessMode>{
+                       public HasEnumAttr<TransferOp, AccessMode, true>{
 
     public:
         using Op::Op;

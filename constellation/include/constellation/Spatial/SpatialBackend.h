@@ -15,6 +15,9 @@
 #include "constellation/core/Backend.h"
 #include "constellation/core/Types.h"
 #include "constellation/core/ValueIDPass.h"
+#include "constellation/core/OpUtils.h"
+
+#include "constellation/core/Lattice.h"
 
 #include "constellation/Spatial/CodeTemplates.h"
 #include "constellation/Spatial/SpatialLocationPass.h"
