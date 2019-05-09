@@ -7,7 +7,7 @@ import spatial.dsl._
 
 {{ decl }}
 
-        Accel * {
+        Accel (*) {
 {{ accel }}
         }
 
