@@ -19,6 +19,8 @@ namespace constellation::core::passes {
 
     public:
         static int getID(mlir::Operation* op);
+        static int getID(mlir::Value* value);
+        static void setID(mlir::Operation* op, int id);
     };
 }
 

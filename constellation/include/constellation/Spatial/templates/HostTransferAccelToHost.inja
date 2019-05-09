@@ -1,5 +1,5 @@
 R"CONST(
-while(getArg(io{{id}}) == 0) {}
+wait(io{{id}})
 {% if useDram %}
 val v{{id}} = getMem(dram{{id}})
 {% else %}

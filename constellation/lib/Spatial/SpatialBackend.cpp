@@ -9,9 +9,54 @@ namespace constellation::spatial {
 
     void SpatialModule::initPassManager(mlir::PassManager *pm) {
         pm->addPass(new passes::SpatialLocationPass());
-        pm->addPass(new constellation::core::passes::ValueIDPass());
+        pm->addPass(new core::passes::ValueIDPass());
     }
 
+    void SpatialModule::genericCodegen(std::stringstream &decl, std::stringstream &host,
+            std::stringstream &accel, mlir::Operation* op) {
+        Memory mem = passes::SpatialLocationPass::getMemory(op);
+        std::stringstream* stream;
+        switch(mem.getLocation()) {
+            case Memory::Location::CPU:
+                stream = &host;
+                break;
+            case Memory::Location::FPGA:
+                stream = &accel;
+                break;
+            default:
+                llvm_unreachable("Invalid location.");
+        }
+        nlohmann::json callParams = {
+                {"id", core::passes::ValueIDPass::getID(op)},
+                {"name", op->getName().getStringRef().str()}
+        };
+        auto args = nlohmann::json::array();
+        for (auto operand: op->getOperands()) {
+            args.push_back("v" + std::to_string(core::passes::ValueIDPass::getID(operand->getDefiningOp())));
+        }
+
+        // Need a way for ops to add extra parameters.
+        callParams["args"] = args;
+        *stream << inja::render(templates::kGenericCallTemplate, callParams);
+    }
+
+    template<>
+    void SpatialModule::codegen(std::stringstream &decl, std::stringstream &host, std::stringstream &accel,
+                                mlir::ReturnOp returnOp) {
+        Memory mem = passes::SpatialLocationPass::getMemory(returnOp);
+        std::stringstream* stream;
+        switch(mem.getLocation()) {
+            case Memory::Location::CPU:
+                stream = &host;
+                break;
+            case Memory::Location::FPGA:
+                stream = &accel;
+                break;
+            default:
+                llvm_unreachable("Invalid location.");
+        }
+        *stream << "return\n";
+    }
 
     template<>
     void SpatialModule::codegen(std::stringstream &decl, std::stringstream &host, std::stringstream &accel,
@@ -34,12 +79,12 @@ namespace constellation::spatial {
                                 IO::TransferOp transferOp) {
 
         int id = core::passes::ValueIDPass::getID(transferOp.getOperation());
-        int prev_id = core::passes::ValueIDPass::getID(transferOp.getOperand()->getDefiningOp());
+        int prev_id = core::passes::ValueIDPass::getID(transferOp.getOperand());
 
         // create a HostIO for handshake
         {
             nlohmann::json hostIOParams = {
-                    {"id", id},
+                    {"name", "io" + std::to_string(id)},
                     {"T", "Int"}
             };
             decl << inja::render(templates::kHostIOTemplate, hostIOParams);
@@ -60,8 +105,13 @@ namespace constellation::spatial {
                 };
                 decl << inja::render(templates::kDRAMTemplate, dramParams);
             } else {
+                typeString = detail::typeToString(transferOp.getType());
                 // Otherwise use a HostIO
-
+                nlohmann::json hostIOParams = {
+                        {"name", "valIO" + std::to_string(id)},
+                        {"T", typeString}
+                };
+                decl << inja::render(templates::kHostIOTemplate, hostIOParams);
             }
 
         }
@@ -99,8 +149,6 @@ namespace constellation::spatial {
 
     void SpatialModule::emit(llvm::raw_ostream *os) {
 
-        module_->print(*os);
-
         nlohmann::json sections;
         sections["name"] = "Placeholder";
 
@@ -132,6 +180,8 @@ namespace constellation::spatial {
         main->walk([this, &decl, &host, &accel](mlir::Operation *op) {
             ConstellationOpCase(IO::ReadOp)
             ConstellationOpCase(IO::TransferOp)
+            ConstellationOpCase(mlir::ReturnOp)
+            genericCodegen(decl, host, accel, op);
         });
 #undef ConstellationOpCase
 

@@ -1,6 +1,6 @@
 R"CONST(
 // Accel side wait on IO
-while(getArg(io{{id}}) == 0){}
+wait(io{{id}})
 
 {% if useDram %}
 // Accel side load

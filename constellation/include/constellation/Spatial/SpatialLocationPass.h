@@ -17,8 +17,10 @@
 namespace constellation::spatial::passes {
 class SpatialLocationPass : public mlir::FunctionPass<SpatialLocationPass> {
     void runOnFunction() override;
+    void setMemory(mlir::Operation* op, Memory mem);
 public:
     static std::string kAttributeName;
+    static Memory getMemory(mlir::Operation* op);
 };
 }
 

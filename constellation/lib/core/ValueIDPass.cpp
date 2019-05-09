@@ -14,12 +14,27 @@ namespace constellation::core::passes {
         llvm_unreachable("Provided operation has no ValueID");
     }
 
+    int ValueIDPass::getID(mlir::Value *value) {
+        if (value->getKind() == mlir::Value::Kind::BlockArgument) {
+            return reinterpret_cast<mlir::BlockArgument*>(value)->getArgNumber();
+        }
+        else if (auto op = value->getDefiningOp()) {
+            return getID(op);
+        }
+
+        llvm_unreachable("Free floating value");
+    }
+
+    void ValueIDPass::setID(mlir::Operation *op, int id) {
+        op->setAttr(kAttributeName, mlir::IntegerAttr::get(
+                mlir::IntegerType::get(sizeof(int)*8, op->getContext()), id));
+    }
+
     void ValueIDPass::runOnFunction() {
         auto& func = getFunction();
         int nextID = func.getNumArguments();
-        func.walk([&func, &nextID](mlir::Operation* op){
-            op->setAttr(kAttributeName, mlir::IntegerAttr::get(
-                    mlir::IntegerType::get(sizeof(int)*8, func.getContext()), nextID++));
+        func.walk([&nextID](mlir::Operation* op){
+            setID(op, nextID++);
         });
     }
 }

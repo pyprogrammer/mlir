@@ -49,13 +49,17 @@ TEST_FUNC(simplex_with_io) {
                                                           params,
                                                           constellation::Memory(constellation::Memory::Location::CPU, 0),
                                                           constellation::Memory(constellation::Memory::Location::FPGA, 0)});
-        auto lat = constellation::intrinsics::lattice({in, trans, constellation::lattice::LatticeType::SIMPLEX});
+        auto intrans = constellation::intrinsics::transfer({constellation::IO::AccessMode::FULL,
+                                                            in,
+                                                            constellation::Memory(constellation::Memory::Location::CPU, 0),
+                                                            constellation::Memory(constellation::Memory::Location::FPGA, 0)});
+        auto lat = constellation::intrinsics::lattice({intrans, trans, constellation::lattice::LatticeType::SIMPLEX});
         auto transback = constellation::intrinsics::transfer({constellation::IO::AccessMode::FULL, lat,
                                                               constellation::Memory(constellation::Memory::Location::FPGA, 0),
                                                               constellation::Memory(constellation::Memory::Location::CPU, 0)});
         (void) constellation::intrinsics::write({path, constellation::IO::AccessMode::STREAM, transback.getValue()});
         ret();
-        cleanupAndPrintFunction(f);
+//        cleanupAndPrintFunction(f);
         constellation::spatial::SpatialModule spatial(&module);
         spatial.emit(&llvm::outs());
     }

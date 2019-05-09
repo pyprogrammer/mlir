@@ -28,7 +28,7 @@ namespace constellation {
         explicit BackendModule(mlir::Module *module) : module_(module) {
             Derived::initPassManager(pm_.get());
             if (mlir::failed(pm_->run(module_))) {
-
+                llvm_unreachable("Failed Passes");
             }
         }
 

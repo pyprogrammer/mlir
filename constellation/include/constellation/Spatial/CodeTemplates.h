@@ -46,6 +46,10 @@ const std::string kAccelTransferAccelToHost(
 const std::string kHostTransferAccelToHost(
 #include "constellation/Spatial/templates/HostTransferAccelToHost.inja"
 );
+
+const std::string kGenericCallTemplate(
+#include "constellation/Spatial/templates/GenericCall.inja"
+);
 }
 
 #endif //SPATIAL_CODETEMPLATES_H

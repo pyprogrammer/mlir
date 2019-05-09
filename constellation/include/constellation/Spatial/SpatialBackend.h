@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "mlir/IR/StandardTypes.h"
+#include "mlir/StandardOps/Ops.h"
 
 #include "constellation/core/Backend.h"
 #include "constellation/core/Types.h"
@@ -34,6 +35,8 @@ namespace constellation::spatial {
 
         template<typename T>
         void codegen(std::stringstream& decl, std::stringstream& host, std::stringstream& accel, T) {}
+
+        void genericCodegen(std::stringstream& decl, std::stringstream& host, std::stringstream& accel, mlir::Operation* op);
     };
 }
 
