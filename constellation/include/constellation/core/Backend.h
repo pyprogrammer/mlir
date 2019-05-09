@@ -23,26 +23,26 @@ namespace constellation {
 // These are meant to be cheap, throwaway objects, useful for parallel codegen of different parameters.
 
     template<typename Derived>
-    class BackendFunc {
+    class BackendModule {
     public:
-        explicit BackendFunc(mlir::Function *func) : func_(func) {
+        explicit BackendModule(mlir::Module *module) : module_(module) {
             Derived::initPassManager(pm_.get());
-            if (mlir::failed(pm_->run(func_->getModule()))) {
-                func_->getContext()->emitError(func_->getLoc(), "Backend-specific passes failed");
+            if (mlir::failed(pm_->run(module_))) {
+
             }
         }
 
-        virtual ~BackendFunc() = default;
+        virtual ~BackendModule() = default;
 
         virtual void emit(llvm::raw_ostream *ostream) {
-            llvm_unreachable("Emit not defined on BackendFunc.");
+            llvm_unreachable("Emit not defined on BackendModule.");
         }
 
         static void initPassManager(mlir::PassManager*) {}
 
     protected:
 
-        mlir::Function *func_;
+        mlir::Module *module_;
         std::unique_ptr<mlir::PassManager> pm_ = std::make_unique<mlir::PassManager>();
     };
 }

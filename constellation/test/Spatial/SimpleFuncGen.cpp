@@ -40,7 +40,7 @@ TEST_FUNC(simplex_with_io) {
     auto vecType = mlir::VectorType::get({5}, fltType);
     auto paramType = mlir::RankedTensorType::get({2, 4, 8, 16, 32}, fltType);
     {
-        Function *f = makeFunction(module, "load_lattice", {vecType}, {});
+        Function *f = makeFunction(module, "main", {vecType}, {});
         ScopedContext sc(f);
         ValueHandle in(f->getArgument(0));
         std::string path = "/dev/null";
@@ -56,8 +56,8 @@ TEST_FUNC(simplex_with_io) {
         (void) constellation::intrinsics::write({path, constellation::IO::AccessMode::STREAM, transback.getValue()});
         ret();
         cleanupAndPrintFunction(f);
-        constellation::spatial::SpatialFunc spatialFunc(f);
-        spatialFunc.emit(&llvm::outs());
+        constellation::spatial::SpatialModule spatial(&module);
+        spatial.emit(&llvm::outs());
     }
 }
 

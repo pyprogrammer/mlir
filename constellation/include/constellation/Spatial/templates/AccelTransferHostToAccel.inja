@@ -1,0 +1,13 @@
+R"CONST(
+// Accel side wait on IO
+while(getArg(io{{id}}) == 0){}
+
+{% if useDram %}
+// Accel side load
+val v{{id}} = SRAM[{{T}}]({% for dim in shape %}{{ dim }}{% if not loop.is_last %}, {% endif %}{% endfor %})
+v{{id}} load dram{{id}}
+{% else %}
+// read from reg
+v{{id}} = getArg()
+{% endif %}
+)CONST"

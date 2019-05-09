@@ -1,0 +1,3 @@
+R"CONST(
+val {{name}} = DRAM[{{T}}]({% for dim in shape %}{{ dim }}{% if not loop.is_last %}, {% endif %}{% endfor %})
+)CONST"

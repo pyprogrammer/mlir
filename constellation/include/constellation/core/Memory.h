@@ -45,6 +45,14 @@ namespace constellation {
             return !(*this == other);
         }
 
+        Location getLocation() {
+            return memoryType_;
+        }
+
+        IndexType getIndex() {
+            return index_;
+        }
+
     private:
         static IndexType getIndex(MLIRMemorySpaceType encoded) {
             return encoded & (kMaxIndex - 1);

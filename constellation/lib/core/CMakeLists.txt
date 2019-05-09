@@ -2,6 +2,7 @@ add_llvm_library(ConstellationCore
         ConstellationDialect.cpp
         Lattice.cpp
         IO.cpp
+        ValueIDPass.cpp
         )
 
 target_link_libraries(
@@ -15,4 +16,5 @@ target_link_libraries(
         MLIRParser
         MLIRPass
         MLIRTransforms
+        MLIRStandardOps
 )

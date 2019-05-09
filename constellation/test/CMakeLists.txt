@@ -15,6 +15,7 @@ macro(add_constellation_example name)
             MLIRParser
             MLIRPass
             MLIRTransforms
+            MLIRStandardOps
     )
 endmacro()
 

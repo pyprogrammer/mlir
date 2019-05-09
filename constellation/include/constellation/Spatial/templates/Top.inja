@@ -4,11 +4,15 @@ import spatial.dsl._
 @spatial object {{ name }} extends SpatialApp {
     def main(args: Array[String]): Unit = {
 {{ args }}
-{{ host }}
+
+{{ decl }}
 
         Accel * {
 {{ accel }}
         }
+
+{{ host }}
+
     }
 }
 )CONST"

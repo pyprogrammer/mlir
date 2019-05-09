@@ -1,0 +1,8 @@
+R"CONST(
+while(getArg(io{{id}}) == 0) {}
+{% if useDram %}
+val v{{id}} = getMem(dram{{id}})
+{% else %}
+val v{{id}} = getArg(valIO{{id}})
+{% endif %}
+)CONST"

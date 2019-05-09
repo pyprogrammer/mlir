@@ -7,25 +7,34 @@
 
 #include <string>
 #include <set>
+#include <vector>
 
 #include "mlir/IR/StandardTypes.h"
 
 #include "constellation/core/Backend.h"
 #include "constellation/core/Types.h"
+#include "constellation/core/ValueIDPass.h"
+
 #include "constellation/Spatial/CodeTemplates.h"
 #include "constellation/Spatial/SpatialLocationPass.h"
 
+#include "constellation/Spatial/SpatialEmitSupport.h"
+
 
 namespace constellation::spatial {
-    class SpatialFunc final: public BackendFunc<SpatialFunc> {
+    class SpatialModule final: public BackendModule<SpatialModule> {
     public:
-        using BackendFunc<SpatialFunc>::BackendFunc;
+        using BackendModule<SpatialModule>::BackendModule;
 
         void emit(llvm::raw_ostream* os) override;
 
         static void initPassManager(mlir::PassManager* pm);
-    };
 
+    private:
+
+        template<typename T>
+        void codegen(std::stringstream& decl, std::stringstream& host, std::stringstream& accel, T) {}
+    };
 }
 
 #endif //CONSTELLATION_SPATIALBACKEND_H

@@ -1,0 +1,16 @@
+R"CONST(
+{% if useDram %}
+val sram{{id}} = SRAM[{{T}}]({% for dim in shape %}{{ dim }}{% if not loop.is_last %}, {% endif %}{% endfor %})
+
+// copy values into sram
+copyInto(sram{{id}}, v{{prev_id}}, Seq({% for dim in shape %}{{ dim }}{% if not loop.is_last %}, {% endif %}{% endfor %}))
+
+// Accel side store
+dram{{id}} store sram{{id}}
+{% else %}
+valIO{{id}} := v{{prev_id}}
+{% endif %}
+// Accel side toggle IO
+
+io{{id}} := 1
+)CONST"
