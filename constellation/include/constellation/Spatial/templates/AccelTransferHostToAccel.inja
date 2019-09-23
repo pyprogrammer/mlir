@@ -1,6 +1,6 @@
 R"CONST(
 // Accel side wait on IO
-wait(io{{id}})
+constellation.wait(io{{id}})
 
 {% if useDram %}
 // Accel side load

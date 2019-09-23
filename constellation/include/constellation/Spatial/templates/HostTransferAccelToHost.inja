@@ -1,5 +1,5 @@
 R"CONST(
-wait(io{{id}})
+constellation.wait(io{{id}})
 {% if useDram %}
 val v{{id}} = getMem(dram{{id}})
 {% else %}

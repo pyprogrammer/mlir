@@ -59,7 +59,7 @@ TEST_FUNC(simplex_with_io) {
                                                               constellation::Memory(constellation::Memory::Location::CPU, 0)});
         (void) constellation::intrinsics::write({path, constellation::IO::AccessMode::STREAM, transback.getValue()});
         ret();
-//        cleanupAndPrintFunction(f);
+        cleanupAndPrintFunction(f);
         constellation::spatial::SpatialModule spatial(&module);
         spatial.emit(&llvm::outs());
     }

@@ -10,6 +10,25 @@ namespace constellation::spatial::detail {
         return std::regex_replace(s, replacement_regex, "\n" + std::string(indent, ' '));
     }
 
+    template<>
+    std::string constellationTypeToString(ConstNum<CONST_FIX> num) {
+        bool is_signed;
+        int first;
+        int second;
+        std::tie(is_signed, first, second) = num.getKey();
+        std::string sign = is_signed ? "TRUE" : "FALSE";
+        return "FixPt[" + sign + ", _" + std::to_string(first) + ", _" + std::to_string(second) + "]";
+    }
+
+    template<>
+    std::string constellationTypeToString(ConstNum<CONST_FLOAT> num) {
+        bool is_signed;
+        int first;
+        int second;
+        std::tie(is_signed, first, second) = num.getKey();
+        return "FltPt[_" + std::to_string(first) + ", _" + std::to_string(second) + "]";
+    }
+
     std::string typeToString(mlir::Type tp) {
         if (auto fltType = tp.dyn_cast<ConstNum<CONST_FLOAT>>()) {
             return constellationTypeToString(fltType);
@@ -37,4 +56,5 @@ namespace constellation::spatial::detail {
         shape.push_back(1);
         return shape;
     }
+
 }

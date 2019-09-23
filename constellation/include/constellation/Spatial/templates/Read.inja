@@ -1,3 +1,3 @@
 R"CONST(
-val v{{ id }} = load[{{ typestr }}]("{{ addr }}", Seq({% for dim in shape %}{{ dim }}{% if not loop.is_last %}, {% endif %}{% endfor %}));
+val v{{ id }} = constellation.read[{{ typestr }}]("{{ addr }}", Seq({% for dim in shape %}{{ dim }}{% if not loop.is_last %}, {% endif %}{% endfor %}));
 )CONST"
