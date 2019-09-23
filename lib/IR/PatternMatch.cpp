@@ -60,6 +60,20 @@ PatternMatchResult RewritePattern::match(Operation *op) const {
   llvm_unreachable("need to implement either match or matchAndRewrite!");
 }
 
+/// Patterns must specify the root operation name they match against, and can
+/// also specify the benefit of the pattern matching. They can also specify the
+/// names of operations that may be generated during a successful rewrite.
+RewritePattern::RewritePattern(StringRef rootName,
+                               ArrayRef<StringRef> generatedNames,
+                               PatternBenefit benefit, MLIRContext *context)
+    : Pattern(rootName, benefit, context) {
+  generatedOps.reserve(generatedNames.size());
+  std::transform(generatedNames.begin(), generatedNames.end(),
+                 std::back_inserter(generatedOps), [context](StringRef name) {
+                   return OperationName(name, context);
+                 });
+}
+
 PatternRewriter::~PatternRewriter() {
   // Out of line to provide a vtable anchor for the class.
 }
@@ -77,8 +91,7 @@ void PatternRewriter::replaceOp(Operation *op, ArrayRef<Value *> newValues,
 
   assert(op->getNumResults() == newValues.size() &&
          "incorrect # of replacement values");
-  for (unsigned i = 0, e = newValues.size(); i != e; ++i)
-    op->getResult(i)->replaceAllUsesWith(newValues[i]);
+  op->replaceAllUsesWith(newValues);
 
   notifyOperationRemoved(op);
   op->erase();
@@ -99,6 +112,18 @@ void PatternRewriter::replaceOpWithResultsOfAnotherOp(
   SmallVector<Value *, 8> newResults(newOp->getResults().begin(),
                                      newOp->getResults().end());
   return replaceOp(op, newResults, valuesToRemoveIfDead);
+}
+
+/// Move the blocks that belong to "region" before the given position in
+/// another region.  The two regions must be different.  The caller is in
+/// charge to update create the operation transferring the control flow to the
+/// region and pass it the correct block arguments.
+void PatternRewriter::inlineRegionBefore(Region &region, Region &parent,
+                                         Region::iterator before) {
+  parent.getBlocks().splice(before, region.getBlocks());
+}
+void PatternRewriter::inlineRegionBefore(Region &region, Block *before) {
+  inlineRegionBefore(region, *before->getParent(), before->getIterator());
 }
 
 /// This method is used as the final notification hook for patterns that end
@@ -123,19 +148,21 @@ void PatternRewriter::updatedRootInPlace(
 //===----------------------------------------------------------------------===//
 
 RewritePatternMatcher::RewritePatternMatcher(
-    OwningRewritePatternList &&patterns, PatternRewriter &rewriter)
-    : patterns(std::move(patterns)), rewriter(rewriter) {
+    const OwningRewritePatternList &patterns) {
+  for (auto &pattern : patterns)
+    this->patterns.push_back(pattern.get());
+
   // Sort the patterns by benefit to simplify the matching logic.
   std::stable_sort(this->patterns.begin(), this->patterns.end(),
-                   [](const std::unique_ptr<RewritePattern> &l,
-                      const std::unique_ptr<RewritePattern> &r) {
+                   [](RewritePattern *l, RewritePattern *r) {
                      return r->getBenefit() < l->getBenefit();
                    });
 }
 
 /// Try to match the given operation to a pattern and rewrite it.
-bool RewritePatternMatcher::matchAndRewrite(Operation *op) {
-  for (auto &pattern : patterns) {
+bool RewritePatternMatcher::matchAndRewrite(Operation *op,
+                                            PatternRewriter &rewriter) {
+  for (auto *pattern : patterns) {
     // Ignore patterns that are for the wrong root or are impossible to match.
     if (pattern->getRootKind() != op->getName() ||
         pattern->getBenefit().isImpossibleToMatch())

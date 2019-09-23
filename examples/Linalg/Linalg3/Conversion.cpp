@@ -37,25 +37,26 @@ using namespace linalg;
 using namespace linalg::common;
 using namespace linalg::intrinsics;
 
-Function *makeFunctionWithAMatmulOp(Module &module, StringRef name) {
+FuncOp makeFunctionWithAMatmulOp(ModuleOp module, StringRef name) {
   MLIRContext *context = module.getContext();
   auto dynamic2DMemRefType = floatMemRefType<2>(context);
-  mlir::Function *f = linalg::common::makeFunction(
+  mlir::FuncOp f = linalg::common::makeFunction(
       module, name,
       {dynamic2DMemRefType, dynamic2DMemRefType, dynamic2DMemRefType}, {});
 
-  ScopedContext scope(f);
+  OpBuilder builder(f.getBody());
+  ScopedContext scope(builder, f.getLoc());
   // clang-format off
   ValueHandle
-    M = dim(f->getArgument(0), 0),
-    N = dim(f->getArgument(2), 1),
-    K = dim(f->getArgument(0), 1),
+    M = dim(f.getArgument(0), 0),
+    N = dim(f.getArgument(2), 1),
+    K = dim(f.getArgument(0), 1),
     rM = range(constant_index(0), M, constant_index(1)),
     rN = range(constant_index(0), N, constant_index(1)),
     rK = range(constant_index(0), K, constant_index(1)),
-    vA = view(f->getArgument(0), {rM, rK}),
-    vB = view(f->getArgument(1), {rK, rN}),
-    vC = view(f->getArgument(2), {rM, rN});
+    vA = view(f.getArgument(0), {rM, rK}),
+    vB = view(f.getArgument(1), {rK, rN}),
+    vC = view(f.getArgument(2), {rM, rN});
   matmul(vA, vB, vC);
   ret();
   // clang-format on
@@ -65,11 +66,11 @@ Function *makeFunctionWithAMatmulOp(Module &module, StringRef name) {
 
 TEST_FUNC(foo) {
   MLIRContext context;
-  Module module(&context);
-  mlir::Function *f = makeFunctionWithAMatmulOp(module, "matmul_as_loops");
+  OwningModuleRef module = ModuleOp::create(UnknownLoc::get(&context));
+  mlir::FuncOp f = makeFunctionWithAMatmulOp(*module, "matmul_as_loops");
   lowerToLoops(f);
 
-  convertLinalg3ToLLVM(module);
+  convertLinalg3ToLLVM(*module);
 
   // clang-format off
   // CHECK:      {{.*}} = llvm.extractvalue {{.*}}[1] : !llvm<"{ float*, i64, [2 x i64], [2 x i64] }">
@@ -92,7 +93,8 @@ TEST_FUNC(foo) {
   // CHECK-NEXT: {{.*}} = llvm.extractvalue {{.*}}[0] : !llvm<"{ float*, i64, [2 x i64], [2 x i64] }">
   // CHECK-NEXT: {{.*}} = llvm.getelementptr {{.*}}[{{.*}}] : (!llvm<"float*">, !llvm.i64) -> !llvm<"float*">
   // CHECK-NEXT: {{.*}} = llvm.load {{.*}} : !llvm<"float*">
-  // CHECK:      %159 = llvm.extractvalue {{.*}}[1] : !llvm<"{ float*, i64, [2 x i64], [2 x i64] }">
+  // CHECK:      {{.*}} = llvm.extractvalue {{.*}}[1] : !llvm<"{ float*, i64, [2 x i64], [2 x i64] }">
+  // CHECK:      {{.*}} = llvm.extractvalue {{.*}}[1] : !llvm<"{ float*, i64, [2 x i64], [2 x i64] }">
   // CHECK-NEXT: {{.*}} = llvm.extractvalue {{.*}}[3, 0] : !llvm<"{ float*, i64, [2 x i64], [2 x i64] }">
   // CHECK-NEXT: {{.*}} = llvm.mul {{.*}}, {{.*}} : !llvm.i64
   // CHECK-NEXT: {{.*}} = llvm.add {{.*}}, {{.*}} : !llvm.i64
@@ -103,7 +105,7 @@ TEST_FUNC(foo) {
   // CHECK-NEXT: {{.*}} = llvm.getelementptr {{.*}}[{{.*}}] : (!llvm<"float*">, !llvm.i64) -> !llvm<"float*">
   // CHECK-NEXT: llvm.store {{.*}}, {{.*}} : !llvm<"float*">
   // clang-format on
-  module.print(llvm::outs());
+  module->print(llvm::outs());
 }
 
 int main() {

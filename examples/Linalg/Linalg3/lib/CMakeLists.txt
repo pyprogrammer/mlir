@@ -17,14 +17,18 @@ add_llvm_library(Linalg3
 
 target_link_libraries(Linalg3
   PUBLIC
+    MLIRAffineOps
     MLIRAnalysis
+    MLIRControlFlowToCFG
     MLIRDialect
     MLIREDSC
     MLIRIR
     MLIRLLVMIR
     MLIRParser
     MLIRPass
+    MLIRStandardToLLVM
     MLIRTransforms
+    Linalg2
     )
 
 add_llvm_library(Linalg3DialectConstruction

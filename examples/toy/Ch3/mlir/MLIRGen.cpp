@@ -24,14 +24,16 @@
 #include "toy/AST.h"
 #include "toy/Dialect.h"
 
+#include "mlir/Analysis/Verifier.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Function.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Module.h"
 #include "mlir/IR/StandardTypes.h"
 #include "mlir/IR/Types.h"
-#include "mlir/StandardOps/Ops.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopedHashTable.h"
@@ -42,11 +44,11 @@ using namespace toy;
 using llvm::cast;
 using llvm::dyn_cast;
 using llvm::isa;
-using llvm::make_unique;
 using llvm::ScopedHashTableScope;
 using llvm::SmallVector;
 using llvm::StringRef;
 using llvm::Twine;
+using std::make_unique;
 
 namespace {
 
@@ -67,24 +69,23 @@ public:
 
   /// Public API: convert the AST for a Toy module (source file) to an MLIR
   /// Module.
-  std::unique_ptr<mlir::Module> mlirGen(ModuleAST &moduleAST) {
+  mlir::OwningModuleRef mlirGen(ModuleAST &moduleAST) {
     // We create an empty MLIR module and codegen functions one at a time and
     // add them to the module.
-    theModule = make_unique<mlir::Module>(&context);
+    theModule = mlir::ModuleOp::create(mlir::UnknownLoc::get(&context));
 
     for (FunctionAST &F : moduleAST) {
       auto func = mlirGen(F);
       if (!func)
         return nullptr;
-      theModule->getFunctions().push_back(func.release());
+      theModule->push_back(func);
     }
 
     // FIXME: (in the next chapter...) without registering a dialect in MLIR,
     // this won't do much, but it should at least check some structural
     // properties.
-    if (failed(theModule->verify())) {
-      context.emitError(mlir::UnknownLoc::get(&context),
-                        "Module verification error");
+    if (failed(mlir::verify(*theModule))) {
+      emitError(mlir::UnknownLoc::get(&context), "module verification error");
       return nullptr;
     }
 
@@ -98,14 +99,14 @@ private:
   mlir::MLIRContext &context;
 
   /// A "module" matches a source file: it contains a list of functions.
-  std::unique_ptr<mlir::Module> theModule;
+  mlir::OwningModuleRef theModule;
 
   /// The builder is a helper class to create IR inside a function. It is
   /// re-initialized every time we enter a function and kept around as a
   /// convenience for emitting individual operations.
   /// The builder is stateful, in particular it keeeps an "insertion point":
   /// this is where the next operations will be introduced.
-  std::unique_ptr<mlir::FuncBuilder> builder;
+  std::unique_ptr<mlir::OpBuilder> builder;
 
   /// The symbol table maps a variable name to a value in the current scope.
   /// Entering a function creates a new scope, and the function arguments are
@@ -114,10 +115,9 @@ private:
   llvm::ScopedHashTable<StringRef, mlir::Value *> symbolTable;
 
   /// Helper conversion for a Toy AST location to an MLIR location.
-  mlir::FileLineColLoc loc(Location loc) {
-    return mlir::FileLineColLoc::get(
-        mlir::UniquedFilename::get(*loc.file, &context), loc.line, loc.col,
-        &context);
+  mlir::Location loc(Location loc) {
+    return mlir::FileLineColLoc::get(mlir::Identifier::get(*loc.file, &context),
+                                     loc.line, loc.col, &context);
   }
 
   /// Declare a variable in the current scope, return true if the variable
@@ -132,40 +132,38 @@ private:
 
   /// Create the prototype for an MLIR function with as many arguments as the
   /// provided Toy AST prototype.
-  mlir::Function *mlirGen(PrototypeAST &proto) {
+  mlir::FuncOp mlirGen(PrototypeAST &proto) {
     // This is a generic function, the return type will be inferred later.
     llvm::SmallVector<mlir::Type, 4> ret_types;
     // Arguments type is uniformly a generic array.
     llvm::SmallVector<mlir::Type, 4> arg_types(proto.getArgs().size(),
                                                getType(VarType{}));
     auto func_type = mlir::FunctionType::get(arg_types, ret_types, &context);
-    auto *function = new mlir::Function(loc(proto.loc()), proto.getName(),
-                                        func_type, /* attrs = */ {});
+    auto function = mlir::FuncOp::create(loc(proto.loc()), proto.getName(),
+                                         func_type, /* attrs = */ {});
 
     // Mark the function as generic: it'll require type specialization for every
     // call site.
-    if (function->getNumArguments())
-      function->setAttr("toy.generic", mlir::BoolAttr::get(true, &context));
+    if (function.getNumArguments())
+      function.setAttr("toy.generic", mlir::BoolAttr::get(true, &context));
 
     return function;
   }
 
   /// Emit a new function and add it to the MLIR module.
-  std::unique_ptr<mlir::Function> mlirGen(FunctionAST &funcAST) {
+  mlir::FuncOp mlirGen(FunctionAST &funcAST) {
     // Create a scope in the symbol table to hold variable declarations.
     ScopedHashTableScope<llvm::StringRef, mlir::Value *> var_scope(symbolTable);
 
     // Create an MLIR function for the given prototype.
-    std::unique_ptr<mlir::Function> function(mlirGen(*funcAST.getProto()));
+    mlir::FuncOp function(mlirGen(*funcAST.getProto()));
     if (!function)
       return nullptr;
 
     // Let's start the body of the function now!
     // In MLIR the entry block of the function is special: it must have the same
     // argument list as the function itself.
-    function->addEntryBlock();
-
-    auto &entryBlock = function->front();
+    auto &entryBlock = *function.addEntryBlock();
     auto &protoArgs = funcAST.getProto()->getArgs();
     // Declare all the function arguments in the symbol table.
     for (const auto &name_value :
@@ -175,16 +173,18 @@ private:
 
     // Create a builder for the function, it will be used throughout the codegen
     // to create operations in this function.
-    builder = llvm::make_unique<mlir::FuncBuilder>(function.get());
+    builder = std::make_unique<mlir::OpBuilder>(function.getBody());
 
     // Emit the body of the function.
-    if (!mlirGen(*funcAST.getBody()))
+    if (!mlirGen(*funcAST.getBody())) {
+      function.erase();
       return nullptr;
+    }
 
     // Implicitly return void if no return statement was emitted.
     // FIXME: we may fix the parser instead to always return the last expression
     // (this would possibly help the REPL case later)
-    if (function->getBlocks().back().back().getName().getStringRef() !=
+    if (function.getBlocks().back().back().getName().getStringRef() !=
         "toy.return") {
       ReturnExprAST fakeRet(funcAST.getProto()->loc(), llvm::None);
       mlirGen(fakeRet);
@@ -223,9 +223,8 @@ private:
     case '*':
       return builder->create<MulOp>(location, L, R).getResult();
     default:
-      context.emitError(loc(binop.loc()),
-                        Twine("Error: invalid binary operator '") +
-                            Twine(binop.getOp()) + "'");
+      emitError(loc(binop.loc()), "error: invalid binary operator '")
+          << binop.getOp() << "'";
       return nullptr;
     }
   }
@@ -236,8 +235,8 @@ private:
   mlir::Value *mlirGen(VariableExprAST &expr) {
     if (symbolTable.count(expr.getName()))
       return symbolTable.lookup(expr.getName());
-    context.emitError(loc(expr.loc()), Twine("Error: unknown variable '") +
-                                           expr.getName() + "'");
+    emitError(loc(expr.loc()), "error: unknown variable '")
+        << expr.getName() << "'";
     return nullptr;
   }
 
@@ -327,9 +326,8 @@ private:
     std::string callee = call.getCallee();
     if (callee == "transpose") {
       if (call.getArgs().size() != 1) {
-        context.emitError(
-            location, Twine("MLIR codegen encountered an error: toy.transpose "
-                            "does not accept multiple arguments"));
+        emitError(location, "MLIR codegen encountered an error: toy.transpose "
+                            "does not accept multiple arguments");
         return nullptr;
       }
       mlir::Value *arg = mlirGen(*call.getArgs()[0]);
@@ -385,10 +383,9 @@ private:
     case toy::ExprAST::Expr_Num:
       return mlirGen(cast<NumberExprAST>(expr));
     default:
-      context.emitError(
-          loc(expr.loc()),
-          Twine("MLIR codegen encountered an unhandled expr kind '") +
-              Twine(expr.getKind()) + "'");
+      emitError(loc(expr.loc()))
+          << "MLIR codegen encountered an unhandled expr kind '"
+          << Twine(expr.getKind()) << "'";
       return nullptr;
     }
   }
@@ -415,8 +412,8 @@ private:
                     .getResult();
       }
     } else {
-      context.emitError(loc(vardecl.loc()),
-                        "Missing initializer in variable declaration");
+      emitError(loc(vardecl.loc()),
+                "missing initializer in variable declaration");
       return nullptr;
     }
     // Register the value in the symbol table
@@ -472,8 +469,8 @@ private:
 namespace toy {
 
 // The public API for codegen.
-std::unique_ptr<mlir::Module> mlirGen(mlir::MLIRContext &context,
-                                      ModuleAST &moduleAST) {
+mlir::OwningModuleRef mlirGen(mlir::MLIRContext &context,
+                              ModuleAST &moduleAST) {
   return MLIRGenImpl(context).mlirGen(moduleAST);
 }
 

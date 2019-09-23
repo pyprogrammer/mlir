@@ -31,11 +31,11 @@ ViewOp linalg::getViewBaseViewOp(Value *view) {
   auto viewType = view->getType().dyn_cast<ViewType>();
   (void)viewType;
   assert(viewType.isa<ViewType>() && "expected a ViewType");
-  while (auto slice = view->getDefiningOp()->dyn_cast<SliceOp>()) {
+  while (auto slice = dyn_cast<SliceOp>(view->getDefiningOp())) {
     view = slice.getParentView();
     assert(viewType.isa<ViewType>() && "expected a ViewType");
   }
-  return view->getDefiningOp()->cast<ViewOp>();
+  return cast<ViewOp>(view->getDefiningOp());
 }
 
 Value *linalg::getViewSupportingMemRef(Value *view) {
@@ -48,15 +48,15 @@ std::pair<mlir::Value *, unsigned> linalg::getViewRootIndexing(Value *view,
   (void)viewType;
   assert(viewType.isa<ViewType>() && "expected a ViewType");
   assert(dim < viewType.getRank() && "dim exceeds rank");
-  if (auto viewOp = view->getDefiningOp()->dyn_cast<ViewOp>())
+  if (auto viewOp = dyn_cast<ViewOp>(view->getDefiningOp()))
     return std::make_pair(viewOp.getIndexing(dim), dim);
 
-  auto sliceOp = view->getDefiningOp()->cast<SliceOp>();
+  auto sliceOp = cast<SliceOp>(view->getDefiningOp());
   auto *parentView = sliceOp.getParentView();
   unsigned sliceDim = sliceOp.getSlicingDim();
   auto *indexing = sliceOp.getIndexing();
   if (indexing->getDefiningOp()) {
-    if (auto rangeOp = indexing->getDefiningOp()->cast<RangeOp>()) {
+    if (auto rangeOp = dyn_cast<RangeOp>(indexing->getDefiningOp())) {
       // If I sliced with a range and I sliced at this dim, then I'm it.
       if (dim == sliceDim) {
         return std::make_pair(rangeOp.getResult(), dim);

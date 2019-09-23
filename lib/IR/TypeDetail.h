@@ -52,7 +52,7 @@ struct OpaqueTypeStorage : public TypeStorage {
         OpaqueTypeStorage(key.first, tyData);
   }
 
-  // The unknown dialect namespace.
+  // The dialect namespace.
   Identifier dialectNamespace;
 
   // The parser type data for this opaque type.
@@ -118,8 +118,8 @@ struct FunctionTypeStorage : public TypeStorage {
 };
 
 /// VectorOrTensor Type Storage.
-struct VectorOrTensorTypeStorage : public TypeStorage {
-  VectorOrTensorTypeStorage(Type elementType, unsigned subclassData = 0)
+struct ShapedTypeStorage : public TypeStorage {
+  ShapedTypeStorage(Type elementType, unsigned subclassData = 0)
       : TypeStorage(subclassData), elementType(elementType) {}
 
   /// The hash key used for uniquing.
@@ -130,11 +130,10 @@ struct VectorOrTensorTypeStorage : public TypeStorage {
 };
 
 /// Vector Type Storage and Uniquing.
-struct VectorTypeStorage : public VectorOrTensorTypeStorage {
+struct VectorTypeStorage : public ShapedTypeStorage {
   VectorTypeStorage(unsigned shapeSize, Type elementTy,
                     const int64_t *shapeElements)
-      : VectorOrTensorTypeStorage(elementTy, shapeSize),
-        shapeElements(shapeElements) {}
+      : ShapedTypeStorage(elementTy, shapeSize), shapeElements(shapeElements) {}
 
   /// The hash key used for uniquing.
   using KeyTy = std::pair<ArrayRef<int64_t>, Type>;
@@ -160,11 +159,10 @@ struct VectorTypeStorage : public VectorOrTensorTypeStorage {
   const int64_t *shapeElements;
 };
 
-struct RankedTensorTypeStorage : public VectorOrTensorTypeStorage {
+struct RankedTensorTypeStorage : public ShapedTypeStorage {
   RankedTensorTypeStorage(unsigned shapeSize, Type elementTy,
                           const int64_t *shapeElements)
-      : VectorOrTensorTypeStorage(elementTy, shapeSize),
-        shapeElements(shapeElements) {}
+      : ShapedTypeStorage(elementTy, shapeSize), shapeElements(shapeElements) {}
 
   /// The hash key used for uniquing.
   using KeyTy = std::pair<ArrayRef<int64_t>, Type>;
@@ -190,9 +188,9 @@ struct RankedTensorTypeStorage : public VectorOrTensorTypeStorage {
   const int64_t *shapeElements;
 };
 
-struct UnrankedTensorTypeStorage : public VectorOrTensorTypeStorage {
-  using VectorOrTensorTypeStorage::KeyTy;
-  using VectorOrTensorTypeStorage::VectorOrTensorTypeStorage;
+struct UnrankedTensorTypeStorage : public ShapedTypeStorage {
+  using ShapedTypeStorage::KeyTy;
+  using ShapedTypeStorage::ShapedTypeStorage;
 
   /// Construction.
   static UnrankedTensorTypeStorage *construct(TypeStorageAllocator &allocator,
@@ -202,13 +200,13 @@ struct UnrankedTensorTypeStorage : public VectorOrTensorTypeStorage {
   }
 };
 
-struct MemRefTypeStorage : public TypeStorage {
+struct MemRefTypeStorage : public ShapedTypeStorage {
   MemRefTypeStorage(unsigned shapeSize, Type elementType,
                     const int64_t *shapeElements, const unsigned numAffineMaps,
                     AffineMap const *affineMapList, const unsigned memorySpace)
-      : TypeStorage(shapeSize), elementType(elementType),
-        shapeElements(shapeElements), numAffineMaps(numAffineMaps),
-        affineMapList(affineMapList), memorySpace(memorySpace) {}
+      : ShapedTypeStorage(elementType, shapeSize), shapeElements(shapeElements),
+        numAffineMaps(numAffineMaps), affineMapList(affineMapList),
+        memorySpace(memorySpace) {}
 
   /// The hash key used for uniquing.
   // MemRefs are uniqued based on their shape, element type, affine map
@@ -244,8 +242,6 @@ struct MemRefTypeStorage : public TypeStorage {
     return ArrayRef<AffineMap>(affineMapList, numAffineMaps);
   }
 
-  /// The type of each scalar element of the memref.
-  Type elementType;
   /// An array of integers which stores the shape dimension sizes.
   const int64_t *shapeElements;
   /// The number of affine maps in the 'affineMapList' array.

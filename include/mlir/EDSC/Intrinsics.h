@@ -42,18 +42,18 @@ namespace edsc {
 /// ```
 struct IndexHandle : public ValueHandle {
   explicit IndexHandle()
-      : ValueHandle(ScopedContext::getBuilder()->getIndexType()) {}
+      : ValueHandle(ScopedContext::getBuilder().getIndexType()) {}
   explicit IndexHandle(index_t v) : ValueHandle(v) {}
   explicit IndexHandle(Value *v) : ValueHandle(v) {
-    assert(v->getType() == ScopedContext::getBuilder()->getIndexType() &&
+    assert(v->getType() == ScopedContext::getBuilder().getIndexType() &&
            "Expected index type");
   }
   explicit IndexHandle(ValueHandle v) : ValueHandle(v) {
-    assert(v.getType() == ScopedContext::getBuilder()->getIndexType() &&
+    assert(v.getType() == ScopedContext::getBuilder().getIndexType() &&
            "Expected index type");
   }
   IndexHandle &operator=(const ValueHandle &v) {
-    assert(v.getType() == ScopedContext::getBuilder()->getIndexType() &&
+    assert(v.getType() == ScopedContext::getBuilder().getIndexType() &&
            "Expected index type");
     /// Creating a new IndexHandle(v) and then std::swap rightly complains the
     /// binding has already occurred and that we should use another name.
@@ -61,19 +61,31 @@ struct IndexHandle : public ValueHandle {
     this->v = v.getValue();
     return *this;
   }
-  static SmallVector<IndexHandle, 8> makeIndexHandles(unsigned rank) {
-    return SmallVector<IndexHandle, 8>(rank);
-  }
-  static SmallVector<ValueHandle *, 8>
-  makeIndexHandlePointers(SmallVectorImpl<IndexHandle> &ivs) {
-    SmallVector<ValueHandle *, 8> pivs;
-    pivs.reserve(ivs.size());
-    for (auto &iv : ivs) {
-      pivs.push_back(&iv);
-    }
-    return pivs;
-  }
 };
+
+inline SmallVector<IndexHandle, 8> makeIndexHandles(unsigned rank) {
+  return SmallVector<IndexHandle, 8>(rank);
+}
+
+inline SmallVector<ValueHandle *, 8>
+makeIndexHandlePointers(MutableArrayRef<IndexHandle> ivs) {
+  SmallVector<ValueHandle *, 8> pivs;
+  pivs.reserve(ivs.size());
+  for (auto &iv : ivs) {
+    pivs.push_back(&iv);
+  }
+  return pivs;
+}
+
+/// Returns a vector of the underlying Value* from `ivs`.
+inline SmallVector<Value *, 8> extractValues(ArrayRef<IndexHandle> ivs) {
+  SmallVector<Value *, 8> vals;
+  vals.reserve(ivs.size());
+  for (auto &iv : ivs) {
+    vals.push_back(iv.getValue());
+  }
+  return vals;
+}
 
 /// Provides a set of first class intrinsics.
 /// In the future, most of intrinsics related to Operation that don't contain
@@ -118,6 +130,7 @@ inline detail::ValueHandleArray unpack(ArrayRef<ValueHandle> values) {
 /// Without subclassing, implicit conversion to Value* would fail when composing
 /// in patterns such as: `select(a, b, select(c, d, e))`.
 template <typename Op> struct ValueBuilder : public ValueHandle {
+  // Builder-based
   template <typename... Args>
   ValueBuilder(Args... args)
       : ValueHandle(ValueHandle::create<Op>(detail::unpack(args)...)) {}
@@ -136,6 +149,30 @@ template <typename Op> struct ValueBuilder : public ValueHandle {
       : ValueHandle(ValueHandle::create<Op>(
             detail::unpack(t1), detail::unpack(t2), detail::unpack(vs),
             detail::unpack(args)...)) {}
+
+  /// Folder-based
+  template <typename... Args>
+  ValueBuilder(OperationFolder &folder, Args... args)
+      : ValueHandle(ValueHandle::create<Op>(folder, detail::unpack(args)...)) {}
+  ValueBuilder(OperationFolder &folder, ArrayRef<ValueHandle> vs)
+      : ValueBuilder(ValueBuilder::create<Op>(folder, detail::unpack(vs))) {}
+  template <typename... Args>
+  ValueBuilder(OperationFolder &folder, ArrayRef<ValueHandle> vs, Args... args)
+      : ValueHandle(ValueHandle::create<Op>(folder, detail::unpack(vs),
+                                            detail::unpack(args)...)) {}
+  template <typename T, typename... Args>
+  ValueBuilder(OperationFolder &folder, T t, ArrayRef<ValueHandle> vs,
+               Args... args)
+      : ValueHandle(ValueHandle::create<Op>(folder, detail::unpack(t),
+                                            detail::unpack(vs),
+                                            detail::unpack(args)...)) {}
+  template <typename T1, typename T2, typename... Args>
+  ValueBuilder(OperationFolder &folder, T1 t1, T2 t2, ArrayRef<ValueHandle> vs,
+               Args... args)
+      : ValueHandle(ValueHandle::create<Op>(
+            folder, detail::unpack(t1), detail::unpack(t2), detail::unpack(vs),
+            detail::unpack(args)...)) {}
+
   ValueBuilder() : ValueHandle(ValueHandle::create<Op>()) {}
 };
 
@@ -161,17 +198,24 @@ template <typename Op> struct OperationBuilder : public OperationHandle {
   OperationBuilder() : OperationHandle(OperationHandle::create<Op>()) {}
 };
 
+using affine_apply = ValueBuilder<AffineApplyOp>;
+using affine_if = OperationBuilder<AffineIfOp>;
+using affine_load = ValueBuilder<AffineLoadOp>;
+using affine_store = OperationBuilder<AffineStoreOp>;
 using alloc = ValueBuilder<AllocOp>;
+using call = OperationBuilder<mlir::CallOp>;
 using constant_float = ValueBuilder<ConstantFloatOp>;
 using constant_index = ValueBuilder<ConstantIndexOp>;
 using constant_int = ValueBuilder<ConstantIntOp>;
 using dealloc = OperationBuilder<DeallocOp>;
 using dim = ValueBuilder<DimOp>;
-using load = ValueBuilder<LoadOp>;
+using muli = ValueBuilder<MulIOp>;
 using ret = OperationBuilder<ReturnOp>;
 using select = ValueBuilder<SelectOp>;
-using store = OperationBuilder<StoreOp>;
-using vector_type_cast = ValueBuilder<VectorTypeCastOp>;
+using std_load = ValueBuilder<LoadOp>;
+using std_store = OperationBuilder<StoreOp>;
+using subi = ValueBuilder<SubIOp>;
+using vector_type_cast = ValueBuilder<vector::VectorTypeCastOp>;
 
 /// Branches into the mlir::Block* captured by BlockHandle `b` with `operands`.
 ///

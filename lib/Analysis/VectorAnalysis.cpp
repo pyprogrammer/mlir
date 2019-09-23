@@ -16,15 +16,16 @@
 // =============================================================================
 
 #include "mlir/Analysis/VectorAnalysis.h"
-#include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/AffineAnalysis.h"
 #include "mlir/Analysis/LoopAnalysis.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
+#include "mlir/Dialect/VectorOps/VectorOps.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/Operation.h"
-#include "mlir/StandardOps/Ops.h"
 #include "mlir/Support/Functional.h"
 #include "mlir/Support/STLExtras.h"
-#include "mlir/VectorOps/VectorOps.h"
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
@@ -108,7 +109,7 @@ Optional<SmallVector<unsigned, 4>> mlir::shapeRatio(VectorType superVectorType,
 /// Examples can be found in the documentation of `makePermutationMap`, in the
 /// header file.
 static AffineMap makePermutationMap(
-    Operation::operand_range operands,
+    ArrayRef<Value *> indices,
     const DenseMap<Operation *, unsigned> &enclosingLoopToVectorDim) {
   if (enclosingLoopToVectorDim.empty())
     return AffineMap();
@@ -116,14 +117,13 @@ static AffineMap makePermutationMap(
       enclosingLoopToVectorDim.begin()->getFirst()->getContext();
   using functional::makePtrDynCaster;
   using functional::map;
-  SmallVector<Value *, 8> indices(operands);
   SmallVector<AffineExpr, 4> perm(enclosingLoopToVectorDim.size(),
                                   getAffineConstantExpr(0, context));
 
   for (auto kvp : enclosingLoopToVectorDim) {
     assert(kvp.second < perm.size());
     auto invariants = getInvariantAccesses(
-        kvp.first->cast<AffineForOp>().getInductionVar(), indices);
+        cast<AffineForOp>(kvp.first).getInductionVar(), indices);
     unsigned numIndices = indices.size();
     unsigned countInvariantIndices = 0;
     for (unsigned dim = 0; dim < numIndices; ++dim) {
@@ -140,7 +140,7 @@ static AffineMap makePermutationMap(
            "Vectorization prerequisite violated: at most 1 index may be "
            "invariant wrt a vectorized loop");
   }
-  return AffineMap::get(indices.size(), 0, perm, {});
+  return AffineMap::get(indices.size(), 0, perm);
 }
 
 /// Implementation detail that walks up the parents and records the ones with
@@ -152,7 +152,7 @@ static SetVector<Operation *> getParentsOfType(Operation *op) {
   SetVector<Operation *> res;
   auto *current = op;
   while (auto *parent = current->getParentOp()) {
-    if (auto typedParent = parent->template dyn_cast<T>()) {
+    if (auto typedParent = dyn_cast<T>(parent)) {
       assert(res.count(parent) == 0 && "Already inserted");
       res.insert(parent);
     }
@@ -167,7 +167,8 @@ static SetVector<Operation *> getEnclosingforOps(Operation *op) {
 }
 
 AffineMap mlir::makePermutationMap(
-    Operation *op, const DenseMap<Operation *, unsigned> &loopToVectorDim) {
+    Operation *op, ArrayRef<Value *> indices,
+    const DenseMap<Operation *, unsigned> &loopToVectorDim) {
   DenseMap<Operation *, unsigned> enclosingLoopToVectorDim;
   auto enclosingLoops = getEnclosingforOps(op);
   for (auto *forInst : enclosingLoops) {
@@ -176,13 +177,7 @@ AffineMap mlir::makePermutationMap(
       enclosingLoopToVectorDim.insert(*it);
     }
   }
-
-  if (auto load = op->dyn_cast<LoadOp>()) {
-    return ::makePermutationMap(load.getIndices(), enclosingLoopToVectorDim);
-  }
-
-  auto store = op->cast<StoreOp>();
-  return ::makePermutationMap(store.getIndices(), enclosingLoopToVectorDim);
+  return ::makePermutationMap(indices, enclosingLoopToVectorDim);
 }
 
 bool mlir::matcher::operatesOnSuperVectorsOf(Operation &op,
@@ -197,15 +192,16 @@ bool mlir::matcher::operatesOnSuperVectorsOf(Operation &op,
   /// TODO(ntv): there should be a single function for all ops to do this so we
   /// do not have to special case. Maybe a trait, or just a method, unclear atm.
   bool mustDivide = false;
+  (void)mustDivide;
   VectorType superVectorType;
-  if (auto read = op.dyn_cast<VectorTransferReadOp>()) {
+  if (auto read = dyn_cast<vector::VectorTransferReadOp>(op)) {
     superVectorType = read.getResultType();
     mustDivide = true;
-  } else if (auto write = op.dyn_cast<VectorTransferWriteOp>()) {
+  } else if (auto write = dyn_cast<vector::VectorTransferWriteOp>(op)) {
     superVectorType = write.getVectorType();
     mustDivide = true;
   } else if (op.getNumResults() == 0) {
-    if (!op.isa<ReturnOp>()) {
+    if (!isa<ReturnOp>(op)) {
       op.emitError("NYI: assuming only return operations can have 0 "
                    " results at this point");
     }

@@ -35,8 +35,8 @@ using namespace mlir::edsc::intrinsics;
 using namespace linalg;
 using namespace linalg::intrinsics;
 
-void linalg::composeSliceOps(mlir::Function *f) {
-  f->walk<SliceOp>([](SliceOp sliceOp) {
+void linalg::composeSliceOps(mlir::FuncOp f) {
+  f.walk([](SliceOp sliceOp) {
     auto *sliceResult = sliceOp.getResult();
     auto viewOp = emitAndReturnFullyComposedView(sliceResult);
     sliceResult->replaceAllUsesWith(viewOp.getResult());
@@ -44,11 +44,11 @@ void linalg::composeSliceOps(mlir::Function *f) {
   });
 }
 
-void linalg::lowerToFinerGrainedTensorContraction(mlir::Function *f) {
-  f->walk([](Operation *op) {
-    if (auto matmulOp = op->dyn_cast<linalg::MatmulOp>()) {
+void linalg::lowerToFinerGrainedTensorContraction(mlir::FuncOp f) {
+  f.walk([](Operation *op) {
+    if (auto matmulOp = dyn_cast<linalg::MatmulOp>(op)) {
       matmulOp.writeAsFinerGrainTensorContraction();
-    } else if (auto matvecOp = op->dyn_cast<linalg::MatvecOp>()) {
+    } else if (auto matvecOp = dyn_cast<linalg::MatvecOp>(op)) {
       matvecOp.writeAsFinerGrainTensorContraction();
     } else {
       return;
@@ -78,9 +78,9 @@ Value *linalg::makeFoldedComposedAffineApply(AffineMap map,
   if (auto *v = tryFold(map, operands)) {
     return v;
   }
-  auto *b = ScopedContext::getBuilder();
+  auto &b = ScopedContext::getBuilder();
   auto loc = ScopedContext::getLocation();
-  return b->create<AffineApplyOp>(loc, map, operands).getResult();
+  return b.create<AffineApplyOp>(loc, map, operands).getResult();
 }
 
 linalg::RangeParts::RangeParts(unsigned reserved) {
@@ -95,7 +95,7 @@ extractFromRanges(ArrayRef<Value *> ranges,
   SmallVector<Value *, 4> res;
   res.reserve(ranges.size());
   for (auto *v : ranges) {
-    auto r = v->getDefiningOp()->cast<RangeOp>();
+    auto r = cast<RangeOp>(v->getDefiningOp());
     res.push_back(extract(r));
   }
   return res;
@@ -120,12 +120,11 @@ static RangeParts makeGenericRangeParts(AffineMap map,
   assert(map.getNumInputs() == ranges.size());
   unsigned numDims = map.getNumDims();
   assert(map.getNumSymbols() == 0);
-  assert(map.getRangeSizes().empty());
 
   RangeParts res(map.getNumResults());
   RangeParts rangeParts(ranges);
   for (auto expr : map.getResults()) {
-    AffineMap map = AffineMap::get(numDims, 0, expr, {});
+    AffineMap map = AffineMap::get(numDims, 0, expr);
     res.mins.push_back(makeFoldedComposedAffineApply(map, rangeParts.mins));
     res.maxes.push_back(makeFoldedComposedAffineApply(map, rangeParts.maxes));
     res.steps.push_back(makeFoldedComposedAffineApply(map, rangeParts.steps));
@@ -149,9 +148,9 @@ linalg::makeGenericLoopRanges(AffineMap operandRangesToLoopMaps,
   for (auto z : llvm::zip(res.steps, tileSizes)) {
     auto *step = std::get<0>(z);
     auto tileSize = std::get<1>(z);
-    auto stepValue = step->getDefiningOp()->cast<ConstantIndexOp>().getValue();
+    auto stepValue = cast<ConstantIndexOp>(step->getDefiningOp()).getValue();
     auto tileSizeValue =
-        tileSize->getDefiningOp()->cast<ConstantIndexOp>().getValue();
+        cast<ConstantIndexOp>(tileSize->getDefiningOp()).getValue();
     assert(stepValue > 0);
     tiledSteps.push_back(constant_index(stepValue * tileSizeValue));
   }
@@ -162,33 +161,30 @@ linalg::makeGenericLoopRanges(AffineMap operandRangesToLoopMaps,
 template <class ContractionOp>
 static SmallVector<mlir::AffineForOp, 4>
 writeContractionAsLoops(ContractionOp contraction) {
-  ScopedContext scope(FuncBuilder(contraction.getOperation()),
-                      contraction.getLoc());
+  OpBuilder builder(contraction.getOperation());
+  ScopedContext scope(builder, contraction.getLoc());
   auto allRanges = getRanges(contraction);
   auto loopRanges =
       makeGenericLoopRanges(operandRangesToLoopsMap(contraction), allRanges);
 
   SmallVector<IndexHandle, 4> parallelIvs(contraction.getNumParallelDims());
   SmallVector<IndexHandle, 4> reductionIvs(contraction.getNumReductionDims());
-  auto pivs = IndexHandle::makeIndexHandlePointers(parallelIvs);
-  auto rivs = IndexHandle::makeIndexHandlePointers(reductionIvs);
+  auto pivs = makeIndexHandlePointers(parallelIvs);
+  auto rivs = makeIndexHandlePointers(reductionIvs);
   assert(loopRanges.size() == pivs.size() + rivs.size());
 
   // clang-format off
   using linalg::common::LoopNestRangeBuilder;
   ArrayRef<Value *> ranges(loopRanges);
-  LoopNestRangeBuilder(pivs, ranges.take_front(pivs.size()))({
-    LoopNestRangeBuilder(rivs, ranges.take_back(rivs.size()))({
-      [&contraction, &parallelIvs, &reductionIvs]() {
+  LoopNestRangeBuilder(pivs, ranges.take_front(pivs.size()))([&]{
+    LoopNestRangeBuilder(rivs, ranges.take_back(rivs.size()))(
+      [&contraction, &parallelIvs, &reductionIvs] {
         SmallVector<mlir::Value *, 4> parallel(
             parallelIvs.begin(), parallelIvs.end());
         SmallVector<mlir::Value *, 4> reduction(
             reductionIvs.begin(), reductionIvs.end());
         contraction.emitScalarImplementation(parallel, reduction);
-        /// NestedBuilders expect handles, we thus return an IndexHandle.
-        return IndexHandle();
-      }()
-    })
+      });
   });
   // clang-format on
 
@@ -205,49 +201,22 @@ writeContractionAsLoops(ContractionOp contraction) {
 
 llvm::Optional<SmallVector<mlir::AffineForOp, 4>>
 linalg::writeAsLoops(Operation *op) {
-  if (auto matmulOp = op->dyn_cast<linalg::MatmulOp>()) {
+  if (auto matmulOp = dyn_cast<linalg::MatmulOp>(op)) {
     return writeContractionAsLoops(matmulOp);
-  } else if (auto matvecOp = op->dyn_cast<linalg::MatvecOp>()) {
+  } else if (auto matvecOp = dyn_cast<linalg::MatvecOp>(op)) {
     return writeContractionAsLoops(matvecOp);
-  } else if (auto dotOp = op->dyn_cast<linalg::DotOp>()) {
+  } else if (auto dotOp = dyn_cast<linalg::DotOp>(op)) {
     return writeContractionAsLoops(dotOp);
   }
   return llvm::None;
 }
 
-void linalg::lowerToLoops(mlir::Function *f) {
-  f->walk([](Operation *op) {
+void linalg::lowerToLoops(mlir::FuncOp f) {
+  f.walk([](Operation *op) {
     if (writeAsLoops(op))
       op->erase();
   });
 }
-
-namespace {
-
-/// Rewriting linalg::LoadOp and linalg::StoreOp to mlir::LoadOp and
-/// mlir::StoreOp requires finding the proper indexing in the supporting MemRef.
-/// This is most easily achieved by calling emitAndReturnFullyComposedView to
-/// fold away all the SliceOp.
-template <typename LoadOrStoreOpTy> struct Rewriter : public RewritePattern {
-  explicit Rewriter(MLIRContext *context)
-      : RewritePattern(LoadOrStoreOpTy::getOperationName(), 1, context) {}
-
-  /// Performs the rewrite.
-  PatternMatchResult matchAndRewrite(Operation *op,
-                                     PatternRewriter &rewriter) const override;
-};
-
-struct LowerLinalgLoadStorePass
-    : public FunctionPass<LowerLinalgLoadStorePass> {
-  void runOnFunction() {
-    OwningRewritePatternList patterns;
-    auto *context = &getContext();
-    patterns.push_back(llvm::make_unique<Rewriter<linalg::LoadOp>>(context));
-    patterns.push_back(llvm::make_unique<Rewriter<linalg::StoreOp>>(context));
-    applyPatternsGreedily(getFunction(), std::move(patterns));
-  }
-};
-} // namespace
 
 /// Emits and returns the standard load and store ops from the view indexings.
 /// If the indexing is of index type, use it as an index to the load/store.
@@ -263,7 +232,7 @@ emitAndReturnLoadStoreOperands(LoadOrStoreOp loadOrStoreOp, ViewOp viewOp) {
       operands.push_back(indexing);
       continue;
     }
-    RangeOp range = indexing->getDefiningOp()->cast<RangeOp>();
+    RangeOp range = cast<RangeOp>(indexing->getDefiningOp());
     ValueHandle min(range.getMin());
     Value *storeIndex = *(loadOrStoreOp.getIndices().begin() + storeDim++);
     using edsc::op::operator+;
@@ -272,38 +241,65 @@ emitAndReturnLoadStoreOperands(LoadOrStoreOp loadOrStoreOp, ViewOp viewOp) {
   return operands;
 }
 
+namespace {
+
+/// Rewriting linalg::LoadOp and linalg::StoreOp to mlir::LoadOp and
+/// mlir::StoreOp requires finding the proper indexing in the supporting MemRef.
+/// This is most easily achieved by calling emitAndReturnFullyComposedView to
+/// fold away all the SliceOp.
+template <typename LoadOrStoreOpTy>
+struct Rewriter : public OpRewritePattern<LoadOrStoreOpTy> {
+  using OpRewritePattern<LoadOrStoreOpTy>::OpRewritePattern;
+
+  /// Performs the rewrite.
+  PatternMatchResult matchAndRewrite(LoadOrStoreOpTy op,
+                                     PatternRewriter &rewriter) const override;
+};
+
+struct LowerLinalgLoadStorePass
+    : public FunctionPass<LowerLinalgLoadStorePass> {
+  void runOnFunction() override {
+    OwningRewritePatternList patterns;
+    auto *context = &getContext();
+    patterns.insert<Rewriter<linalg::LoadOp>, Rewriter<linalg::StoreOp>>(
+        context);
+    applyPatternsGreedily(getFunction(), patterns);
+  }
+};
+
 template <>
 PatternMatchResult
-Rewriter<linalg::LoadOp>::matchAndRewrite(Operation *op,
+Rewriter<linalg::LoadOp>::matchAndRewrite(linalg::LoadOp load,
                                           PatternRewriter &rewriter) const {
-  auto load = op->cast<linalg::LoadOp>();
-  SliceOp slice = load.getView()->getDefiningOp()->dyn_cast<SliceOp>();
+  SliceOp slice = dyn_cast<SliceOp>(load.getView()->getDefiningOp());
   ViewOp view = slice ? emitAndReturnFullyComposedView(slice.getResult())
-                      : load.getView()->getDefiningOp()->cast<ViewOp>();
-  ScopedContext scope(FuncBuilder(load), load.getLoc());
+                      : cast<ViewOp>(load.getView()->getDefiningOp());
+  OpBuilder builder(load);
+  ScopedContext scope(builder, load.getLoc());
   auto *memRef = view.getSupportingMemRef();
   auto operands = emitAndReturnLoadStoreOperands(load, view);
-  rewriter.replaceOpWithNewOp<mlir::LoadOp>(op, memRef, operands);
+  rewriter.replaceOpWithNewOp<mlir::LoadOp>(load, memRef, operands);
   return matchSuccess();
 }
 
 template <>
 PatternMatchResult
-Rewriter<linalg::StoreOp>::matchAndRewrite(Operation *op,
+Rewriter<linalg::StoreOp>::matchAndRewrite(linalg::StoreOp store,
                                            PatternRewriter &rewriter) const {
-  auto store = op->cast<linalg::StoreOp>();
-  SliceOp slice = store.getView()->getDefiningOp()->dyn_cast<SliceOp>();
+  SliceOp slice = dyn_cast<SliceOp>(store.getView()->getDefiningOp());
   ViewOp view = slice ? emitAndReturnFullyComposedView(slice.getResult())
-                      : store.getView()->getDefiningOp()->cast<ViewOp>();
-  ScopedContext scope(FuncBuilder(store), store.getLoc());
+                      : cast<ViewOp>(store.getView()->getDefiningOp());
+  OpBuilder builder(store);
+  ScopedContext scope(builder, store.getLoc());
   auto *valueToStore = store.getValueToStore();
   auto *memRef = view.getSupportingMemRef();
   auto operands = emitAndReturnLoadStoreOperands(store, view);
-  rewriter.replaceOpWithNewOp<mlir::StoreOp>(op, valueToStore, memRef,
+  rewriter.replaceOpWithNewOp<mlir::StoreOp>(store, valueToStore, memRef,
                                              operands);
   return matchSuccess();
 }
+} // namespace
 
-FunctionPassBase *linalg::createLowerLinalgLoadStorePass() {
-  return new LowerLinalgLoadStorePass();
+std::unique_ptr<OpPassBase<FuncOp>> linalg::createLowerLinalgLoadStorePass() {
+  return std::make_unique<LowerLinalgLoadStorePass>();
 }

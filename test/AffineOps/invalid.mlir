@@ -1,4 +1,4 @@
-// RUN: mlir-opt %s -split-input-file -verify
+// RUN: mlir-opt %s -split-input-file -verify-diagnostics
 
 // -----
 
@@ -23,6 +23,26 @@ func @affine_apply_invalid_sym() {
     // expected-error@+1 {{operand cannot be used as a symbol}}
     %0 = affine.apply #map0(%i0)[%i0]
   }
+  return
+}
+
+// -----
+
+func @affine_apply_operand_non_index(%arg0 : i32) {
+  // Custom parser automatically assigns all arguments the `index` so we must
+  // use the generic syntax here to exercise the verifier.
+  // expected-error@+1 {{operands must be of type 'index'}}
+  %0 = "affine.apply"(%arg0) {map = (d0) -> (d0)} : (i32) -> (index)
+  return
+}
+
+// -----
+
+func @affine_apply_resul_non_index(%arg0 : index) {
+  // Custom parser automatically assigns `index` as the result type so we must
+  // use the generic syntax here to exercise the verifier.
+  // expected-error@+1 {{result must be of type 'index'}}
+  %0 = "affine.apply"(%arg0) {map = (d0) -> (d0)} : (index) -> (i32)
   return
 }
 
@@ -120,5 +140,14 @@ func @affine_if_invalid_dimop_dim(%arg0: index, %arg1: index, %arg2: index, %arg
     // expected-error@+1 {{operand cannot be used as a dimension id}}
     affine.if #set0(%dim)[%n0] {}
   }
+  return
+}
+
+// -----
+
+func @affine_store_missing_l_square(%C: memref<4096x4096xf32>) {
+  %9 = constant 0.0 : f32
+  // expected-error@+1 {{expected '['}}
+  affine.store %9, %C : memref<4096x4096xf32>
   return
 }

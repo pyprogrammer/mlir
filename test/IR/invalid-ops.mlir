@@ -1,8 +1,8 @@
-// RUN: mlir-opt %s -split-input-file -verify
+// RUN: mlir-opt %s -split-input-file -verify-diagnostics
 
 func @dim(tensor<1xf32>) {
 ^bb(%0: tensor<1xf32>):
-  "std.dim"(%0){index: "xyz"} : (tensor<1xf32>)->i32 // expected-error {{'std.dim' op requires an integer attribute named 'index'}}
+  "std.dim"(%0){index = "xyz"} : (tensor<1xf32>)->index // expected-error {{attribute 'index' failed to satisfy constraint: arbitrary integer attribute}}
   return
 }
 
@@ -10,7 +10,7 @@ func @dim(tensor<1xf32>) {
 
 func @dim2(tensor<1xf32>) {
 ^bb(%0: tensor<1xf32>):
-  "std.dim"(){index: "xyz"} : ()->i32 // expected-error {{'std.dim' op requires a single operand}}
+  "std.dim"(){index = "xyz"} : ()->index // expected-error {{'std.dim' op requires a single operand}}
   return
 }
 
@@ -18,7 +18,15 @@ func @dim2(tensor<1xf32>) {
 
 func @dim3(tensor<1xf32>) {
 ^bb(%0: tensor<1xf32>):
-  "std.dim"(%0){index: 1} : (tensor<1xf32>)->i32 // expected-error {{'std.dim' op index is out of range}}
+  "std.dim"(%0){index = 1} : (tensor<1xf32>)->index // expected-error {{'std.dim' op index is out of range}}
+  return
+}
+
+// -----
+
+func @rank(f32) {
+^bb(%0: f32):
+  "std.rank"(%0): (f32)->index // expected-error {{'std.rank' op operand #0 must be tensor of any type values}}
   return
 }
 
@@ -26,7 +34,7 @@ func @dim3(tensor<1xf32>) {
 
 func @constant() {
 ^bb:
-  %x = "std.constant"(){value: "xyz"} : () -> i32 // expected-error {{'std.constant' op requires 'value' to be an integer for an integer result type}}
+  %x = "std.constant"(){value = "xyz"} : () -> i32 // expected-error {{unsupported 'value' attribute}}
   return
 }
 
@@ -34,15 +42,22 @@ func @constant() {
 
 func @constant_out_of_range() {
 ^bb:
-  %x = "std.constant"(){value: 100} : () -> i1 // expected-error {{'std.constant' op requires 'value' to be an integer within the range of the integer result type}}
+  %x = "std.constant"(){value = 100} : () -> i1 // expected-error {{requires attribute's type ('i64') to match op's return type ('i1')}}
   return
 }
 
 // -----
 
+func @constant_wrong_type() {
+^bb:
+  %x = "std.constant"(){value = 10.} : () -> f32 // expected-error {{requires attribute's type ('f64') to match op's return type ('f32')}}
+  return
+}
+
+// -----
 func @affine_apply_no_map() {
 ^bb0:
-  %i = "std.constant"() {value: 0} : () -> index
+  %i = constant 0 : index
   %x = "affine.apply" (%i) { } : (index) -> (index) //  expected-error {{'affine.apply' op requires an affine map}}
   return
 }
@@ -51,8 +66,8 @@ func @affine_apply_no_map() {
 
 func @affine_apply_wrong_operand_count() {
 ^bb0:
-  %i = "std.constant"() {value: 0} : () -> index
-  %x = "affine.apply" (%i) {map: (d0, d1) -> ((d0 + 1), (d1 + 2))} : (index) -> (index) //  expected-error {{'affine.apply' op operand count and affine map dimension and symbol count must match}}
+  %i = constant 0 : index
+  %x = "affine.apply" (%i) {map = (d0, d1) -> ((d0 + 1), (d1 + 2))} : (index) -> (index) //  expected-error {{'affine.apply' op operand count and affine map dimension and symbol count must match}}
   return
 }
 
@@ -60,9 +75,9 @@ func @affine_apply_wrong_operand_count() {
 
 func @affine_apply_wrong_result_count() {
 ^bb0:
-  %i = "std.constant"() {value: 0} : () -> index
-  %j = "std.constant"() {value: 1} : () -> index
-  %x = "affine.apply" (%i, %j) {map: (d0, d1) -> ((d0 + 1), (d1 + 2))} : (index,index) -> (index) //  expected-error {{'affine.apply' op mapping must produce one value}}
+  %i = constant 0 : index
+  %j = constant 1 : index
+  %x = "affine.apply" (%i, %j) {map = (d0, d1) -> ((d0 + 1), (d1 + 2))} : (index,index) -> (index) //  expected-error {{'affine.apply' op mapping must produce one value}}
   return
 }
 
@@ -70,7 +85,7 @@ func @affine_apply_wrong_result_count() {
 
 func @unknown_custom_op() {
 ^bb0:
-  %i = crazyThing() {value: 0} : () -> index  // expected-error {{custom op 'crazyThing' is unknown}}
+  %i = crazyThing() {value = 0} : () -> index  // expected-error {{custom op 'crazyThing' is unknown}}
   return
 }
 
@@ -86,9 +101,9 @@ func @unknown_std_op() {
 
 func @bad_alloc_wrong_dynamic_dim_count() {
 ^bb0:
-  %0 = "std.constant"() {value: 7} : () -> index
+  %0 = constant 7 : index
   // Test alloc with wrong number of dynamic dimensions.
-  %1 = alloc(%0)[%1] : memref<2x4xf32, (d0, d1)[s0] -> ((d0 + s0), d1), 1> // expected-error {{custom op 'alloc' dimension operand count does not equal memref dynamic dimension count}}
+  %1 = alloc(%0)[%1] : memref<2x4xf32, (d0, d1)[s0] -> ((d0 + s0), d1), 1> // expected-error {{op 'std.alloc' dimension operand count does not equal memref dynamic dimension count}}
   return
 }
 
@@ -96,7 +111,7 @@ func @bad_alloc_wrong_dynamic_dim_count() {
 
 func @bad_alloc_wrong_symbol_count() {
 ^bb0:
-  %0 = "std.constant"() {value: 7} : () -> index
+  %0 = constant 7 : index
   // Test alloc with wrong number of symbols
   %1 = alloc(%0) : memref<2x?xf32, (d0, d1)[s0] -> ((d0 + s0), d1), 1> // expected-error {{operand count does not equal dimension plus symbol operand count}}
   return
@@ -107,8 +122,8 @@ func @bad_alloc_wrong_symbol_count() {
 func @test_store_zero_results() {
 ^bb0:
   %0 = alloc() : memref<1024x64xf32, (d0, d1) -> (d0, d1), 1>
-  %1 = "std.constant"() {value: 0} : () -> index
-  %2 = "std.constant"() {value: 1} : () -> index
+  %1 = constant 0 : index
+  %2 = constant 1 : index
   %3 = load %0[%1, %2] : memref<1024x64xf32, (d0, d1) -> (d0, d1), 1>
   // Test that store returns zero results.
   %4 = store %3, %0[%1, %2] : memref<1024x64xf32, (d0, d1) -> (d0, d1), 1> // expected-error {{cannot name an operation with no results}}
@@ -134,29 +149,15 @@ func @test_alloc_memref_map_rank_mismatch() {
 
 func @intlimit2() {
 ^bb:
-  %0 = "std.constant"() {value: 0} : () -> i4096
-  %1 = "std.constant"() {value: 1} : () -> i4097 // expected-error {{integer bitwidth is limited to 4096 bits}}
-  return
-}
-
-// -----
-
-func @func_constant() {
-  %x = "std.constant"(){value: "xyz"} : () -> i32 // expected-error {{'std.constant' op requires 'value' to be an integer for an integer result type}}
-  return
-}
-
-// -----
-
-func @func_constant_out_of_range() {
-  %x = "std.constant"(){value: 100} : () -> i1 // expected-error {{'std.constant' op requires 'value' to be an integer within the range of the integer result type}}
+  %0 = "std.constant"() {value = 0} : () -> i4096
+  %1 = "std.constant"() {value = 1} : () -> i4097 // expected-error {{integer bitwidth is limited to 4096 bits}}
   return
 }
 
 // -----
 
 func @calls(%arg0: i32) {
-  %x = call @calls() : () -> i32  // expected-error {{reference to function with mismatched type}}
+  %x = call @calls() : () -> i32  // expected-error {{incorrect number of operands for callee}}
   return
 }
 
@@ -164,7 +165,7 @@ func @calls(%arg0: i32) {
 
 func @func_with_ops(f32) {
 ^bb0(%a : f32):
-  %sf = addf %a, %a, %a : f32  // expected-error {{custom op 'addf' expected 2 operands}}
+  %sf = addf %a, %a, %a : f32  // expected-error {{custom op 'std.addf' expected 2 operands}}
 }
 
 // -----
@@ -201,14 +202,14 @@ func @func_with_ops(i32) {
 func @func_with_ops(i32) {
 ^bb0(%a : i32):
   // expected-error@+1 {{'predicate' attribute value out of range}}
-  %r = "std.cmpi"(%a, %a) {predicate: 42} : (i32, i32) -> i1
+  %r = "std.cmpi"(%a, %a) {predicate = 42} : (i32, i32) -> i1
 }
 
 // -----
 
 // Comparison are defined for arguments of the same type.
 func @func_with_ops(i32, i64) {
-^bb0(%a : i32, %b : i64): // expected-error {{prior use here}}
+^bb0(%a : i32, %b : i64): // expected-note {{prior use here}}
   %r = cmpi "eq", %a, %b : i32 // expected-error {{use of value '%b' expects different type than prior uses}}
 }
 
@@ -225,7 +226,7 @@ func @func_with_ops(i32, i32) {
 // Integer comparisons are not recognized for float types.
 func @func_with_ops(f32, f32) {
 ^bb0(%a : f32, %b : f32):
-  %r = cmpi "eq", %a, %b : f32 // expected-error {{op requires an integer or index type}}
+  %r = cmpi "eq", %a, %b : f32 // expected-error {{operand #0 must be integer-like}}
 }
 
 // -----
@@ -233,7 +234,7 @@ func @func_with_ops(f32, f32) {
 // Result type must be boolean like.
 func @func_with_ops(i32, i32) {
 ^bb0(%a : i32, %b : i32):
-  %r = "std.cmpi"(%a, %b) {predicate: 0} : (i32, i32) -> i32 // expected-error {{op requires a bool result type}}
+  %r = "std.cmpi"(%a, %b) {predicate = 0} : (i32, i32) -> i32 // expected-error {{op result #0 must be bool-like}}
 }
 
 // -----
@@ -241,16 +242,16 @@ func @func_with_ops(i32, i32) {
 func @func_with_ops(i32, i32) {
 ^bb0(%a : i32, %b : i32):
   // expected-error@+1 {{requires an integer attribute named 'predicate'}}
-  %r = "std.cmpi"(%a, %b) {foo: 1} : (i32, i32) -> i1
+  %r = "std.cmpi"(%a, %b) {foo = 1} : (i32, i32) -> i1
 }
 
 // -----
 
 func @func_with_ops() {
 ^bb0:
-  %c = constant splat<vector<42 x i32>, 0> : vector<42 x i32>
+  %c = constant dense<0> : vector<42 x i32>
   // expected-error@+1 {{op requires the same shape for all operands and results}}
-  %r = "std.cmpi"(%c, %c) {predicate: 0} : (vector<42 x i32>, vector<42 x i32>) -> vector<41 x i1>
+  %r = "std.cmpi"(%c, %c) {predicate = 0} : (vector<42 x i32>, vector<42 x i32>) -> vector<41 x i1>
 }
 
 // -----
@@ -258,7 +259,7 @@ func @func_with_ops() {
 func @func_with_ops(i32, i32, i32) {
 ^bb0(%cond : i32, %t : i32, %f : i32):
   // expected-error@+2 {{different type than prior uses}}
-  // expected-error@-2 {{prior use here}}
+  // expected-note@-2 {{prior use here}}
   %r = select %cond, %t, %f : i32
 }
 
@@ -266,7 +267,7 @@ func @func_with_ops(i32, i32, i32) {
 
 func @func_with_ops(i32, i32, i32) {
 ^bb0(%cond : i32, %t : i32, %f : i32):
-  // expected-error@+1 {{elemental type i1}}
+  // expected-error@+1 {{op operand #0 must be bool-like}}
   %r = "std.select"(%cond, %t, %f) : (i32, i32, i32) -> i32
 }
 
@@ -282,7 +283,7 @@ func @func_with_ops(i1, i32, i64) {
 
 func @func_with_ops(i1, vector<42xi32>, vector<42xi32>) {
 ^bb0(%cond : i1, %t : vector<42xi32>, %f : vector<42xi32>):
-  // expected-error@+1 {{requires the condition to have the same shape as arguments}}
+  // expected-error@+1 {{requires the same shape for all operands and results}}
   %r = "std.select"(%cond, %t, %f) : (i1, vector<42xi32>, vector<42xi32>) -> vector<42xi32>
 }
 
@@ -290,7 +291,7 @@ func @func_with_ops(i1, vector<42xi32>, vector<42xi32>) {
 
 func @func_with_ops(i1, tensor<42xi32>, tensor<?xi32>) {
 ^bb0(%cond : i1, %t : tensor<42xi32>, %f : tensor<?xi32>):
-  // expected-error@+1 {{'true' and 'false' arguments to be of the same type}}
+  // expected-error@+1 {{ op requires the same shape for all operands and results}}
   %r = "std.select"(%cond, %t, %f) : (i1, tensor<42xi32>, tensor<?xi32>) -> tensor<42xi32>
 }
 
@@ -298,7 +299,7 @@ func @func_with_ops(i1, tensor<42xi32>, tensor<?xi32>) {
 
 func @func_with_ops(tensor<?xi1>, tensor<42xi32>, tensor<42xi32>) {
 ^bb0(%cond : tensor<?xi1>, %t : tensor<42xi32>, %f : tensor<42xi32>):
-  // expected-error@+1 {{requires the condition to have the same shape as arguments}}
+  // expected-error@+1 {{requires the same shape for all operands and results}}
   %r = "std.select"(%cond, %t, %f) : (tensor<?xi1>, tensor<42xi32>, tensor<42xi32>) -> tensor<42xi32>
 }
 
@@ -339,7 +340,7 @@ func @test_vector.transfer_read(memref<?x?xf32>) {
   %c3 = constant 3 : index
   %cst = constant 3.0 : f32
   // expected-error@+1 {{requires an AffineMapAttr named 'permutation_map'}}
-  %0 = vector.transfer_read %arg0[%c3, %c3] {perm: (d0)->(d0)} : memref<?x?xf32>, vector<128xf32>
+  %0 = vector.transfer_read %arg0[%c3, %c3] {perm = (d0)->(d0)} : memref<?x?xf32>, vector<128xf32>
 }
 
 // -----
@@ -349,7 +350,7 @@ func @test_vector.transfer_read(memref<?x?xf32>) {
   %c3 = constant 3 : index
   %cst = constant 3.0 : f32
   // expected-error@+1 {{requires a permutation_map with input dims of the same rank as the memref type}}
-  %0 = vector.transfer_read %arg0[%c3, %c3] {permutation_map: (d0)->(d0)} : memref<?x?xf32>, vector<128xf32>
+  %0 = vector.transfer_read %arg0[%c3, %c3] {permutation_map = (d0)->(d0)} : memref<?x?xf32>, vector<128xf32>
 }
 
 // -----
@@ -359,7 +360,7 @@ func @test_vector.transfer_read(memref<?x?xf32>) {
   %c3 = constant 3 : index
   %cst = constant 3.0 : f32
   // expected-error@+1 {{requires a permutation_map with result dims of the same rank as the vector type}}
-  %0 = vector.transfer_read %arg0[%c3, %c3] {permutation_map: (d0, d1)->(d0, d1)} : memref<?x?xf32>, vector<128xf32>
+  %0 = vector.transfer_read %arg0[%c3, %c3] {permutation_map = (d0, d1)->(d0, d1)} : memref<?x?xf32>, vector<128xf32>
 }
 
 // -----
@@ -369,7 +370,7 @@ func @test_vector.transfer_read(memref<?x?xf32>) {
   %c3 = constant 3 : index
   %cst = constant 3.0 : f32
   // expected-error@+1 {{requires a projected permutation_map (at most one dim or the zero constant can appear in each result)}}
-  %0 = vector.transfer_read %arg0[%c3, %c3] {permutation_map: (d0, d1)->(d0 + d1)} : memref<?x?xf32>, vector<128xf32>
+  %0 = vector.transfer_read %arg0[%c3, %c3] {permutation_map = (d0, d1)->(d0 + d1)} : memref<?x?xf32>, vector<128xf32>
 }
 
 // -----
@@ -379,7 +380,7 @@ func @test_vector.transfer_read(memref<?x?xf32>) {
   %c3 = constant 3 : index
   %cst = constant 3.0 : f32
   // expected-error@+1 {{requires a projected permutation_map (at most one dim or the zero constant can appear in each result)}}
-  %0 = vector.transfer_read %arg0[%c3, %c3] {permutation_map: (d0, d1)->(d0 + 1)} : memref<?x?xf32>, vector<128xf32>
+  %0 = vector.transfer_read %arg0[%c3, %c3] {permutation_map = (d0, d1)->(d0 + 1)} : memref<?x?xf32>, vector<128xf32>
 }
 
 // -----
@@ -389,7 +390,7 @@ func @test_vector.transfer_read(memref<?x?x?xf32>) {
   %c3 = constant 3 : index
   %cst = constant 3.0 : f32
   // expected-error@+1 {{requires a permutation_map that is a permutation (found one dim used more than once)}}
-  %0 = vector.transfer_read %arg0[%c3, %c3, %c3] {permutation_map: (d0, d1, d2)->(d0, d0)} : memref<?x?x?xf32>, vector<3x7xf32>
+  %0 = vector.transfer_read %arg0[%c3, %c3, %c3] {permutation_map = (d0, d1, d2)->(d0, d0)} : memref<?x?x?xf32>, vector<3x7xf32>
 }
 
 // -----
@@ -397,7 +398,7 @@ func @test_vector.transfer_read(memref<?x?x?xf32>) {
 func @test_vector.transfer_write(memref<?x?xf32>) {
 ^bb0(%arg0: memref<?x?xf32>):
   %c3 = constant 3 : index
-  %cst = constant splat<vector<128 x f32>, 3.0>  : vector<128 x f32>
+  %cst = constant dense<3.0> : vector<128 x f32>
   // expected-error@+1 {{expected 5 operand types but had 4}}
   %0 = "vector.transfer_write"(%cst, %arg0, %c3, %c3, %c3) : (vector<128xf32>, memref<?x?xf32>, index, index) -> ()
 }
@@ -407,7 +408,7 @@ func @test_vector.transfer_write(memref<?x?xf32>) {
 func @test_vector.transfer_write(memref<?x?xf32>) {
 ^bb0(%arg0: memref<?x?xf32>):
   %c3 = constant 3 : index
-  %cst = constant splat<vector<128 x f32>, 3.0>  : vector<128 x f32>
+  %cst = constant dense<3.0> : vector<128 x f32>
   // expected-error@+1 {{expects 4 operands (of which 2 indices)}}
   vector.transfer_write %cst, %arg0[%c3, %c3, %c3] : vector<128xf32>, memref<?x?xf32>
 }
@@ -417,7 +418,7 @@ func @test_vector.transfer_write(memref<?x?xf32>) {
 func @test_vector.transfer_write(memref<?x?xf32>) {
 ^bb0(%arg0: memref<?x?xf32>):
   %c3 = constant 3 : index
-  %cst = constant splat<vector<128 x f32>, 3.0>  : vector<128 x f32>
+  %cst = constant dense<3.0> : vector<128 x f32>
   // expected-error@+1 {{requires an AffineMapAttr named 'permutation_map'}}
   vector.transfer_write %cst, %arg0[%c3, %c3] : vector<128xf32>, memref<?x?xf32>
 }
@@ -427,9 +428,9 @@ func @test_vector.transfer_write(memref<?x?xf32>) {
 func @test_vector.transfer_write(memref<?x?xf32>) {
 ^bb0(%arg0: memref<?x?xf32>):
   %c3 = constant 3 : index
-  %cst = constant splat<vector<128 x f32>, 3.0>  : vector<128 x f32>
+  %cst = constant dense<3.0> : vector<128 x f32>
   // expected-error@+1 {{requires an AffineMapAttr named 'permutation_map'}}
-  vector.transfer_write %cst, %arg0[%c3, %c3] {perm: (d0)->(d0)} : vector<128xf32>, memref<?x?xf32>
+  vector.transfer_write %cst, %arg0[%c3, %c3] {perm = (d0)->(d0)} : vector<128xf32>, memref<?x?xf32>
 }
 
 // -----
@@ -437,9 +438,9 @@ func @test_vector.transfer_write(memref<?x?xf32>) {
 func @test_vector.transfer_write(memref<?x?xf32>) {
 ^bb0(%arg0: memref<?x?xf32>):
   %c3 = constant 3 : index
-  %cst = constant splat<vector<128 x f32>, 3.0>  : vector<128 x f32>
+  %cst = constant dense<3.0> : vector<128 x f32>
   // expected-error@+1 {{requires a permutation_map with input dims of the same rank as the memref type}}
-  vector.transfer_write %cst, %arg0[%c3, %c3] {permutation_map: (d0)->(d0)} : vector<128xf32>, memref<?x?xf32>
+  vector.transfer_write %cst, %arg0[%c3, %c3] {permutation_map = (d0)->(d0)} : vector<128xf32>, memref<?x?xf32>
 }
 
 // -----
@@ -447,9 +448,9 @@ func @test_vector.transfer_write(memref<?x?xf32>) {
 func @test_vector.transfer_write(memref<?x?xf32>) {
 ^bb0(%arg0: memref<?x?xf32>):
   %c3 = constant 3 : index
-  %cst = constant splat<vector<128 x f32>, 3.0>  : vector<128 x f32>
+  %cst = constant dense<3.0> : vector<128 x f32>
   // expected-error@+1 {{requires a permutation_map with result dims of the same rank as the vector type}}
-  vector.transfer_write %cst, %arg0[%c3, %c3] {permutation_map: (d0, d1)->(d0, d1)} : vector<128xf32>, memref<?x?xf32>
+  vector.transfer_write %cst, %arg0[%c3, %c3] {permutation_map = (d0, d1)->(d0, d1)} : vector<128xf32>, memref<?x?xf32>
 }
 
 // -----
@@ -457,9 +458,9 @@ func @test_vector.transfer_write(memref<?x?xf32>) {
 func @test_vector.transfer_write(memref<?x?xf32>) {
 ^bb0(%arg0: memref<?x?xf32>):
   %c3 = constant 3 : index
-  %cst = constant splat<vector<128 x f32>, 3.0>  : vector<128 x f32>
+  %cst = constant dense<3.0> : vector<128 x f32>
   // expected-error@+1 {{requires a projected permutation_map (at most one dim or the zero constant can appear in each result)}}
-  vector.transfer_write %cst, %arg0[%c3, %c3] {permutation_map: (d0, d1)->(d0 + d1)} : vector<128xf32>, memref<?x?xf32>
+  vector.transfer_write %cst, %arg0[%c3, %c3] {permutation_map = (d0, d1)->(d0 + d1)} : vector<128xf32>, memref<?x?xf32>
 }
 
 // -----
@@ -467,18 +468,18 @@ func @test_vector.transfer_write(memref<?x?xf32>) {
 func @test_vector.transfer_write(memref<?x?xf32>) {
 ^bb0(%arg0: memref<?x?xf32>):
   %c3 = constant 3 : index
-  %cst = constant splat<vector<128 x f32>, 3.0>  : vector<128 x f32>
+  %cst = constant dense<3.0> : vector<128 x f32>
   // expected-error@+1 {{requires a projected permutation_map (at most one dim or the zero constant can appear in each result)}}
-  vector.transfer_write %cst, %arg0[%c3, %c3] {permutation_map: (d0, d1)->(d0 + 1)} : vector<128xf32>, memref<?x?xf32>
+  vector.transfer_write %cst, %arg0[%c3, %c3] {permutation_map = (d0, d1)->(d0 + 1)} : vector<128xf32>, memref<?x?xf32>
 }
 // -----
 
 func @test_vector.transfer_write(memref<?x?x?xf32>) {
 ^bb0(%arg0: memref<?x?x?xf32>):
   %c3 = constant 3 : index
-  %cst = constant splat<vector<3 x 7 x f32>, 3.0>  : vector<3 x 7 x f32>
+  %cst = constant dense<3.0> : vector<3 x 7 x f32>
   // expected-error@+1 {{requires a permutation_map that is a permutation (found one dim used more than once)}}
-  vector.transfer_write %cst, %arg0[%c3, %c3, %c3] {permutation_map: (d0, d1, d2)->(d0, d0)} : vector<3x7xf32>, memref<?x?x?xf32>
+  vector.transfer_write %cst, %arg0[%c3, %c3, %c3] {permutation_map = (d0, d1, d2)->(d0, d0)} : vector<3x7xf32>, memref<?x?x?xf32>
 }
 
 // -----
@@ -528,3 +529,295 @@ func @dma_wait_no_tag_memref(%tag : f32, %c0 : index) {
 func @invalid_cmp_attr(%idx : i32) {
   // expected-error@+1 {{expected string comparison predicate attribute}}
   %cmp = cmpi i1, %idx, %idx : i32
+
+// -----
+
+func @cmpf_generic_invalid_predicate_value(%a : f32) {
+  // expected-error@+1 {{'predicate' attribute value out of range}}
+  %r = "std.cmpf"(%a, %a) {predicate = 42} : (f32, f32) -> i1
+}
+
+// -----
+
+func @cmpf_canonical_invalid_predicate_value(%a : f32) {
+  // expected-error@+1 {{unknown comparison predicate "foo"}}
+  %r = cmpf "foo", %a, %a : f32
+}
+
+// -----
+
+func @cmpf_canonical_invalid_predicate_value_signed(%a : f32) {
+  // expected-error@+1 {{unknown comparison predicate "sge"}}
+  %r = cmpf "sge", %a, %a : f32
+}
+
+// -----
+
+func @cmpf_canonical_invalid_predicate_value_no_order(%a : f32) {
+  // expected-error@+1 {{unknown comparison predicate "eq"}}
+  %r = cmpf "eq", %a, %a : f32
+}
+
+// -----
+
+func @cmpf_canonical_no_predicate_attr(%a : f32, %b : f32) {
+  %r = cmpf %a, %b : f32 // expected-error {{}}
+}
+
+// -----
+
+func @cmpf_generic_no_predicate_attr(%a : f32, %b : f32) {
+  // expected-error@+1 {{requires an integer attribute named 'predicate'}}
+  %r = "std.cmpf"(%a, %b) {foo = 1} : (f32, f32) -> i1
+}
+
+// -----
+
+func @cmpf_wrong_type(%a : i32, %b : i32) {
+  %r = cmpf "oeq", %a, %b : i32 // expected-error {{operand #0 must be floating-point-like}}
+}
+
+// -----
+
+func @cmpf_generic_wrong_result_type(%a : f32, %b : f32) {
+  // expected-error@+1 {{result #0 must be bool-like}}
+  %r = "std.cmpf"(%a, %b) {predicate = 0} : (f32, f32) -> f32
+}
+
+// -----
+
+func @cmpf_canonical_wrong_result_type(%a : f32, %b : f32) -> f32 {
+  %r = cmpf "oeq", %a, %b : f32 // expected-note {{prior use here}}
+  // expected-error@+1 {{use of value '%r' expects different type than prior uses}}
+  return %r : f32
+}
+
+// -----
+
+func @cmpf_result_shape_mismatch(%a : vector<42xf32>) {
+  // expected-error@+1 {{op requires the same shape for all operands and results}}
+  %r = "std.cmpf"(%a, %a) {predicate = 0} : (vector<42 x f32>, vector<42 x f32>) -> vector<41 x i1>
+}
+
+// -----
+
+func @cmpf_operand_shape_mismatch(%a : vector<42xf32>, %b : vector<41xf32>) {
+  // expected-error@+1 {{op requires all operands to have the same type}}
+  %r = "std.cmpf"(%a, %b) {predicate = 0} : (vector<42 x f32>, vector<41 x f32>) -> vector<42 x i1>
+}
+
+// -----
+
+func @cmpf_generic_operand_type_mismatch(%a : f32, %b : f64) {
+  // expected-error@+1 {{op requires all operands to have the same type}}
+  %r = "std.cmpf"(%a, %b) {predicate = 0} : (f32, f64) -> i1
+}
+
+// -----
+
+func @cmpf_canonical_type_mismatch(%a : f32, %b : f64) { // expected-note {{prior use here}}
+  // expected-error@+1 {{use of value '%b' expects different type than prior uses}}
+  %r = cmpf "oeq", %a, %b : f32
+}
+
+// -----
+
+func @extract_element_no_operands() {
+  // expected-error@+1 {{op expected 1 or more operands}}
+  %0 = "std.extract_element"() : () -> f32
+  return
+}
+
+// -----
+
+func @extract_element_no_indices(%v : vector<3xf32>) {
+  // expected-error@+1 {{incorrect number of indices for extract_element}}
+  %0 = "std.extract_element"(%v) : (vector<3xf32>) -> f32
+  return
+}
+
+// -----
+
+func @extract_element_invalid_index_type(%v : vector<3xf32>, %i : i32) {
+  // expected-error@+1 {{operand #1 must be index}}
+  %0 = "std.extract_element"(%v, %i) : (vector<3xf32>, i32) -> f32
+  return
+}
+
+// -----
+
+func @extract_element_element_result_type_mismatch(%v : vector<3xf32>, %i : index) {
+  // expected-error@+1 {{result type must match element type of aggregate}}
+  %0 = "std.extract_element"(%v, %i) : (vector<3xf32>, index) -> f64
+  return
+}
+
+// -----
+
+func @extract_element_vector_too_many_indices(%v : vector<3xf32>, %i : index) {
+  // expected-error@+1 {{incorrect number of indices for extract_element}}
+  %0 = "std.extract_element"(%v, %i, %i) : (vector<3xf32>, index, index) -> f32
+  return
+}
+
+// -----
+
+func @extract_element_tensor_too_many_indices(%t : tensor<2x3xf32>, %i : index) {
+  // expected-error@+1 {{incorrect number of indices for extract_element}}
+  %0 = "std.extract_element"(%t, %i, %i, %i) : (tensor<2x3xf32>, index, index, index) -> f32
+  return
+}
+
+// -----
+
+func @extract_element_tensor_too_few_indices(%t : tensor<2x3xf32>, %i : index) {
+  // expected-error@+1 {{incorrect number of indices for extract_element}}
+  %0 = "std.extract_element"(%t, %i) : (tensor<2x3xf32>, index) -> f32
+  return
+}
+
+// -----
+
+func @index_cast_index_to_index(%arg0: index) {
+  // expected-error@+1 {{are cast incompatible}}
+  %0 = index_cast %arg0: index to index
+  return
+}
+
+// -----
+
+func @index_cast_float(%arg0: index, %arg1: f32) {
+  // expected-error@+1 {{are cast incompatible}}
+  %0 = index_cast %arg0 : index to f32
+  return
+}
+
+// -----
+
+func @index_cast_float_to_index(%arg0: f32) {
+  // expected-error@+1 {{are cast incompatible}}
+  %0 = index_cast %arg0 : f32 to index
+  return
+}
+
+// -----
+
+func @sitofp_i32_to_i64(%arg0 : i32) {
+  // expected-error@+1 {{are cast incompatible}}
+  %0 = sitofp %arg0 : i32 to i64
+  return
+}
+
+// -----
+
+func @sitofp_f32_to_i32(%arg0 : f32) {
+  // expected-error@+1 {{are cast incompatible}}
+  %0 = sitofp %arg0 : f32 to i32
+  return
+}
+
+// -----
+
+func @sexti_index_as_operand(%arg0 : index) {
+  // expected-error@+1 {{'index' is not a valid operand type}}
+  %0 = sexti %arg0 : index to i128
+  return
+}
+
+// -----
+
+func @zexti_index_as_operand(%arg0 : index) {
+  // expected-error@+1 {{'index' is not a valid operand type}}
+  %0 = zexti %arg0 : index to i128
+  return
+}
+
+// -----
+
+func @trunci_index_as_operand(%arg0 : index) {
+  // expected-error@+1 {{'index' is not a valid operand type}}
+  %2 = trunci %arg0 : index to i128
+  return
+}
+
+// -----
+
+func @sexti_index_as_result(%arg0 : i1) {
+  // expected-error@+1 {{'index' is not a valid result type}}
+  %0 = sexti %arg0 : i1 to index
+  return
+}
+
+// -----
+
+func @zexti_index_as_operand(%arg0 : i1) {
+  // expected-error@+1 {{'index' is not a valid result type}}
+  %0 = zexti %arg0 : i1 to index
+  return
+}
+
+// -----
+
+func @trunci_index_as_result(%arg0 : i128) {
+  // expected-error@+1 {{'index' is not a valid result type}}
+  %2 = trunci %arg0 : i128 to index
+  return
+}
+
+// -----
+
+func @sexti_cast_to_narrower(%arg0 : i16) {
+  // expected-error@+1 {{must be wider}}
+  %0 = sexti %arg0 : i16 to i15
+  return
+}
+
+// -----
+
+func @zexti_cast_to_narrower(%arg0 : i16) {
+  // expected-error@+1 {{must be wider}}
+  %0 = zexti %arg0 : i16 to i15
+  return
+}
+
+// -----
+
+func @trunci_cast_to_wider(%arg0 : i16) {
+  // expected-error@+1 {{must be wider}}
+  %0 = trunci %arg0 : i16 to i17
+  return
+}
+
+// -----
+
+func @sexti_cast_to_same_width(%arg0 : i16) {
+  // expected-error@+1 {{must be wider}}
+  %0 = sexti %arg0 : i16 to i16
+  return
+}
+
+// -----
+
+func @zexti_cast_to_same_width(%arg0 : i16) {
+  // expected-error@+1 {{must be wider}}
+  %0 = zexti %arg0 : i16 to i16
+  return
+}
+
+// -----
+
+func @trunci_cast_to_same_width(%arg0 : i16) {
+  // expected-error@+1 {{must be wider}}
+  %0 = trunci %arg0 : i16 to i16
+  return
+}
+
+// -----
+
+func @return_not_in_function() {
+  "foo.region"() ({
+    // expected-error@+1 {{'std.return' op expects parent op 'func'}}
+    return
+  }): () -> ()
+  return
+}

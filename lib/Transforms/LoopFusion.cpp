@@ -19,16 +19,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/AffineAnalysis.h"
 #include "mlir/Analysis/AffineStructures.h"
 #include "mlir/Analysis/LoopAnalysis.h"
 #include "mlir/Analysis/Utils.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/StandardOps/Ops.h"
+#include "mlir/Transforms/LoopFusionUtils.h"
 #include "mlir/Transforms/LoopUtils.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/Utils.h"
@@ -40,8 +41,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <iomanip>
 #include <sstream>
-
-#define DEBUG_TYPE "loop-fusion"
+#define DEBUG_TYPE "affine-loop-fusion"
 
 using llvm::SetVector;
 
@@ -111,10 +111,11 @@ struct LoopFusion : public FunctionPass<LoopFusion> {
 
 } // end anonymous namespace
 
-FunctionPassBase *mlir::createLoopFusionPass(unsigned fastMemorySpace,
-                                             uint64_t localBufSizeThreshold,
-                                             bool maximalFusion) {
-  return new LoopFusion(fastMemorySpace, localBufSizeThreshold, maximalFusion);
+std::unique_ptr<OpPassBase<FuncOp>>
+mlir::createLoopFusionPass(unsigned fastMemorySpace,
+                           uint64_t localBufSizeThreshold, bool maximalFusion) {
+  return std::make_unique<LoopFusion>(fastMemorySpace, localBufSizeThreshold,
+                                      maximalFusion);
 }
 
 namespace {
@@ -129,13 +130,13 @@ struct LoopNestStateCollector {
 
   void collect(Operation *opToWalk) {
     opToWalk->walk([&](Operation *op) {
-      if (op->isa<AffineForOp>())
-        forOps.push_back(op->cast<AffineForOp>());
+      if (isa<AffineForOp>(op))
+        forOps.push_back(cast<AffineForOp>(op));
       else if (op->getNumRegions() != 0)
         hasNonForRegion = true;
-      else if (op->isa<LoadOp>())
+      else if (isa<AffineLoadOp>(op))
         loadOpInsts.push_back(op);
-      else if (op->isa<StoreOp>())
+      else if (isa<AffineStoreOp>(op))
         storeOpInsts.push_back(op);
     });
   }
@@ -143,14 +144,14 @@ struct LoopNestStateCollector {
 
 // TODO(b/117228571) Replace when this is modeled through side-effects/op traits
 static bool isMemRefDereferencingOp(Operation &op) {
-  if (op.isa<LoadOp>() || op.isa<StoreOp>() || op.isa<DmaStartOp>() ||
-      op.isa<DmaWaitOp>())
+  if (isa<AffineLoadOp>(op) || isa<AffineStoreOp>(op) ||
+      isa<AffineDmaStartOp>(op) || isa<AffineDmaWaitOp>(op))
     return true;
   return false;
 }
 
 // MemRefDependenceGraph is a graph data structure where graph nodes are
-// top-level operations in a Function which contain load/store ops, and edges
+// top-level operations in a FuncOp which contain load/store ops, and edges
 // are memref dependences between the nodes.
 // TODO(andydavis) Add a more flexible dependece graph representation.
 // TODO(andydavis) Add a depth parameter to dependence graph construction.
@@ -174,7 +175,7 @@ public:
     unsigned getLoadOpCount(Value *memref) {
       unsigned loadOpCount = 0;
       for (auto *loadOpInst : loads) {
-        if (memref == loadOpInst->cast<LoadOp>().getMemRef())
+        if (memref == cast<AffineLoadOp>(loadOpInst).getMemRef())
           ++loadOpCount;
       }
       return loadOpCount;
@@ -184,7 +185,7 @@ public:
     unsigned getStoreOpCount(Value *memref) {
       unsigned storeOpCount = 0;
       for (auto *storeOpInst : stores) {
-        if (memref == storeOpInst->cast<StoreOp>().getMemRef())
+        if (memref == cast<AffineStoreOp>(storeOpInst).getMemRef())
           ++storeOpCount;
       }
       return storeOpCount;
@@ -194,7 +195,7 @@ public:
     void getStoreOpsForMemref(Value *memref,
                               SmallVectorImpl<Operation *> *storeOps) {
       for (auto *storeOpInst : stores) {
-        if (memref == storeOpInst->cast<StoreOp>().getMemRef())
+        if (memref == cast<AffineStoreOp>(storeOpInst).getMemRef())
           storeOps->push_back(storeOpInst);
       }
     }
@@ -203,7 +204,7 @@ public:
     void getLoadOpsForMemref(Value *memref,
                              SmallVectorImpl<Operation *> *loadOps) {
       for (auto *loadOpInst : loads) {
-        if (memref == loadOpInst->cast<LoadOp>().getMemRef())
+        if (memref == cast<AffineLoadOp>(loadOpInst).getMemRef())
           loadOps->push_back(loadOpInst);
       }
     }
@@ -213,10 +214,10 @@ public:
     void getLoadAndStoreMemrefSet(DenseSet<Value *> *loadAndStoreMemrefSet) {
       llvm::SmallDenseSet<Value *, 2> loadMemrefs;
       for (auto *loadOpInst : loads) {
-        loadMemrefs.insert(loadOpInst->cast<LoadOp>().getMemRef());
+        loadMemrefs.insert(cast<AffineLoadOp>(loadOpInst).getMemRef());
       }
       for (auto *storeOpInst : stores) {
-        auto *memref = storeOpInst->cast<StoreOp>().getMemRef();
+        auto *memref = cast<AffineStoreOp>(storeOpInst).getMemRef();
         if (loadMemrefs.count(memref) > 0)
           loadAndStoreMemrefSet->insert(memref);
       }
@@ -257,7 +258,7 @@ public:
 
   // Initializes the dependence graph based on operations in 'f'.
   // Returns true on success, false otherwise.
-  bool init(Function &f);
+  bool init(FuncOp f);
 
   // Returns the graph node for 'id'.
   Node *getNode(unsigned id) {
@@ -308,14 +309,14 @@ public:
   bool writesToLiveInOrEscapingMemrefs(unsigned id) {
     Node *node = getNode(id);
     for (auto *storeOpInst : node->stores) {
-      auto *memref = storeOpInst->cast<StoreOp>().getMemRef();
+      auto *memref = cast<AffineStoreOp>(storeOpInst).getMemRef();
       auto *op = memref->getDefiningOp();
       // Return true if 'memref' is a block argument.
       if (!op)
         return true;
       // Return true if any use of 'memref' escapes the function.
-      for (auto &use : memref->getUses())
-        if (!isMemRefDereferencingOp(*use.getOwner()))
+      for (auto *user : memref->getUsers())
+        if (!isMemRefDereferencingOp(*user))
           return true;
     }
     return false;
@@ -333,7 +334,7 @@ public:
     Node *node = getNode(id);
     for (auto *storeOpInst : node->stores) {
       // Return false if there exist out edges from 'id' on 'memref'.
-      if (getOutEdgeCount(id, storeOpInst->cast<StoreOp>().getMemRef()) > 0)
+      if (getOutEdgeCount(id, cast<AffineStoreOp>(storeOpInst).getMemRef()) > 0)
         return false;
     }
     return true;
@@ -606,7 +607,7 @@ public:
         continue;
       assert(nodes.count(edge.id) > 0);
       // Skip if 'edge.id' is not a loop nest.
-      if (!getNode(edge.id)->op->isa<AffineForOp>())
+      if (!isa<AffineForOp>(getNode(edge.id)->op))
         continue;
       // Visit current input edge 'edge'.
       callback(edge);
@@ -637,7 +638,7 @@ public:
 // Assigns each node in the graph a node id based on program order in 'f'.
 // TODO(andydavis) Add support for taking a Block arg to construct the
 // dependence graph at a different depth.
-bool MemRefDependenceGraph::init(Function &f) {
+bool MemRefDependenceGraph::init(FuncOp f) {
   DenseMap<Value *, SetVector<unsigned>> memrefAccesses;
 
   // TODO: support multi-block functions.
@@ -646,7 +647,7 @@ bool MemRefDependenceGraph::init(Function &f) {
 
   DenseMap<Operation *, unsigned> forToNodeMap;
   for (auto &op : f.front()) {
-    if (auto forOp = op.dyn_cast<AffineForOp>()) {
+    if (auto forOp = dyn_cast<AffineForOp>(op)) {
       // Create graph node 'id' to represent top-level 'forOp' and record
       // all loads and store accesses it contains.
       LoopNestStateCollector collector;
@@ -658,28 +659,28 @@ bool MemRefDependenceGraph::init(Function &f) {
       Node node(nextNodeId++, &op);
       for (auto *opInst : collector.loadOpInsts) {
         node.loads.push_back(opInst);
-        auto *memref = opInst->cast<LoadOp>().getMemRef();
+        auto *memref = cast<AffineLoadOp>(opInst).getMemRef();
         memrefAccesses[memref].insert(node.id);
       }
       for (auto *opInst : collector.storeOpInsts) {
         node.stores.push_back(opInst);
-        auto *memref = opInst->cast<StoreOp>().getMemRef();
+        auto *memref = cast<AffineStoreOp>(opInst).getMemRef();
         memrefAccesses[memref].insert(node.id);
       }
       forToNodeMap[&op] = node.id;
       nodes.insert({node.id, node});
-    } else if (auto loadOp = op.dyn_cast<LoadOp>()) {
+    } else if (auto loadOp = dyn_cast<AffineLoadOp>(op)) {
       // Create graph node for top-level load op.
       Node node(nextNodeId++, &op);
       node.loads.push_back(&op);
-      auto *memref = op.cast<LoadOp>().getMemRef();
+      auto *memref = cast<AffineLoadOp>(op).getMemRef();
       memrefAccesses[memref].insert(node.id);
       nodes.insert({node.id, node});
-    } else if (auto storeOp = op.dyn_cast<StoreOp>()) {
+    } else if (auto storeOp = dyn_cast<AffineStoreOp>(op)) {
       // Create graph node for top-level store op.
       Node node(nextNodeId++, &op);
       node.stores.push_back(&op);
-      auto *memref = op.cast<StoreOp>().getMemRef();
+      auto *memref = cast<AffineStoreOp>(op).getMemRef();
       memrefAccesses[memref].insert(node.id);
       nodes.insert({node.id, node});
     } else if (op.getNumRegions() != 0) {
@@ -701,9 +702,9 @@ bool MemRefDependenceGraph::init(Function &f) {
       continue;
     auto *opInst = node.op;
     for (auto *value : opInst->getResults()) {
-      for (auto &use : value->getUses()) {
+      for (auto *user : value->getUsers()) {
         SmallVector<AffineForOp, 4> loops;
-        getLoopIVs(*use.getOwner(), &loops);
+        getLoopIVs(*user, &loops);
         if (loops.empty())
           continue;
         assert(forToNodeMap.count(loops[0].getOperation()) > 0);
@@ -732,155 +733,6 @@ bool MemRefDependenceGraph::init(Function &f) {
   return true;
 }
 
-namespace {
-
-// LoopNestStats aggregates various per-loop statistics (eg. loop trip count
-// and operation count) for a loop nest up until the innermost loop body.
-struct LoopNestStats {
-  // Map from AffineForOp to immediate child AffineForOps in its loop body.
-  DenseMap<Operation *, SmallVector<AffineForOp, 2>> loopMap;
-  // Map from AffineForOp to count of operations in its loop body.
-  DenseMap<Operation *, uint64_t> opCountMap;
-  // Map from AffineForOp to its constant trip count.
-  DenseMap<Operation *, uint64_t> tripCountMap;
-};
-
-// LoopNestStatsCollector walks a single loop nest and gathers per-loop
-// trip count and operation count statistics and records them in 'stats'.
-struct LoopNestStatsCollector {
-  LoopNestStats *stats;
-  bool hasLoopWithNonConstTripCount = false;
-
-  LoopNestStatsCollector(LoopNestStats *stats) : stats(stats) {}
-
-  void collect(Operation *op) {
-    op->walk<AffineForOp>([&](AffineForOp forOp) {
-      auto *forInst = forOp.getOperation();
-      auto *parentInst = forOp.getOperation()->getParentOp();
-      if (parentInst != nullptr) {
-        assert(parentInst->isa<AffineForOp>() && "Expected parent AffineForOp");
-        // Add mapping to 'forOp' from its parent AffineForOp.
-        stats->loopMap[parentInst].push_back(forOp);
-      }
-
-      // Record the number of op operations in the body of 'forOp'.
-      unsigned count = 0;
-      stats->opCountMap[forInst] = 0;
-      for (auto &op : *forOp.getBody()) {
-        if (!op.isa<AffineForOp>() && !op.isa<AffineIfOp>())
-          ++count;
-      }
-      stats->opCountMap[forInst] = count;
-      // Record trip count for 'forOp'. Set flag if trip count is not
-      // constant.
-      Optional<uint64_t> maybeConstTripCount = getConstantTripCount(forOp);
-      if (!maybeConstTripCount.hasValue()) {
-        hasLoopWithNonConstTripCount = true;
-        return;
-      }
-      stats->tripCountMap[forInst] = maybeConstTripCount.getValue();
-    });
-  }
-};
-
-// Computes the total cost of the loop nest rooted at 'forOp'.
-// Currently, the total cost is computed by counting the total operation
-// instance count (i.e. total number of operations in the loop bodyloop
-// operation count * loop trip count) for the entire loop nest.
-// If 'tripCountOverrideMap' is non-null, overrides the trip count for loops
-// specified in the map when computing the total op instance count.
-// NOTEs: 1) This is used to compute the cost of computation slices, which are
-// sliced along the iteration dimension, and thus reduce the trip count.
-// If 'computeCostMap' is non-null, the total op count for forOps specified
-// in the map is increased (not overridden) by adding the op count from the
-// map to the existing op count for the for loop. This is done before
-// multiplying by the loop's trip count, and is used to model the cost of
-// inserting a sliced loop nest of known cost into the loop's body.
-// 2) This is also used to compute the cost of fusing a slice of some loop nest
-// within another loop.
-static int64_t getComputeCost(
-    Operation *forInst, LoopNestStats *stats,
-    llvm::SmallDenseMap<Operation *, uint64_t, 8> *tripCountOverrideMap,
-    DenseMap<Operation *, int64_t> *computeCostMap) {
-  // 'opCount' is the total number operations in one iteration of 'forOp' body
-  int64_t opCount = stats->opCountMap[forInst];
-  if (stats->loopMap.count(forInst) > 0) {
-    for (auto childForOp : stats->loopMap[forInst]) {
-      opCount += getComputeCost(childForOp.getOperation(), stats,
-                                tripCountOverrideMap, computeCostMap);
-    }
-  }
-  // Add in additional op instances from slice (if specified in map).
-  if (computeCostMap != nullptr) {
-    auto it = computeCostMap->find(forInst);
-    if (it != computeCostMap->end()) {
-      opCount += it->second;
-    }
-  }
-  // Override trip count (if specified in map).
-  int64_t tripCount = stats->tripCountMap[forInst];
-  if (tripCountOverrideMap != nullptr) {
-    auto it = tripCountOverrideMap->find(forInst);
-    if (it != tripCountOverrideMap->end()) {
-      tripCount = it->second;
-    }
-  }
-  // Returns the total number of dynamic instances of operations in loop body.
-  return tripCount * opCount;
-}
-
-} // end anonymous namespace
-
-// TODO(andydavis,b/126426796): extend this to handle multiple result maps.
-static Optional<uint64_t> getConstDifference(AffineMap lbMap, AffineMap ubMap) {
-  assert(lbMap.getNumResults() == 1 && "expected single result bound map");
-  assert(ubMap.getNumResults() == 1 && "expected single result bound map");
-  assert(lbMap.getNumDims() == ubMap.getNumDims());
-  assert(lbMap.getNumSymbols() == ubMap.getNumSymbols());
-  AffineExpr lbExpr(lbMap.getResult(0));
-  AffineExpr ubExpr(ubMap.getResult(0));
-  auto loopSpanExpr = simplifyAffineExpr(ubExpr - lbExpr, lbMap.getNumDims(),
-                                         lbMap.getNumSymbols());
-  auto cExpr = loopSpanExpr.dyn_cast<AffineConstantExpr>();
-  if (!cExpr)
-    return None;
-  return cExpr.getValue();
-}
-
-// Builds a map 'tripCountMap' from AffineForOp to constant trip count for loop
-// nest surrounding 'srcAccess' utilizing slice loop bounds in 'sliceState'.
-// Returns true on success, false otherwise (if a non-constant trip count
-// was encountered).
-// TODO(andydavis) Make this work with non-unit step loops.
-static bool buildSliceTripCountMap(
-    Operation *srcOpInst, ComputationSliceState *sliceState,
-    llvm::SmallDenseMap<Operation *, uint64_t, 8> *tripCountMap) {
-  SmallVector<AffineForOp, 4> srcLoopIVs;
-  getLoopIVs(*srcOpInst, &srcLoopIVs);
-  unsigned numSrcLoopIVs = srcLoopIVs.size();
-  // Populate map from AffineForOp -> trip count
-  for (unsigned i = 0; i < numSrcLoopIVs; ++i) {
-    AffineMap lbMap = sliceState->lbs[i];
-    AffineMap ubMap = sliceState->ubs[i];
-    if (lbMap == AffineMap() || ubMap == AffineMap()) {
-      // The iteration of src loop IV 'i' was not sliced. Use full loop bounds.
-      if (srcLoopIVs[i].hasConstantLowerBound() &&
-          srcLoopIVs[i].hasConstantUpperBound()) {
-        (*tripCountMap)[srcLoopIVs[i].getOperation()] =
-            srcLoopIVs[i].getConstantUpperBound() -
-            srcLoopIVs[i].getConstantLowerBound();
-        continue;
-      }
-      return false;
-    }
-    Optional<uint64_t> tripCount = getConstDifference(lbMap, ubMap);
-    if (!tripCount.hasValue())
-      return false;
-    (*tripCountMap)[srcLoopIVs[i].getOperation()] = tripCount.getValue();
-  }
-  return true;
-}
-
 // Removes load operations from 'srcLoads' which operate on 'memref', and
 // adds them to 'dstLoads'.
 static void moveLoadsAccessingMemrefTo(Value *memref,
@@ -889,7 +741,7 @@ static void moveLoadsAccessingMemrefTo(Value *memref,
   dstLoads->clear();
   SmallVector<Operation *, 4> srcLoadsToKeep;
   for (auto *load : *srcLoads) {
-    if (load->cast<LoadOp>().getMemRef() == memref)
+    if (cast<AffineLoadOp>(load).getMemRef() == memref)
       dstLoads->push_back(load);
     else
       srcLoadsToKeep.push_back(load);
@@ -953,9 +805,10 @@ static unsigned getMaxLoopDepth(ArrayRef<Operation *> loadOpInsts,
       for (unsigned d = 1; d <= numCommonLoops + 1; ++d) {
         FlatAffineConstraints dependenceConstraints;
         // TODO(andydavis) Cache dependence analysis results, check cache here.
-        if (checkMemrefAccessDependence(srcAccess, dstAccess, d,
-                                        &dependenceConstraints,
-                                        /*dependenceComponents=*/nullptr)) {
+        DependenceResult result = checkMemrefAccessDependence(
+            srcAccess, dstAccess, d, &dependenceConstraints,
+            /*dependenceComponents=*/nullptr);
+        if (hasDependence(result)) {
           // Store minimum loop depth and break because we want the min 'd' at
           // which there is a dependence.
           loopDepth = std::min(loopDepth, d - 1);
@@ -967,115 +820,15 @@ static unsigned getMaxLoopDepth(ArrayRef<Operation *> loadOpInsts,
   return loopDepth;
 }
 
-// Compute loop interchange permutation:
-// *) Computes dependence components between all op pairs of ops in loop nest
-//    rooted at 'loops[0]', for loop depths in range [1, 'maxLoopDepth'].
-// *) Classifies the outermost 'maxLoopDepth' loops surrounding 'ops' as either
-//    parallel or sequential.
-// *) Computes the loop permutation which sinks sequential loops deeper into
-//    the loop nest, while preserving the relative order between other loops.
-// *) Checks each dependence component against the permutation to see if the
-//    desired loop interchange would violate dependences by making the
-//    dependence componenent lexicographically negative.
-// TODO(andydavis) Move this function to LoopUtils.
-static bool
-computeLoopInterchangePermutation(ArrayRef<AffineForOp> loops,
-                                  SmallVectorImpl<unsigned> *loopPermMap) {
-  assert(loops.size() > 1);
-  // Gather dependence components for dependences between all ops in loop nest
-  // rooted at 'loops[0]', at loop depths in range [1, maxLoopDepth].
-  unsigned maxLoopDepth = loops.size();
-  std::vector<llvm::SmallVector<DependenceComponent, 2>> depCompsVec;
-  getDependenceComponents(loops[0], maxLoopDepth, &depCompsVec);
-  // Mark loops as either parallel or sequential.
-  llvm::SmallVector<bool, 8> isParallelLoop(maxLoopDepth, true);
-  for (unsigned i = 0, e = depCompsVec.size(); i < e; ++i) {
-    llvm::SmallVector<DependenceComponent, 2> &depComps = depCompsVec[i];
-    assert(depComps.size() >= maxLoopDepth);
-    for (unsigned j = 0; j < maxLoopDepth; ++j) {
-      DependenceComponent &depComp = depComps[j];
-      assert(depComp.lb.hasValue() && depComp.ub.hasValue());
-      if (depComp.lb.getValue() != 0 || depComp.ub.getValue() != 0)
-        isParallelLoop[j] = false;
-    }
-  }
-
-  // Count the number of parallel loops.
-  unsigned numParallelLoops = 0;
-  for (unsigned i = 0, e = isParallelLoop.size(); i < e; ++i)
-    if (isParallelLoop[i])
-      ++numParallelLoops;
-
-  // Compute permutation of loops that sinks sequential loops (and thus raises
-  // parallel loops) while preserving relative order.
-  llvm::SmallVector<unsigned, 4> loopPermMapInv;
-  loopPermMapInv.resize(maxLoopDepth);
-  loopPermMap->resize(maxLoopDepth);
-  unsigned nextSequentialLoop = numParallelLoops;
-  unsigned nextParallelLoop = 0;
-  for (unsigned i = 0; i < maxLoopDepth; ++i) {
-    if (isParallelLoop[i]) {
-      (*loopPermMap)[i] = nextParallelLoop;
-      loopPermMapInv[nextParallelLoop++] = i;
-    } else {
-      (*loopPermMap)[i] = nextSequentialLoop;
-      loopPermMapInv[nextSequentialLoop++] = i;
-    }
-  }
-
-  // Check each dependence component against the permutation to see if the
-  // desired loop interchange permutation would make the dependence vectors
-  // lexicographically negative.
-  // Example 1: [-1, 1][0, 0]
-  // Example 2: [0, 0][-1, 1]
-  for (unsigned i = 0, e = depCompsVec.size(); i < e; ++i) {
-    llvm::SmallVector<DependenceComponent, 2> &depComps = depCompsVec[i];
-    assert(depComps.size() >= maxLoopDepth);
-    // Check if the first non-zero dependence component is positive.
-    for (unsigned j = 0; j < maxLoopDepth; ++j) {
-      unsigned permIndex = loopPermMapInv[j];
-      assert(depComps[permIndex].lb.hasValue());
-      int64_t depCompLb = depComps[permIndex].lb.getValue();
-      if (depCompLb > 0)
-        break;
-      if (depCompLb < 0)
-        return false;
-    }
-  }
-  return true;
-}
-
 // Sinks all sequential loops to the innermost levels (while preserving
 // relative order among them) and moves all parallel loops to the
 // outermost (while again preserving relative order among them).
 // This can increase the loop depth at which we can fuse a slice, since we are
 // pushing loop carried dependence to a greater depth in the loop nest.
 static void sinkSequentialLoops(MemRefDependenceGraph::Node *node) {
-  assert(node->op->isa<AffineForOp>());
-  SmallVector<AffineForOp, 4> loops;
-  AffineForOp curr = node->op->cast<AffineForOp>();
-  getPerfectlyNestedLoops(loops, curr);
-  if (loops.size() < 2)
-    return;
-
-  // Compute loop permutation in 'loopPermMap'.
-  llvm::SmallVector<unsigned, 4> loopPermMap;
-  if (!computeLoopInterchangePermutation(loops, &loopPermMap))
-    return;
-
-  int loopNestRootIndex = -1;
-  for (int i = loops.size() - 1; i >= 0; --i) {
-    int permIndex = static_cast<int>(loopPermMap[i]);
-    // Store the index of the for loop which will be the new loop nest root.
-    if (permIndex == 0)
-      loopNestRootIndex = i;
-    if (permIndex > i) {
-      // Sink loop 'i' by 'permIndex - i' levels deeper into the loop nest.
-      sinkLoop(loops[i], permIndex - i);
-    }
-  }
-  assert(loopNestRootIndex != -1 && "invalid root index");
-  node->op = loops[loopNestRootIndex].getOperation();
+  assert(isa<AffineForOp>(node->op));
+  AffineForOp newRootForOp = sinkSequentialLoops(cast<AffineForOp>(node->op));
+  node->op = newRootForOp.getOperation();
 }
 
 //  TODO(mlir-team): improve/complete this when we have target data.
@@ -1105,11 +858,11 @@ static Value *createPrivateMemRef(AffineForOp forOp, Operation *srcStoreOpInst,
   auto *forInst = forOp.getOperation();
 
   // Create builder to insert alloc op just before 'forOp'.
-  FuncBuilder b(forInst);
+  OpBuilder b(forInst);
   // Builder to create constants at the top level.
-  FuncBuilder top(forInst->getFunction());
+  OpBuilder top(forInst->getParentOfType<FuncOp>().getBody());
   // Create new memref type based on slice bounds.
-  auto *oldMemRef = srcStoreOpInst->cast<StoreOp>().getMemRef();
+  auto *oldMemRef = cast<AffineStoreOp>(srcStoreOpInst).getMemRef();
   auto oldMemRefType = oldMemRef->getType().cast<MemRefType>();
   unsigned rank = oldMemRefType.getRank();
 
@@ -1195,28 +948,19 @@ static Value *createPrivateMemRef(AffineForOp forOp, Operation *srcStoreOpInst,
         simplifyAffineExpr(dimExpr - offsets[i], outerIVs.size() + rank, 0);
     remapExprs.push_back(remapExpr);
   }
-  auto indexRemap =
-      zeroOffsetCount == rank
-          ? AffineMap()
-          : b.getAffineMap(outerIVs.size() + rank, 0, remapExprs, {});
+  auto indexRemap = zeroOffsetCount == rank
+                        ? AffineMap()
+                        : b.getAffineMap(outerIVs.size() + rank, 0, remapExprs);
   // Replace all users of 'oldMemRef' with 'newMemRef'.
-  bool ret =
+  LogicalResult res =
       replaceAllMemRefUsesWith(oldMemRef, newMemRef, {}, indexRemap,
                                /*extraOperands=*/outerIVs,
+                               /*symbolOperands=*/{},
                                /*domInstFilter=*/&*forOp.getBody()->begin());
-  assert(ret && "replaceAllMemrefUsesWith should always succeed here");
-  (void)ret;
+  assert(succeeded(res) &&
+         "replaceAllMemrefUsesWith should always succeed here");
+  (void)res;
   return newMemRef;
-}
-
-// Return the number of iterations in the given slice.
-static uint64_t getSliceIterationCount(
-    const llvm::SmallDenseMap<Operation *, uint64_t, 8> &sliceTripCountMap) {
-  uint64_t iterCount = 1;
-  for (const auto &count : sliceTripCountMap) {
-    iterCount *= count.second;
-  }
-  return iterCount;
 }
 
 // Checks if node 'srcId' (which writes to a live out memref), can be safely
@@ -1235,7 +979,7 @@ static bool canFuseSrcWhichWritesToLiveOut(unsigned srcId, unsigned dstId,
   // Gather all memrefs from 'srcNode' store ops.
   DenseSet<Value *> storeMemrefs;
   for (auto *storeOpInst : srcNode->stores) {
-    storeMemrefs.insert(storeOpInst->cast<StoreOp>().getMemRef());
+    storeMemrefs.insert(cast<AffineStoreOp>(storeOpInst).getMemRef());
   }
   // Return false if any of the following are true:
   // *) 'srcNode' writes to a live in/out memref other than 'memref'.
@@ -1288,82 +1032,6 @@ static bool canFuseSrcWhichWritesToLiveOut(unsigned srcId, unsigned dstId,
   // TODO(andydavis) Check the shape and lower bounds here too.
   if (srcNumElements != dstNumElements)
     return false;
-  return true;
-}
-
-// Computes the union of all slice bounds computed between 'srcOpInst'
-// and each load op in 'dstLoadOpInsts' at 'dstLoopDepth', and returns
-// the union in 'sliceState'. Returns true on success, false otherwise.
-// TODO(andydavis) Move this to a loop fusion utility function.
-static bool getSliceUnion(Operation *srcOpInst,
-                          ArrayRef<Operation *> dstLoadOpInsts,
-                          unsigned numSrcLoopIVs, unsigned dstLoopDepth,
-                          ComputationSliceState *sliceState) {
-  MemRefAccess srcAccess(srcOpInst);
-  unsigned numDstLoadOpInsts = dstLoadOpInsts.size();
-  assert(numDstLoadOpInsts > 0);
-  // Compute the slice bounds between 'srcOpInst' and 'dstLoadOpInsts[0]'.
-  if (failed(mlir::getBackwardComputationSliceState(
-          srcAccess, MemRefAccess(dstLoadOpInsts[0]), dstLoopDepth,
-          sliceState)))
-    return false;
-  // Handle the common case of one dst load without a copy.
-  if (numDstLoadOpInsts == 1)
-    return true;
-
-  // Initialize 'sliceUnionCst' with the bounds computed in previous step.
-  FlatAffineConstraints sliceUnionCst;
-  if (failed(sliceState->getAsConstraints(&sliceUnionCst))) {
-    LLVM_DEBUG(llvm::dbgs() << "Unable to compute slice bound constraints\n.");
-    return false;
-  }
-
-  // Compute the union of slice bounds between 'srcOpInst' and each load
-  // in 'dstLoadOpInsts' in range [1, numDstLoadOpInsts), in 'sliceUnionCst'.
-  for (unsigned i = 1; i < numDstLoadOpInsts; ++i) {
-    MemRefAccess dstAccess(dstLoadOpInsts[i]);
-    // Compute slice bounds for 'srcOpInst' and 'dstLoadOpInsts[i]'.
-    ComputationSliceState tmpSliceState;
-    if (failed(mlir::getBackwardComputationSliceState(
-            srcAccess, dstAccess, dstLoopDepth, &tmpSliceState))) {
-      LLVM_DEBUG(llvm::dbgs() << "Unable to compute slice bounds\n.");
-      return false;
-    }
-
-    // Compute constraints for 'tmpSliceState' in 'tmpSliceCst'.
-    FlatAffineConstraints tmpSliceCst;
-    if (failed(tmpSliceState.getAsConstraints(&tmpSliceCst))) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "Unable to compute slice bound constraints\n.");
-      return false;
-    }
-    // Compute union bounding box of 'sliceUnionCst' and 'tmpSliceCst'.
-    if (failed(sliceUnionCst.unionBoundingBox(tmpSliceCst))) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "Unable to compute union bounding box of slice bounds.\n.");
-      return false;
-    }
-  }
-
-  // Convert any dst loop IVs which are symbol identifiers to dim identifiers.
-  sliceUnionCst.convertLoopIVSymbolsToDims();
-
-  sliceState->clearBounds();
-  sliceState->lbs.resize(numSrcLoopIVs, AffineMap());
-  sliceState->ubs.resize(numSrcLoopIVs, AffineMap());
-
-  // Get slice bounds from slice union constraints 'sliceUnionCst'.
-  sliceUnionCst.getSliceBounds(numSrcLoopIVs, srcOpInst->getContext(),
-                               &sliceState->lbs, &sliceState->ubs);
-  // Add slice bound operands of union.
-  SmallVector<Value *, 4> sliceBoundOperands;
-  sliceUnionCst.getIdValues(numSrcLoopIVs,
-                            sliceUnionCst.getNumDimAndSymbolIds(),
-                            &sliceBoundOperands);
-  // Give each bound its own copy of 'sliceBoundOperands' for subsequent
-  // canonicalization.
-  sliceState->lbOperands.resize(numSrcLoopIVs, sliceBoundOperands);
-  sliceState->ubOperands.resize(numSrcLoopIVs, sliceBoundOperands);
   return true;
 }
 
@@ -1425,25 +1093,16 @@ static bool isFusionProfitable(Operation *srcOpInst, Operation *srcStoreOpInst,
 
   // Walk src loop nest and collect stats.
   LoopNestStats srcLoopNestStats;
-  LoopNestStatsCollector srcStatsCollector(&srcLoopNestStats);
-  srcStatsCollector.collect(srcLoopIVs[0].getOperation());
-  // Currently only constant trip count loop nests are supported.
-  if (srcStatsCollector.hasLoopWithNonConstTripCount) {
-    LLVM_DEBUG(llvm::dbgs() << "Non-constant trip count loops unsupported.\n");
+  if (!getLoopNestStats(srcLoopIVs[0], &srcLoopNestStats))
     return false;
-  }
+
   // Compute cost of dst loop nest.
   SmallVector<AffineForOp, 4> dstLoopIVs;
   getLoopIVs(*dstLoadOpInsts[0], &dstLoopIVs);
 
   LoopNestStats dstLoopNestStats;
-  LoopNestStatsCollector dstStatsCollector(&dstLoopNestStats);
-  dstStatsCollector.collect(dstLoopIVs[0].getOperation());
-  // Currently only constant trip count loop nests are supported.
-  if (dstStatsCollector.hasLoopWithNonConstTripCount) {
-    LLVM_DEBUG(llvm::dbgs() << "Non-constant trip count loops unsupported.\n");
+  if (!getLoopNestStats(dstLoopIVs[0], &dstLoopNestStats))
     return false;
-  }
 
   // Compute the maximum loop depth at which we can can insert the src slice
   // and still satisfy dest loop nest dependences, for producer-consumer fusion.
@@ -1472,10 +1131,7 @@ static bool isFusionProfitable(Operation *srcOpInst, Operation *srcStoreOpInst,
   Optional<unsigned> bestDstLoopDepth = None;
 
   // Compute op instance count for the src loop nest without iteration slicing.
-  uint64_t srcLoopNestCost =
-      getComputeCost(srcLoopIVs[0].getOperation(), &srcLoopNestStats,
-                     /*tripCountOverrideMap=*/nullptr,
-                     /*computeCostMap=*/nullptr);
+  uint64_t srcLoopNestCost = getComputeCost(srcLoopIVs[0], srcLoopNestStats);
 
   // Compute src loop nest write region size.
   MemRefRegion srcWriteRegion(srcStoreOpInst->getLoc());
@@ -1492,64 +1148,29 @@ static bool isFusionProfitable(Operation *srcOpInst, Operation *srcStoreOpInst,
   int64_t srcWriteRegionSizeBytes = maybeSrcWriteRegionSizeBytes.getValue();
 
   // Compute op instance count for the src loop nest.
-  uint64_t dstLoopNestCost =
-      getComputeCost(dstLoopIVs[0].getOperation(), &dstLoopNestStats,
-                     /*tripCountOverrideMap=*/nullptr,
-                     /*computeCostMap=*/nullptr);
+  uint64_t dstLoopNestCost = getComputeCost(dstLoopIVs[0], dstLoopNestStats);
 
   // Evaluate all depth choices for materializing the slice in the destination
   // loop nest.
-  llvm::SmallDenseMap<Operation *, uint64_t, 8> sliceTripCountMap;
-  DenseMap<Operation *, int64_t> computeCostMap;
   for (unsigned i = maxDstLoopDepth; i >= 1; --i) {
     // Compute the union of slice bounds of all ops in 'dstLoadOpInsts'.
-    if (!getSliceUnion(srcOpInst, dstLoadOpInsts, numSrcLoopIVs, i,
-                       &sliceStates[i - 1])) {
+    if (failed(mlir::computeSliceUnion({srcOpInst}, dstLoadOpInsts,
+                                       /*loopDepth=*/i,
+                                       /*numCommonLoops=*/0,
+                                       /*isBackwardSlice=*/true,
+                                       &sliceStates[i - 1]))) {
       LLVM_DEBUG(llvm::dbgs()
-                 << "getSliceUnion failed for loopDepth: " << i << "\n");
+                 << "computeSliceUnion failed for loopDepth: " << i << "\n");
       continue;
     }
 
-    // Build trip count map for computation slice. We'll skip cases where the
-    // trip count was non-constant.
-    sliceTripCountMap.clear();
-    if (!buildSliceTripCountMap(srcOpInst, &sliceStates[i - 1],
-                                &sliceTripCountMap)) {
-      LLVM_DEBUG(llvm::dbgs() << "Unable to build slice trip count map.\n.");
+    int64_t fusedLoopNestComputeCost;
+    if (!getFusionComputeCost(srcLoopIVs[0], srcLoopNestStats, dstLoopIVs[0],
+                              dstLoopNestStats, &sliceStates[i - 1],
+                              &fusedLoopNestComputeCost)) {
+      LLVM_DEBUG(llvm::dbgs() << "Unable to compute fusion compute cost.\n.");
       continue;
     }
-
-    // Checks whether a store to load forwarding will happen.
-    int64_t sliceIterationCount = getSliceIterationCount(sliceTripCountMap);
-    assert(sliceIterationCount > 0);
-    bool storeLoadFwdGuaranteed = (sliceIterationCount == 1);
-
-    // Compute cost of fusion for this dest loop depth.
-
-    computeCostMap.clear();
-
-    // The store and loads to this memref will disappear.
-    // TODO(andydavis) Add load coalescing to memref data flow opt pass.
-    if (storeLoadFwdGuaranteed) {
-      // A single store disappears: -1 for that.
-      computeCostMap[srcLoopIVs[numSrcLoopIVs - 1].getOperation()] = -1;
-      for (auto *loadOp : dstLoadOpInsts)
-        if (auto forOp = dyn_cast_or_null<AffineForOp>(loadOp->getParentOp()))
-          computeCostMap[forOp] = -1;
-    }
-
-    // Compute op instance count for the src loop nest with iteration slicing.
-    int64_t sliceComputeCost =
-        getComputeCost(srcLoopIVs[0].getOperation(), &srcLoopNestStats,
-                       /*tripCountOverrideMap=*/&sliceTripCountMap,
-                       /*computeCostMap=*/&computeCostMap);
-
-    // Compute cost of fusion for this depth.
-    computeCostMap[dstLoopIVs[i - 1].getOperation()] = sliceComputeCost;
-
-    int64_t fusedLoopNestComputeCost =
-        getComputeCost(dstLoopIVs[0].getOperation(), &dstLoopNestStats,
-                       /*tripCountOverrideMap=*/nullptr, &computeCostMap);
 
     double additionalComputeFraction =
         fusedLoopNestComputeCost /
@@ -1599,7 +1220,6 @@ static bool isFusionProfitable(Operation *srcOpInst, Operation *srcStoreOpInst,
           << 100.0 * additionalComputeFraction << "%\n"
           << "   storage reduction factor: " << storageReduction << "x\n"
           << "   fused nest cost: " << fusedLoopNestComputeCost << "\n"
-          << "   slice iteration count: " << sliceIterationCount << "\n"
           << "   src write region size: " << srcWriteRegionSizeBytes << "\n"
           << "   slice write region size: " << sliceWriteRegionSizeBytes
           << "\n";
@@ -1676,7 +1296,7 @@ static bool isFusionProfitable(Operation *srcOpInst, Operation *srcStoreOpInst,
                             << "   fused mem: " << fusedMem << "\n"
                             << "   slice mem: " << sliceMemEstimate << "\n");
 
-    if (fusedMem > srcMemSizeVal + dstMemSizeVal) {
+    if (static_cast<long>(fusedMem) > srcMemSizeVal + dstMemSizeVal) {
       LLVM_DEBUG(llvm::dbgs() << "Fusion is not profitable; NOT fusing.\n");
       return false;
     }
@@ -1831,7 +1451,7 @@ public:
       // Get 'dstNode' into which to attempt fusion.
       auto *dstNode = mdg->getNode(dstId);
       // Skip if 'dstNode' is not a loop nest.
-      if (!dstNode->op->isa<AffineForOp>())
+      if (!isa<AffineForOp>(dstNode->op))
         continue;
       // Sink sequential loops in 'dstNode' (and thus raise parallel loops)
       // while preserving relative order. This can increase the maximum loop
@@ -1844,7 +1464,7 @@ public:
       DenseSet<Value *> visitedMemrefs;
       while (!loads.empty()) {
         // Get memref of load on top of the stack.
-        auto *memref = loads.back()->cast<LoadOp>().getMemRef();
+        auto *memref = cast<AffineLoadOp>(loads.back()).getMemRef();
         if (visitedMemrefs.count(memref) > 0)
           continue;
         visitedMemrefs.insert(memref);
@@ -1869,7 +1489,7 @@ public:
           // Get 'srcNode' from which to attempt fusion into 'dstNode'.
           auto *srcNode = mdg->getNode(srcId);
           // Skip if 'srcNode' is not a loop nest.
-          if (!srcNode->op->isa<AffineForOp>())
+          if (!isa<AffineForOp>(srcNode->op))
             continue;
           // Skip if 'srcNode' has more than one store to any memref.
           // TODO(andydavis) Support fusing multi-output src loop nests.
@@ -1900,7 +1520,7 @@ public:
           // Gather 'dstNode' store ops to 'memref'.
           SmallVector<Operation *, 2> dstStoreOpInsts;
           for (auto *storeOpInst : dstNode->stores)
-            if (storeOpInst->cast<StoreOp>().getMemRef() == memref)
+            if (cast<AffineStoreOp>(storeOpInst).getMemRef() == memref)
               dstStoreOpInsts.push_back(storeOpInst);
 
           unsigned bestDstLoopDepth;
@@ -1910,7 +1530,16 @@ public:
                                   dstLoadOpInsts, dstStoreOpInsts, &sliceState,
                                   &bestDstLoopDepth, maximalFusion))
             continue;
-
+          // TODO(andydavis) Remove the following test code when canFuseLoops
+          // is fully functional.
+          mlir::ComputationSliceState sliceUnion;
+          if (!maximalFusion) {
+            FusionResult result = mlir::canFuseLoops(
+                cast<AffineForOp>(srcNode->op), cast<AffineForOp>(dstNode->op),
+                bestDstLoopDepth, &sliceUnion);
+            assert(result.value == FusionResult::Success);
+            (void)result;
+          }
           // Fuse computation slice of 'srcLoopNest' into 'dstLoopNest'.
           auto sliceLoopNest = mlir::insertBackwardComputationSlice(
               srcStoreOpInst, dstLoadOpInsts[0], bestDstLoopDepth, &sliceState);
@@ -1918,7 +1547,7 @@ public:
             LLVM_DEBUG(llvm::dbgs() << "\tslice loop nest:\n"
                                     << *sliceLoopNest.getOperation() << "\n");
             // Move 'dstAffineForOp' before 'insertPointInst' if needed.
-            auto dstAffineForOp = dstNode->op->cast<AffineForOp>();
+            auto dstAffineForOp = cast<AffineForOp>(dstNode->op);
             if (insertPointInst != dstAffineForOp.getOperation()) {
               dstAffineForOp.getOperation()->moveBefore(insertPointInst);
             }
@@ -1936,7 +1565,7 @@ public:
               // Create private memref for 'memref' in 'dstAffineForOp'.
               SmallVector<Operation *, 4> storesForMemref;
               for (auto *storeOpInst : sliceCollector.storeOpInsts) {
-                if (storeOpInst->cast<StoreOp>().getMemRef() == memref)
+                if (cast<AffineStoreOp>(storeOpInst).getMemRef() == memref)
                   storesForMemref.push_back(storeOpInst);
               }
               assert(storesForMemref.size() == 1);
@@ -1958,7 +1587,7 @@ public:
             // Add new load ops to current Node load op list 'loads' to
             // continue fusing based on new operands.
             for (auto *loadOpInst : dstLoopCollector.loadOpInsts) {
-              auto *loadMemRef = loadOpInst->cast<LoadOp>().getMemRef();
+              auto *loadMemRef = cast<AffineLoadOp>(loadOpInst).getMemRef();
               if (visitedMemrefs.count(loadMemRef) == 0)
                 loads.push_back(loadOpInst);
             }
@@ -2014,7 +1643,7 @@ public:
       // Get 'dstNode' into which to attempt fusion.
       auto *dstNode = mdg->getNode(dstId);
       // Skip if 'dstNode' is not a loop nest.
-      if (!dstNode->op->isa<AffineForOp>())
+      if (!isa<AffineForOp>(dstNode->op))
         continue;
       // Attempt to fuse 'dstNode' with its sibling nodes in the graph.
       fuseWithSiblingNodes(dstNode);
@@ -2074,7 +1703,7 @@ public:
       auto sliceLoopNest = mlir::insertBackwardComputationSlice(
           sibLoadOpInst, dstLoadOpInsts[0], bestDstLoopDepth, &sliceState);
       if (sliceLoopNest != nullptr) {
-        auto dstForInst = dstNode->op->cast<AffineForOp>();
+        auto dstForInst = cast<AffineForOp>(dstNode->op);
         // Update operation position of fused loop nest (if needed).
         if (insertPointInst != dstForInst.getOperation()) {
           dstForInst.getOperation()->moveBefore(insertPointInst);
@@ -2116,7 +1745,7 @@ public:
       // Check that all stores are to the same memref.
       DenseSet<Value *> storeMemrefs;
       for (auto *storeOpInst : sibNode->stores) {
-        storeMemrefs.insert(storeOpInst->cast<StoreOp>().getMemRef());
+        storeMemrefs.insert(cast<AffineStoreOp>(storeOpInst).getMemRef());
       }
       if (storeMemrefs.size() != 1)
         return false;
@@ -2124,13 +1753,13 @@ public:
     };
 
     // Search for siblings which load the same memref function argument.
-    auto *fn = dstNode->op->getFunction();
-    for (unsigned i = 0, e = fn->getNumArguments(); i != e; ++i) {
-      for (auto &use : fn->getArgument(i)->getUses()) {
-        if (auto loadOp = use.getOwner()->dyn_cast<LoadOp>()) {
+    auto fn = dstNode->op->getParentOfType<FuncOp>();
+    for (unsigned i = 0, e = fn.getNumArguments(); i != e; ++i) {
+      for (auto *user : fn.getArgument(i)->getUsers()) {
+        if (auto loadOp = dyn_cast<AffineLoadOp>(user)) {
           // Gather loops surrounding 'use'.
           SmallVector<AffineForOp, 4> loops;
-          getLoopIVs(*use.getOwner(), &loops);
+          getLoopIVs(*user, &loops);
           // Skip 'use' if it is not within a loop nest.
           if (loops.empty())
             continue;
@@ -2182,7 +1811,7 @@ public:
             if (outEdge.id == dstNode->id || outEdge.value != inEdge.value)
               return;
             auto *sibNode = mdg->getNode(sibNodeId);
-            if (!sibNode->op->isa<AffineForOp>())
+            if (!isa<AffineForOp>(sibNode->op))
               return;
             // Check if 'sibNode/dstNode' can be input-reuse fused on 'memref'.
             if (canFuseWithSibNode(sibNode, outEdge.value)) {
@@ -2216,7 +1845,7 @@ public:
     }
 
     // Collect dst loop stats after memref privatizaton transformation.
-    auto dstForInst = dstNode->op->cast<AffineForOp>();
+    auto dstForInst = cast<AffineForOp>(dstNode->op);
     LoopNestStateCollector dstLoopCollector;
     dstLoopCollector.collect(dstForInst.getOperation());
     // Clear and add back loads and stores
@@ -2228,7 +1857,7 @@ public:
     // function.
     if (mdg->getOutEdgeCount(sibNode->id) == 0) {
       mdg->removeNode(sibNode->id);
-      sibNode->op->cast<AffineForOp>().erase();
+      sibNode->op->erase();
     }
   }
 
@@ -2271,4 +1900,5 @@ void LoopFusion::runOnFunction() {
         .run();
 }
 
-static PassRegistration<LoopFusion> pass("loop-fusion", "Fuse loop nests");
+static PassRegistration<LoopFusion> pass("affine-loop-fusion",
+                                         "Fuse loop nests");

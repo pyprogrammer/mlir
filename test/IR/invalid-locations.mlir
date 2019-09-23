@@ -1,4 +1,4 @@
-// RUN: mlir-opt %s -split-input-file -verify
+// RUN: mlir-opt %s -split-input-file -verify-diagnostics
 
 // -----
 
@@ -19,6 +19,20 @@ func @location_missing_r_paren() {
 func @location_invalid_instance() {
 ^bb:
   return loc() // expected-error {{expected location instance}}
+}
+
+// -----
+
+func @location_name_missing_r_paren() {
+^bb:
+  return loc("foo"(unknown]) // expected-error {{expected ')' after child location of NameLoc}}
+}
+
+// -----
+
+func @location_name_child_is_name() {
+^bb:
+  return loc("foo"("foo")) // expected-error {{child of NameLoc cannot be another NameLoc}}
 }
 
 // -----

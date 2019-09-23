@@ -1,4 +1,4 @@
-//===- FileUtilities.cpp - utilities for working with files -----*- C++ -*-===//
+//===- FileUtilities.cpp - utilities for working with files ---------------===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -43,8 +43,8 @@ mlir::openInputFile(StringRef inputFilename, std::string *errorMessage) {
 std::unique_ptr<llvm::ToolOutputFile>
 mlir::openOutputFile(StringRef outputFilename, std::string *errorMessage) {
   std::error_code error;
-  auto result = llvm::make_unique<llvm::ToolOutputFile>(outputFilename, error,
-                                                        llvm::sys::fs::F_None);
+  auto result = std::make_unique<llvm::ToolOutputFile>(outputFilename, error,
+                                                       llvm::sys::fs::F_None);
   if (error) {
     if (errorMessage)
       *errorMessage = "cannot open output file '" + outputFilename.str() +

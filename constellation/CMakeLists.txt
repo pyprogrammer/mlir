@@ -6,7 +6,6 @@ include_directories(include/)
 include_directories(SYSTEM include/constellation/third_party/)
 
 add_subdirectory(lib)
-add_subdirectory(test/)
 
 set(LLVM_LINK_COMPONENTS
         Core

@@ -22,11 +22,12 @@
 
 #include "toy/Dialect.h"
 
+#include "mlir/Analysis/Verifier.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
 #include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/StandardTypes.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/StandardOps/Ops.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Support/STLExtras.h"
 #include "llvm/ADT/DenseSet.h"
@@ -113,18 +114,17 @@ public:
   // function to process, the mangled name for this specialization, and the
   // types of the arguments on which to specialize.
   struct FunctionToSpecialize {
-    mlir::Function *function;
+    mlir::FuncOp function;
     std::string mangledName;
-    std::vector<mlir::Type> argumentsType;
+    SmallVector<mlir::Type, 4> argumentsType;
   };
 
   void runOnModule() override {
-    auto &module = getModule();
-    auto *main = module.getNamedFunction("main");
+    auto module = getModule();
+    auto main = module.lookupSymbol<mlir::FuncOp>("main");
     if (!main) {
-      module.getContext()->emitError(
-          mlir::UnknownLoc::get(module.getContext()),
-          "Shape inference failed: can't find a main function\n");
+      emitError(mlir::UnknownLoc::get(module.getContext()),
+                "shape inference failed: can't find a main function\n");
       signalPassFailure();
       return;
     }
@@ -140,7 +140,8 @@ public:
 
     // Delete any generic function left
     // FIXME: we may want this as a separate pass.
-    for (mlir::Function &function : llvm::make_early_inc_range(module)) {
+    for (mlir::FuncOp function :
+         llvm::make_early_inc_range(module.getOps<mlir::FuncOp>())) {
       if (auto genericAttr =
               function.getAttrOfType<mlir::BoolAttr>("toy.generic")) {
         if (genericAttr.getValue())
@@ -154,13 +155,14 @@ public:
   mlir::LogicalResult
   specialize(SmallVectorImpl<FunctionToSpecialize> &funcWorklist) {
     FunctionToSpecialize &functionToSpecialize = funcWorklist.back();
-    mlir::Function *f = functionToSpecialize.function;
+    mlir::FuncOp f = functionToSpecialize.function;
 
     // Check if cloning for specialization is needed (usually anything but main)
     // We will create a new function with the concrete types for the parameters
     // and clone the body into it.
     if (!functionToSpecialize.mangledName.empty()) {
-      if (getModule().getNamedFunction(functionToSpecialize.mangledName)) {
+      if (getModule().lookupSymbol<mlir::FuncOp>(
+              functionToSpecialize.mangledName)) {
         funcWorklist.pop_back();
         // Function already specialized, move on.
         return mlir::success();
@@ -170,41 +172,42 @@ public:
       auto type = mlir::FunctionType::get(functionToSpecialize.argumentsType,
                                           {ToyArrayType::get(&getContext())},
                                           &getContext());
-      auto *newFunction = new mlir::Function(
-          f->getLoc(), functionToSpecialize.mangledName, type, f->getAttrs());
-      getModule().getFunctions().push_back(newFunction);
+      auto newFunction =
+          mlir::FuncOp::create(f.getLoc(), functionToSpecialize.mangledName,
+                               type, f.getDialectAttrs());
+      getModule().push_back(newFunction);
 
       // Clone the function body
       mlir::BlockAndValueMapping mapper;
-      f->cloneInto(newFunction, mapper);
+      f.cloneInto(newFunction, mapper);
       LLVM_DEBUG({
         llvm::dbgs() << "====== Cloned : \n";
-        f->dump();
+        f.dump();
         llvm::dbgs() << "====== Into : \n";
-        newFunction->dump();
+        newFunction.dump();
       });
       f = newFunction;
-      f->setAttr("toy.generic", mlir::BoolAttr::get(false, &getContext()));
+      f.setAttr("toy.generic", mlir::BoolAttr::get(false, &getContext()));
       // Remap the entry-block arguments
       // FIXME: this seems like a bug in `cloneInto()` above?
-      auto &entryBlock = f->getBlocks().front();
+      auto &entryBlock = f.getBlocks().front();
       int blockArgSize = entryBlock.getArguments().size();
-      assert(blockArgSize == f->getType().getInputs().size());
-      entryBlock.addArguments(f->getType().getInputs());
+      assert(blockArgSize == static_cast<int>(f.getType().getInputs().size()));
+      entryBlock.addArguments(f.getType().getInputs());
       auto argList = entryBlock.getArguments();
       for (int argNum = 0; argNum < blockArgSize; ++argNum) {
         argList[0]->replaceAllUsesWith(argList[blockArgSize]);
         entryBlock.eraseArgument(0);
       }
-      assert(succeeded(f->verify()));
+      assert(succeeded(mlir::verify(f)));
     }
     LLVM_DEBUG(llvm::dbgs()
-               << "Run shape inference on : '" << f->getName() << "'\n");
+               << "Run shape inference on : '" << f.getName() << "'\n");
 
     auto *toyDialect = getContext().getRegisteredDialect("toy");
     if (!toyDialect) {
-      getContext().emitError(mlir::UnknownLoc::get(&getContext()),
-                             "Toy dialect is not registered");
+      emitError(mlir::UnknownLoc::get(&getContext()),
+                "Toy dialect is not registered");
       signalPassFailure();
       return mlir::failure();
     }
@@ -212,7 +215,7 @@ public:
     // Populate the worklist with the operations that need shape inference:
     // these are the Toy operations that return a generic array.
     llvm::SmallPtrSet<mlir::Operation *, 16> opWorklist;
-    f->walk([&](mlir::Operation *op) {
+    f.walk([&](mlir::Operation *op) {
       if (op->getDialect() == toyDialect) {
         if (op->getNumResults() == 1 &&
             op->getResult(0)->getType().cast<ToyArrayType>().isGeneric())
@@ -226,8 +229,8 @@ public:
       // Find the next operation ready for inference, that is an operation
       // with all operands already resolved (non-generic).
       auto nextop = llvm::find_if(opWorklist, [](mlir::Operation *op) {
-        return llvm::all_of(op->getOperands(), [](mlir::Value *v) {
-          return !v->getType().cast<ToyArrayType>().isGeneric();
+        return llvm::all_of(op->getOperandTypes(), [](mlir::Type ty) {
+          return !ty.cast<ToyArrayType>().isGeneric();
         });
       });
       if (nextop == opWorklist.end())
@@ -238,13 +241,13 @@ public:
       LLVM_DEBUG(llvm::dbgs() << "Inferring shape for: " << *op << "\n");
 
       // The add operation is trivial: propagate the input type as is.
-      if (auto addOp = op->dyn_cast<AddOp>()) {
+      if (auto addOp = llvm::dyn_cast<AddOp>(op)) {
         op->getResult(0)->setType(op->getOperand(0)->getType());
         continue;
       }
 
       // Transpose is easy: just invert the dimensions.
-      if (auto transpose = op->dyn_cast<TransposeOp>()) {
+      if (auto transpose = llvm::dyn_cast<TransposeOp>(op)) {
         SmallVector<int64_t, 2> dims;
         auto arrayTy = transpose.getOperand()->getType().cast<ToyArrayType>();
         dims.insert(dims.end(), arrayTy.getShape().begin(),
@@ -259,14 +262,14 @@ public:
       // catch it but shape inference earlier in the pass could generate an
       // invalid IR (from an invalid Toy input of course) and we wouldn't want
       // to crash here.
-      if (auto mulOp = op->dyn_cast<MulOp>()) {
+      if (auto mulOp = llvm::dyn_cast<MulOp>(op)) {
         auto lhs = mulOp.getLHS()->getType().cast<ToyArrayType>();
         auto rhs = mulOp.getRHS()->getType().cast<ToyArrayType>();
         auto lhsRank = lhs.getShape().size();
         auto rhsRank = rhs.getShape().size();
         if (lhsRank != rhsRank) {
           return mulOp.emitOpError(
-              "Shape mismatch: LHS and RHS must have the same "
+              "shape mismatch: LHS and RHS must have the same "
               "rank for multiplication, got " +
               Twine(lhsRank) + " vs  " + Twine(lhsRank));
         }
@@ -276,7 +279,7 @@ public:
           dims.push_back(1);
         } else if (lhsRank != 2) {
           return op->emitOpError(
-              "Shape mismatch: expect rank 1 or 2 for mul operands, got " +
+              "shape mismatch: expect rank 1 or 2 for mul operands, got " +
               Twine(lhsRank));
         } else {
           dims.push_back(lhs.getShape()[0]);
@@ -291,34 +294,31 @@ public:
       // for this function, queue the callee in the inter-procedural work list,
       // and return. The current function stays in the work list and will
       // restart after the callee is processed.
-      if (auto callOp = op->dyn_cast<GenericCallOp>()) {
+      if (auto callOp = llvm::dyn_cast<GenericCallOp>(op)) {
         auto calleeName = callOp.getCalleeName();
-        auto *callee = getModule().getNamedFunction(calleeName);
+        auto callee = getModule().lookupSymbol<mlir::FuncOp>(calleeName);
         if (!callee) {
-          f->emitError(
-              llvm::Twine("Shape inference failed, call to unknown '") +
-              calleeName + "'");
+          f.emitError("shape inference failed, call to unknown '")
+              << calleeName << "'";
           signalPassFailure();
           return mlir::failure();
         }
         auto mangledName = mangle(calleeName, op->getOpOperands());
         LLVM_DEBUG(llvm::dbgs() << "Found callee to infer: '" << calleeName
                                 << "', mangled: '" << mangledName << "'\n");
-        auto *mangledCallee = getModule().getNamedFunction(mangledName);
+        auto mangledCallee =
+            getModule().lookupSymbol<mlir::FuncOp>(mangledName);
         if (!mangledCallee) {
           // Can't find the target, this is where we queue the request for the
           // callee and stop the inference for the current function now.
-          std::vector<mlir::Type> funcArgs;
-          for (auto operand : op->getOperands())
-            funcArgs.push_back(operand->getType());
-          funcWorklist.push_back(
-              {callee, std::move(mangledName), std::move(funcArgs)});
+          funcWorklist.push_back({callee, std::move(mangledName),
+                                  llvm::to_vector<4>(op->getOperandTypes())});
           return mlir::success();
         }
         // Found a specialized callee! Let's turn this into a normal call
         // operation.
         SmallVector<mlir::Value *, 8> operands(op->getOperands());
-        mlir::FuncBuilder builder(op);
+        mlir::OpBuilder builder(op);
         auto newCall =
             builder.create<mlir::CallOp>(op->getLoc(), mangledCallee, operands);
         if (newCall.getNumResults()) {
@@ -332,41 +332,41 @@ public:
     // Done with inference on this function, removing it from the worklist.
     funcWorklist.pop_back();
     // Mark the function as non-generic now that inference has succeeded
-    f->setAttr("toy.generic", mlir::BoolAttr::get(false, &getContext()));
+    f.setAttr("toy.generic", mlir::BoolAttr::get(false, &getContext()));
 
     // If the operation worklist isn't empty, this indicates a failure.
     if (!opWorklist.empty()) {
       std::string str;
       llvm::raw_string_ostream errorMsg(str);
-      errorMsg << "Shape inference failed, " << opWorklist.size()
+      errorMsg << "shape inference failed, " << opWorklist.size()
                << " operations couldn't be inferred\n";
       for (auto *ope : opWorklist)
         errorMsg << " - " << *ope << "\n";
-      f->emitError(errorMsg.str());
+      f.emitError(errorMsg.str());
       signalPassFailure();
       return mlir::failure();
     }
 
     // Finally, update the return type of the function based on the argument to
     // the return operation.
-    for (auto &block : f->getBlocks()) {
-      auto ret = block.getTerminator()->cast<ReturnOp>();
+    for (auto &block : f.getBlocks()) {
+      auto ret = llvm::cast<ReturnOp>(block.getTerminator());
       if (!ret)
         continue;
       if (ret.getNumOperands() &&
-          f->getType().getResult(0) == ret.getOperand()->getType())
+          f.getType().getResult(0) == ret.getOperand()->getType())
         // type match, we're done
         break;
       SmallVector<mlir::Type, 1> retTy;
       if (ret.getNumOperands())
         retTy.push_back(ret.getOperand()->getType());
       std::vector<mlir::Type> argumentsType;
-      for (auto arg : f->getArguments())
+      for (auto arg : f.getArguments())
         argumentsType.push_back(arg->getType());
       auto newType =
           mlir::FunctionType::get(argumentsType, retTy, &getContext());
-      f->setType(newType);
-      assert(succeeded(f->verify()));
+      f.setType(newType);
+      assert(succeeded(mlir::verify(f)));
       break;
     }
     return mlir::success();
@@ -375,5 +375,7 @@ public:
 } // end anonymous namespace
 
 namespace toy {
-mlir::Pass *createShapeInferencePass() { return new ShapeInferencePass(); }
+std::unique_ptr<mlir::Pass> createShapeInferencePass() {
+  return std::make_unique<ShapeInferencePass>();
+}
 } // namespace toy

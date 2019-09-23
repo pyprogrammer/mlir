@@ -47,7 +47,7 @@ template <typename T> class ArrayRef;
 template <typename T> class MutableArrayRef;
 template <typename T> class TinyPtrVector;
 template <typename T> class Optional;
-template <typename PT1, typename PT2> class PointerUnion;
+template <typename... PT> class PointerUnion;
 namespace detail {
 template <typename KeyT, typename ValueT> struct DenseMapPair;
 }
@@ -55,6 +55,7 @@ template <typename T> struct DenseMapInfo;
 template <typename ValueT, typename ValueInfoT> class DenseSet;
 template <typename KeyT, typename ValueT, typename KeyInfoT, typename BucketT>
 class DenseMap;
+template <typename Fn> class function_ref;
 
 // Other common classes.
 class raw_ostream;
@@ -69,12 +70,18 @@ using llvm::cast_or_null;
 using llvm::dyn_cast;
 using llvm::dyn_cast_or_null;
 using llvm::isa;
+using llvm::isa_and_nonnull;
 
 // Containers.
 using llvm::ArrayRef;
-using llvm::DenseMap;
 using llvm::DenseMapInfo;
-using llvm::DenseSet;
+template <typename KeyT, typename ValueT,
+          typename KeyInfoT = DenseMapInfo<KeyT>,
+          typename BucketT = llvm::detail::DenseMapPair<KeyT, ValueT>>
+using DenseMap = llvm::DenseMap<KeyT, ValueT, KeyInfoT, BucketT>;
+template <typename ValueT, typename ValueInfoT = DenseMapInfo<ValueT>>
+using DenseSet = llvm::DenseSet<ValueT, ValueInfoT>;
+template <typename Fn> using function_ref = llvm::function_ref<Fn>;
 using llvm::MutableArrayRef;
 using llvm::None;
 using llvm::Optional;
@@ -92,7 +99,6 @@ using llvm::Twine;
 // Other common classes.
 using llvm::APFloat;
 using llvm::APInt;
-using llvm::NoneType;
 using llvm::raw_ostream;
 } // namespace mlir
 

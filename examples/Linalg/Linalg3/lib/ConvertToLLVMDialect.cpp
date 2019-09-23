@@ -15,6 +15,10 @@
 // limitations under the License.
 // =============================================================================
 
+#include "mlir/Conversion/ControlFlowToCFG/ConvertControlFlowToCFG.h"
+#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
+#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVMPass.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/EDSC/Builders.h"
 #include "mlir/EDSC/Intrinsics.h"
 #include "mlir/IR/Attributes.h"
@@ -25,9 +29,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/StandardTypes.h"
 #include "mlir/IR/Types.h"
-#include "mlir/LLVMIR/LLVMDialect.h"
-#include "mlir/LLVMIR/Transforms.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/LowerAffine.h"
 
 #include "linalg1/ConvertToLLVMDialect.h"
 #include "linalg1/LLVMIntrinsics.h"
@@ -37,52 +40,31 @@
 
 using namespace mlir;
 
-// Create an array attribute containing integer attributes with values provided
-// in `position`.
-static ArrayAttr makePositionAttr(FuncBuilder &builder,
-                                  ArrayRef<int> position) {
-  SmallVector<Attribute, 4> attrs;
-  attrs.reserve(position.size());
-  for (auto p : position)
-    attrs.push_back(builder.getIntegerAttr(builder.getIntegerType(64), p));
-  return builder.getArrayAttr(attrs);
-}
-
 namespace {
 // Common functionality for Linalg LoadOp and StoreOp conversion to the
 // LLVM IR Dialect.
-template <typename Op>
-class LoadStoreOpConversion : public DialectOpConversion {
+template <typename Op> class LoadStoreOpConversion : public ConversionPattern {
 public:
   explicit LoadStoreOpConversion(MLIRContext *context)
-      : DialectOpConversion(Op::getOperationName(), 1, context) {}
+      : ConversionPattern(Op::getOperationName(), 1, context) {}
   using Base = LoadStoreOpConversion<Op>;
-
-  // Match the Op specified as template argument.
-  PatternMatchResult match(Operation *op) const override {
-    if (op->isa<Op>())
-      return matchSuccess();
-    return matchFailure();
-  }
 
   // Compute the pointer to an element of the buffer underlying the view given
   // current view indices.  Use the base offset and strides stored in the view
   // descriptor to emit IR iteratively computing the actual offset, followed by
   // a getelementptr.
   Value *obtainDataPtr(Operation *op, Value *viewDescriptor,
-                       ArrayRef<Value *> indices, FuncBuilder &rewriter) const {
-    auto loadOp = op->cast<Op>();
+                       ArrayRef<Value *> indices, Builder &rewriter) const {
+    auto loadOp = cast<Op>(op);
     auto elementType =
         loadOp.getViewType().template cast<linalg::ViewType>().getElementType();
-    auto *llvmPtrType = linalg::convertLinalgType(elementType)
-                            .template cast<LLVM::LLVMType>()
-                            .getUnderlyingType()
-                            ->getPointerTo();
-    elementType = rewriter.getType<LLVM::LLVMType>(llvmPtrType);
+    elementType = linalg::convertLinalgType(elementType)
+                      .template cast<LLVM::LLVMType>()
+                      .getPointerTo();
     auto int64Ty = linalg::convertLinalgType(rewriter.getIntegerType(64));
 
-    auto pos = [&rewriter](ArrayRef<int> values) {
-      return makePositionAttr(rewriter, values);
+    auto pos = [&rewriter](ArrayRef<int64_t> values) {
+      return rewriter.getI64ArrayAttr(values);
     };
 
     using namespace intrinsics;
@@ -104,15 +86,17 @@ public:
 // an LLVM IR load.
 class LoadOpConversion : public LoadStoreOpConversion<linalg::LoadOp> {
   using Base::Base;
-  SmallVector<Value *, 4> rewrite(Operation *op, ArrayRef<Value *> operands,
-                                  FuncBuilder &rewriter) const override {
+  PatternMatchResult
+  matchAndRewrite(Operation *op, ArrayRef<Value *> operands,
+                  ConversionPatternRewriter &rewriter) const override {
     edsc::ScopedContext edscContext(rewriter, op->getLoc());
-    auto elementType = linalg::convertLinalgType(*op->getResultTypes().begin());
+    auto elementType = linalg::convertLinalgType(*op->result_type_begin());
     Value *viewDescriptor = operands[0];
     ArrayRef<Value *> indices = operands.drop_front();
     Value *ptr = obtainDataPtr(op, viewDescriptor, indices, rewriter);
     Value *element = intrinsics::load(elementType, ptr);
-    return {element};
+    rewriter.replaceOp(op, {element});
+    return matchSuccess();
   }
 };
 
@@ -120,50 +104,58 @@ class LoadOpConversion : public LoadStoreOpConversion<linalg::LoadOp> {
 // an LLVM IR store.
 class StoreOpConversion : public LoadStoreOpConversion<linalg::StoreOp> {
   using Base::Base;
-  SmallVector<Value *, 4> rewrite(Operation *op, ArrayRef<Value *> operands,
-                                  FuncBuilder &rewriter) const override {
+  PatternMatchResult
+  matchAndRewrite(Operation *op, ArrayRef<Value *> operands,
+                  ConversionPatternRewriter &rewriter) const override {
     edsc::ScopedContext edscContext(rewriter, op->getLoc());
     Value *viewDescriptor = operands[1];
     Value *data = operands[0];
     ArrayRef<Value *> indices = operands.drop_front(2);
     Value *ptr = obtainDataPtr(op, viewDescriptor, indices, rewriter);
     intrinsics::store(data, ptr);
-    return {};
+    rewriter.replaceOp(op, llvm::None);
+    return matchSuccess();
   }
 };
 
+/// A type conversion class that converts Linalg and Std types to LLVM.
+struct LinalgTypeConverter : public LLVMTypeConverter {
+  using LLVMTypeConverter::LLVMTypeConverter;
+
+  // This gets called for block and region arguments, and attributes.
+  Type convertType(Type t) override {
+    if (auto result = LLVMTypeConverter::convertType(t))
+      return result;
+    return linalg::convertLinalgType(t);
+  }
+};
 } // end anonymous namespace
 
 // Helper function that allocates the descriptor converters and adds load/store
 // coverters to the list.
-static llvm::DenseSet<mlir::DialectOpConversion *>
-allocateConversions(llvm::BumpPtrAllocator *allocator,
-                    mlir::MLIRContext *context) {
-  auto conversions = linalg::allocateDescriptorConverters(allocator, context);
-  auto additional =
-      ConversionListBuilder<LoadOpConversion, StoreOpConversion>::build(
-          allocator, context);
-  conversions.insert(additional.begin(), additional.end());
-  return conversions;
+static void populateLinalg3ToLLVMConversionPatterns(
+    mlir::OwningRewritePatternList &patterns, mlir::MLIRContext *context) {
+  patterns.insert<LoadOpConversion, StoreOpConversion>(context);
 }
 
-void linalg::convertLinalg3ToLLVM(Module &module) {
-  // Remove affine constructs if any by using an existing pass.
-  PassManager pm;
-  pm.addPass(createLowerAffinePass());
-  auto rr = pm.run(&module);
-  (void)rr;
-  assert(succeeded(rr) && "affine loop lowering failed");
+LogicalResult linalg::convertLinalg3ToLLVM(ModuleOp module) {
+  // Convert Linalg ops to the LLVM IR dialect using the converter defined
+  // above.
+  LinalgTypeConverter converter(module.getContext());
+  OwningRewritePatternList patterns;
+  populateAffineToStdConversionPatterns(patterns, module.getContext());
+  populateLoopToStdConversionPatterns(patterns, module.getContext());
+  populateStdToLLVMConversionPatterns(converter, patterns);
+  populateLinalg1ToLLVMConversionPatterns(patterns, module.getContext());
+  populateLinalg3ToLLVMConversionPatterns(patterns, module.getContext());
 
-  auto lowering = makeLinalgToLLVMLowering(allocateConversions);
-  auto r = lowering->convert(&module);
-  (void)r;
-  assert(succeeded(r) && "conversion failed");
+  ConversionTarget target(*module.getContext());
+  target.addLegalDialect<LLVM::LLVMDialect>();
+  target.addLegalOp<ModuleOp, ModuleTerminatorOp>();
+  target.addDynamicallyLegalOp<FuncOp>(
+      [&](FuncOp op) { return converter.isSignatureLegal(op.getType()); });
+  if (failed(applyFullConversion(module, target, patterns, &converter)))
+    return failure();
 
-  // Convert the remaining standard MLIR operations to the LLVM IR dialect using
-  // the default converter.
-  auto converter = createStdToLLVMConverter();
-  r = converter->convert(&module);
-  (void)r;
-  assert(succeeded(r) && "second conversion failed");
+  return success();
 }

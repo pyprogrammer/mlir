@@ -135,15 +135,6 @@
 // CHECK: #map{{[0-9]+}} = (d0, d1)[s0, s1] -> (d0 * s0, d0 + s0, d0 + 2, d1 * 2, s1 * 2, s0 + 2)
 #map39 = (i, j)[M, N] -> (i*M, M + i, 2+i, j*2, N*2, 2 + M)
 
-// CHECK: #map{{[0-9]+}} = (d0, d1) -> (d0, d1) size (10, 20)
-#map40 = (i, j) -> (i, j) size (10, 20)
-
-// CHECK: #map{{[0-9]+}} = (d0, d1)[s0, s1] -> (d0, d1) size (s0, s1 + 10)
-#map41 = (i, j)[N, M] -> (i, j) size (N, M+10)
-
-// CHECK: #map{{[0-9]+}} = (d0, d1)[s0, s1] -> (d0, d1) size (128, s0 * 2 + s1 + 5)
-#map42 = (i, j)[N, M] -> (i, j) size (64 + 64, 5 + 2*N + M)
-
 // CHECK: #map{{[0-9]+}} = (d0, d1)[s0] -> ((d0 * 5) floordiv 4, (d1 ceildiv 7) mod s0)
 #map43 = (i, j) [s0] -> ( i * 5 floordiv 4, j ceildiv 7 mod s0)
 
@@ -179,6 +170,9 @@
 // Parenthesis ellision.
 // CHECK: #map{{[0-9]+}} = (d0) -> (d0 * 16 - (d0 + 1) + 15)
 #map52 = (d0) -> (16*d0 + ((d0 + 1) * -1) + 15)
+
+// CHECK: #map{{[0-9]+}} = (d0) -> (d0 - (d0 + 1))
+#map53 = (d0) -> (d0 - (d0 + 1))
 
 // Single identity maps are removed.
 // CHECK: func @f0(memref<2x4xi8, 1>)
@@ -317,15 +311,6 @@ func @f38(memref<2x4xi8, #map38, 1>)
 // CHECK: func @f39(memref<2x4xi8, #map{{[0-9]+}}, 1>)
 func @f39(memref<2x4xi8, #map39, 1>)
 
-// CHECK: func @f40(memref<2x4xi8, #map{{[0-9]+}}, 1>)
-func @f40(memref<2x4xi8, #map40, 1>)
-
-// CHECK: func @f41(memref<2x4xi8, #map{{[0-9]+}}, 1>)
-func @f41(memref<2x4xi8, #map41, 1>)
-
-// CHECK: func @f42(memref<2x4xi8, #map{{[0-9]+}}, 1>)
-func @f42(memref<2x4xi8, #map42, 1>)
-
 // CHECK: func @f43(memref<2x4xi8, #map{{[0-9]+}}>)
 func @f43(memref<2x4xi8, #map43>)
 
@@ -355,3 +340,6 @@ func @f51(memref<1xi8, #map51>)
 
 // CHECK: func @f52(memref<1xi8, #map{{[0-9]+}}>)
 func @f52(memref<1xi8, #map52>)
+
+// CHECK: func @f53(memref<1xi8, #map{{[0-9]+}}>)
+func @f53(memref<1xi8, #map53>)

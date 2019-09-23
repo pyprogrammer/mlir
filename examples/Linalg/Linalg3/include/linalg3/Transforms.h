@@ -26,10 +26,11 @@
 namespace mlir {
 class AffineForOp;
 class AffineMap;
-class Function;
-class FunctionPassBase;
+class FuncOp;
 class Operation;
 class Value;
+
+template <typename T> class OpPassBase;
 } // namespace mlir
 
 namespace linalg {
@@ -55,11 +56,11 @@ makeGenericLoopRanges(mlir::AffineMap operandRangesToLoopMaps,
 
 /// Traverses `f` and rewrites linalg.slice, and the operations it depends on,
 /// to only use linalg.view operations.
-void composeSliceOps(mlir::Function *f);
+void composeSliceOps(mlir::FuncOp f);
 
 /// Traverses `f` and rewrites linalg.matmul(resp. linalg.matvec)
 /// as linalg.matvec(resp. linalg.dot).
-void lowerToFinerGrainedTensorContraction(mlir::Function *f);
+void lowerToFinerGrainedTensorContraction(mlir::FuncOp f);
 
 /// Operation-wise writing of linalg operations to loop form.
 /// It is the caller's responsibility to erase the `op` if necessary.
@@ -69,11 +70,12 @@ llvm::Optional<llvm::SmallVector<mlir::AffineForOp, 4>>
 writeAsLoops(mlir::Operation *op);
 
 /// Traverses `f` and rewrites linalg operations in loop form.
-void lowerToLoops(mlir::Function *f);
+void lowerToLoops(mlir::FuncOp f);
 
 /// Creates a pass that rewrites linalg.load and linalg.store to affine.load and
 /// affine.store operations.
-mlir::FunctionPassBase *createLowerLinalgLoadStorePass();
+std::unique_ptr<mlir::OpPassBase<mlir::FuncOp>>
+createLowerLinalgLoadStorePass();
 
 } // namespace linalg
 

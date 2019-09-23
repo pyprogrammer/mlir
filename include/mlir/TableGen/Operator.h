@@ -25,7 +25,9 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/TableGen/Argument.h"
 #include "mlir/TableGen/Attribute.h"
+#include "mlir/TableGen/Dialect.h"
 #include "mlir/TableGen/OpTrait.h"
+#include "mlir/TableGen/Region.h"
 #include "mlir/TableGen/Type.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallVector.h"
@@ -50,23 +52,32 @@ public:
   explicit Operator(const llvm::Record &def);
   explicit Operator(const llvm::Record *def) : Operator(*def) {}
 
-  // Returns the operation name.
-  StringRef getOperationName() const;
-
   // Returns this op's dialect name.
   StringRef getDialectName() const;
+
+  // Returns the operation name. The name will follow the "<dialect>.<op-name>"
+  // format if its dialect name is not empty.
+  std::string getOperationName() const;
 
   // Returns this op's C++ class name.
   StringRef getCppClassName() const;
 
-  // Returns the qualified C++ class name for the given TableGen def `name`.
-  // The first `_` in `name` is treated as separating the dialect namespace
-  // and the op class name if the dialect namespace is not empty. Otherwise,
-  // if `name` starts with a `_`, the `_` is considered as part the class name.
-  static std::string getQualCppClassName(StringRef name);
-
-  // Returns this op's C++ class name prefixed with dialect namespace.
+  // Returns this op's C++ class name prefixed with namespaces.
   std::string getQualCppClassName() const;
+
+  using value_iterator = NamedTypeConstraint *;
+  using value_range = llvm::iterator_range<value_iterator>;
+
+  // Returns true if this op has variadic operands or results.
+  bool isVariadic() const;
+
+  // Returns true if default builders should not be generated.
+  bool skipDefaultBuilders() const;
+
+  // Op result iterators.
+  value_iterator result_begin();
+  value_iterator result_end();
+  value_range getResults();
 
   // Returns the number of results this op produces.
   int getNumResults() const;
@@ -82,8 +93,8 @@ public:
   // Returns the `index`-th result's name.
   StringRef getResultName(int index) const;
 
-  // Returns true if this operation has a variadic result.
-  bool hasVariadicResult() const;
+  // Returns the number of variadic results in this operation.
+  unsigned getNumVariadicResults() const;
 
   // Op attribute interators.
   using attribute_iterator = const NamedAttribute *;
@@ -92,19 +103,14 @@ public:
   llvm::iterator_range<attribute_iterator> getAttributes() const;
 
   int getNumAttributes() const { return attributes.size(); }
-  // Returns the total number of native attributes.
-  int getNumNativeAttributes() const;
-  int getNumDerivedAttributes() const;
 
   // Op attribute accessors.
   NamedAttribute &getAttribute(int index) { return attributes[index]; }
-  const NamedAttribute &getAttribute(int index) const;
 
   // Op operand iterators.
-  using operand_iterator = NamedTypeConstraint *;
-  operand_iterator operand_begin();
-  operand_iterator operand_end();
-  llvm::iterator_range<operand_iterator> getOperands();
+  value_iterator operand_begin();
+  value_iterator operand_end();
+  value_range getOperands();
 
   int getNumOperands() const { return operands.size(); }
   NamedTypeConstraint &getOperand(int index) { return operands[index]; }
@@ -112,23 +118,25 @@ public:
     return operands[index];
   }
 
-  // Returns true if this operation has a variadic operand.
-  bool hasVariadicOperand() const;
+  // Returns the number of variadic operands in this operation.
+  unsigned getNumVariadicOperands() const;
 
   // Returns the total number of arguments.
   int getNumArgs() const { return arguments.size(); }
 
   // Op argument (attribute or operand) accessors.
-  Argument getArg(int index);
+  Argument getArg(int index) const;
   StringRef getArgName(int index) const;
-
-  // Returns the number of `PredOpTrait` traits.
-  int getNumPredOpTraits() const;
 
   // Returns true if this op has the given MLIR C++ `trait`.
   // TODO: We should add a C++ wrapper class for TableGen OpTrait instead of
   // requiring the raw MLIR trait here.
   bool hasTrait(llvm::StringRef trait) const;
+
+  // Returns the number of regions.
+  unsigned getNumRegions() const;
+  // Returns the `index`-th region.
+  const NamedRegion &getRegion(unsigned index) const;
 
   // Trait.
   using const_trait_iterator = const OpTrait *;
@@ -144,12 +152,21 @@ public:
   bool hasSummary() const;
   StringRef getSummary() const;
 
+  // Returns this op's extra class declaration code.
+  StringRef getExtraClassDeclaration() const;
+
+  // Returns the Tablegen definition this operator was constructed from.
+  // TODO(antiagainst,zinenko): do not expose the TableGen record, this is a
+  // temporary solution to OpEmitter requiring a Record because Operator does
+  // not provide enough methods.
+  const llvm::Record &getDef() const;
+
 private:
   // Populates the vectors containing operands, attributes, results and traits.
   void populateOpStructure();
 
-  // The dialect name of the op.
-  StringRef dialectName;
+  // The dialect of this op.
+  Dialect dialect;
 
   // The unqualified C++ class name of the op.
   StringRef cppClassName;
@@ -171,6 +188,9 @@ private:
 
   // The traits of the op.
   SmallVector<OpTrait, 4> traits;
+
+  // The regions of this op.
+  SmallVector<NamedRegion, 1> regions;
 
   // The number of native attributes stored in the leading positions of
   // `attributes`.

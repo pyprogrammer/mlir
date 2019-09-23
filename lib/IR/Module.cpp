@@ -1,4 +1,4 @@
-//===- Module.cpp - MLIR Module Class -------------------------------===//
+//===- Module.cpp - MLIR Module Operation ---------------------------------===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -16,19 +16,81 @@
 // =============================================================================
 
 #include "mlir/IR/Module.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/OpImplementation.h"
+
 using namespace mlir;
 
-Module::Module(MLIRContext *context) : context(context) {}
+//===----------------------------------------------------------------------===//
+// Module Operation.
+//===----------------------------------------------------------------------===//
 
-/// Look up a function with the specified name, returning null if no such
-/// name exists.  Function names never include the @ on them.
-Function *Module::getNamedFunction(StringRef name) {
-  return getNamedFunction(Identifier::get(name, context));
+void ModuleOp::build(Builder *builder, OperationState &result) {
+  ensureTerminator(*result.addRegion(), *builder, result.location);
 }
 
-/// Look up a function with the specified name, returning null if no such
-/// name exists.  Function names never include the @ on them.
-Function *Module::getNamedFunction(Identifier name) {
-  auto it = symbolTable.find(name);
-  return it != symbolTable.end() ? it->second : nullptr;
+/// Construct a module from the given context.
+ModuleOp ModuleOp::create(Location loc) {
+  OperationState state(loc, "module");
+  Builder builder(loc->getContext());
+  ModuleOp::build(&builder, state);
+  return llvm::cast<ModuleOp>(Operation::create(state));
 }
+
+ParseResult ModuleOp::parse(OpAsmParser &parser, OperationState &result) {
+  // If module attributes are present, parse them.
+  if (succeeded(parser.parseOptionalKeyword("attributes")))
+    if (parser.parseOptionalAttributeDict(result.attributes))
+      return failure();
+
+  // Parse the module body.
+  auto *body = result.addRegion();
+  if (parser.parseRegion(*body, llvm::None, llvm::None))
+    return failure();
+
+  // Ensure that this module has a valid terminator.
+  ensureTerminator(*body, parser.getBuilder(), result.location);
+  return success();
+}
+
+void ModuleOp::print(OpAsmPrinter &p) {
+  p << "module";
+
+  // Print the module attributes.
+  auto attrs = getAttrs();
+  if (!attrs.empty()) {
+    p << " attributes";
+    p.printOptionalAttrDict(attrs, {});
+  }
+
+  // Print the region.
+  p.printRegion(getOperation()->getRegion(0), /*printEntryBlockArgs=*/false,
+                /*printBlockTerminators=*/false);
+}
+
+LogicalResult ModuleOp::verify() {
+  auto &bodyRegion = getOperation()->getRegion(0);
+
+  // The body must contain a single basic block.
+  if (bodyRegion.empty() || std::next(bodyRegion.begin()) != bodyRegion.end())
+    return emitOpError("expected body region to have a single block");
+
+  // Check that the body has no block arguments.
+  auto *body = &bodyRegion.front();
+  if (body->getNumArguments() != 0)
+    return emitOpError("expected body to have no arguments");
+
+  // Check that none of the attributes are non-dialect attributes.
+  for (auto attr : getOperation()->getAttrList().getAttrs()) {
+    if (!attr.first.strref().contains('.'))
+      return emitOpError(
+                 "can only contain dialect-specific attributes, found: '")
+             << attr.first << "'";
+  }
+
+  return success();
+}
+
+/// Return body of this module.
+Region &ModuleOp::getBodyRegion() { return getOperation()->getRegion(0); }
+Block *ModuleOp::getBody() { return &getBodyRegion().front(); }

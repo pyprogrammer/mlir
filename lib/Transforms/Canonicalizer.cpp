@@ -40,7 +40,7 @@ struct Canonicalizer : public FunctionPass<Canonicalizer> {
 
 void Canonicalizer::runOnFunction() {
   OwningRewritePatternList patterns;
-  auto &func = getFunction();
+  auto func = getFunction();
 
   // TODO: Instead of adding all known patterns from the whole system lazily add
   // and cache the canonicalization patterns for ops we see in practice when
@@ -49,12 +49,12 @@ void Canonicalizer::runOnFunction() {
   for (auto *op : context->getRegisteredOperations())
     op->getCanonicalizationPatterns(patterns, context);
 
-  applyPatternsGreedily(func, std::move(patterns));
+  applyPatternsGreedily(func, patterns);
 }
 
 /// Create a Canonicalizer pass.
-FunctionPassBase *mlir::createCanonicalizerPass() {
-  return new Canonicalizer();
+std::unique_ptr<OpPassBase<FuncOp>> mlir::createCanonicalizerPass() {
+  return std::make_unique<Canonicalizer>();
 }
 
 static PassRegistration<Canonicalizer> pass("canonicalize",

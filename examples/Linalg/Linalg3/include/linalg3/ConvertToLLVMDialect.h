@@ -19,11 +19,12 @@
 #define LINALG3_CONVERTTOLLVMDIALECT_H_
 
 namespace mlir {
-class Module;
+struct LogicalResult;
+class ModuleOp;
 } // end namespace mlir
 
 namespace linalg {
-void convertLinalg3ToLLVM(mlir::Module &module);
+mlir::LogicalResult convertLinalg3ToLLVM(mlir::ModuleOp module);
 } // end namespace linalg
 
 #endif // LINALG3_CONVERTTOLLVMDIALECT_H_

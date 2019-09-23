@@ -110,49 +110,47 @@ struct CSE : public FunctionPass<CSE> {
     bool processed;
   };
 
-  /// Attempt to eliminate a redundant operation. Returns true if the operation
-  /// was marked for removal, false otherwise.
-  bool simplifyOperation(Operation *op);
+  /// Attempt to eliminate a redundant operation. Returns success if the
+  /// operation was marked for removal, failure otherwise.
+  LogicalResult simplifyOperation(ScopedMapTy &knownValues, Operation *op);
 
-  void simplifyBlock(DominanceInfo &domInfo, Block *bb);
-  void simplifyRegion(DominanceInfo &domInfo, Region &region);
+  void simplifyBlock(ScopedMapTy &knownValues, DominanceInfo &domInfo,
+                     Block *bb);
+  void simplifyRegion(ScopedMapTy &knownValues, DominanceInfo &domInfo,
+                      Region &region);
 
   void runOnFunction() override;
 
 private:
-  /// A scoped hash table of defining operations within a function.
-  ScopedMapTy knownValues;
-
   /// Operations marked as dead and to be erased.
   std::vector<Operation *> opsToErase;
 };
 } // end anonymous namespace
 
 /// Attempt to eliminate a redundant operation.
-bool CSE::simplifyOperation(Operation *op) {
+LogicalResult CSE::simplifyOperation(ScopedMapTy &knownValues, Operation *op) {
   // Don't simplify operations with nested blocks. We don't currently model
   // equality comparisons correctly among other things. It is also unclear
   // whether we would want to CSE such operations.
   if (op->getNumRegions() != 0)
-    return false;
+    return failure();
 
   // TODO(riverriddle) We currently only eliminate non side-effecting
   // operations.
   if (!op->hasNoSideEffect())
-    return false;
+    return failure();
 
   // If the operation is already trivially dead just add it to the erase list.
   if (op->use_empty()) {
     opsToErase.push_back(op);
-    return true;
+    return success();
   }
 
   // Look for an existing definition for the operation.
   if (auto *existing = knownValues.lookup(op)) {
     // If we find one then replace all uses of the current operation with the
     // existing one and mark it for deletion.
-    for (unsigned i = 0, e = existing->getNumResults(); i != e; ++i)
-      op->getResult(i)->replaceAllUsesWith(existing->getResult(i));
+    op->replaceAllUsesWith(existing);
     opsToErase.push_back(op);
 
     // If the existing operation has an unknown location and the current
@@ -162,27 +160,39 @@ bool CSE::simplifyOperation(Operation *op) {
         !op->getLoc().isa<UnknownLoc>()) {
       existing->setLoc(op->getLoc());
     }
-    return true;
+    return success();
   }
 
   // Otherwise, we add this operation to the known values map.
   knownValues.insert(op, op);
-  return false;
+  return failure();
 }
 
-void CSE::simplifyBlock(DominanceInfo &domInfo, Block *bb) {
-  for (auto &i : *bb) {
+void CSE::simplifyBlock(ScopedMapTy &knownValues, DominanceInfo &domInfo,
+                        Block *bb) {
+  for (auto &inst : *bb) {
     // If the operation is simplified, we don't process any held regions.
-    if (simplifyOperation(&i))
+    if (succeeded(simplifyOperation(knownValues, &inst)))
       continue;
 
-    // Simplify any held blocks.
-    for (auto &region : i.getRegions())
-      simplifyRegion(domInfo, region);
+    // If this operation is isolated above, we can't process nested regions with
+    // the given 'knownValues' map. This would cause the insertion of implicit
+    // captures in explicit capture only regions.
+    if (!inst.isRegistered() || inst.isKnownIsolatedFromAbove()) {
+      ScopedMapTy nestedKnownValues;
+      for (auto &region : inst.getRegions())
+        simplifyRegion(nestedKnownValues, domInfo, region);
+      continue;
+    }
+
+    // Otherwise, process nested regions normally.
+    for (auto &region : inst.getRegions())
+      simplifyRegion(knownValues, domInfo, region);
   }
 }
 
-void CSE::simplifyRegion(DominanceInfo &domInfo, Region &region) {
+void CSE::simplifyRegion(ScopedMapTy &knownValues, DominanceInfo &domInfo,
+                         Region &region) {
   // If the region is empty there is nothing to do.
   if (region.empty())
     return;
@@ -190,7 +200,7 @@ void CSE::simplifyRegion(DominanceInfo &domInfo, Region &region) {
   // If the region only contains one block, then simplify it directly.
   if (std::next(region.begin()) == region.end()) {
     ScopedMapTy::ScopeTy scope(knownValues);
-    simplifyBlock(domInfo, &region.front());
+    simplifyBlock(knownValues, domInfo, &region.front());
     return;
   }
 
@@ -203,7 +213,7 @@ void CSE::simplifyRegion(DominanceInfo &domInfo, Region &region) {
   std::deque<std::unique_ptr<CFGStackNode>> stack;
 
   // Process the nodes of the dom tree for this region.
-  stack.emplace_back(llvm::make_unique<CFGStackNode>(
+  stack.emplace_back(std::make_unique<CFGStackNode>(
       knownValues, domInfo.getRootNode(&region)));
 
   while (!stack.empty()) {
@@ -212,14 +222,14 @@ void CSE::simplifyRegion(DominanceInfo &domInfo, Region &region) {
     // Check to see if we need to process this node.
     if (!currentNode->processed) {
       currentNode->processed = true;
-      simplifyBlock(domInfo, currentNode->node->getBlock());
+      simplifyBlock(knownValues, domInfo, currentNode->node->getBlock());
     }
 
     // Otherwise, check to see if we need to process a child node.
     if (currentNode->childIterator != currentNode->node->end()) {
       auto *childNode = *(currentNode->childIterator++);
       stack.emplace_back(
-          llvm::make_unique<CFGStackNode>(knownValues, childNode));
+          std::make_unique<CFGStackNode>(knownValues, childNode));
     } else {
       // Finally, if the node and all of its children have been processed
       // then we delete the node.
@@ -229,13 +239,14 @@ void CSE::simplifyRegion(DominanceInfo &domInfo, Region &region) {
 }
 
 void CSE::runOnFunction() {
-  simplifyRegion(getAnalysis<DominanceInfo>(), getFunction().getBody());
+  /// A scoped hash table of defining operations within a function.
+  ScopedMapTy knownValues;
+  simplifyRegion(knownValues, getAnalysis<DominanceInfo>(),
+                 getFunction().getBody());
 
   // If no operations were erased, then we mark all analyses as preserved.
-  if (opsToErase.empty()) {
-    markAllAnalysesPreserved();
-    return;
-  }
+  if (opsToErase.empty())
+    return markAllAnalysesPreserved();
 
   /// Erase any operations that were marked as dead during simplification.
   for (auto *op : opsToErase)
@@ -247,7 +258,9 @@ void CSE::runOnFunction() {
   markAnalysesPreserved<DominanceInfo, PostDominanceInfo>();
 }
 
-FunctionPassBase *mlir::createCSEPass() { return new CSE(); }
+std::unique_ptr<OpPassBase<FuncOp>> mlir::createCSEPass() {
+  return std::make_unique<CSE>();
+}
 
 static PassRegistration<CSE>
     pass("cse", "Eliminate common sub-expressions in functions");

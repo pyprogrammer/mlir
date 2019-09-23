@@ -16,19 +16,24 @@
 // =============================================================================
 //
 // This file lowers affine constructs (If and For statements, AffineApply
-// operations) within a function into their lower level CFG equivalent blocks.
+// operations) within a function into their standard If and For equivalent ops.
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/AffineOps/AffineOps.h"
+#include "mlir/Transforms/LowerAffine.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/LoopOps/LoopOps.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
 #include "mlir/IR/AffineExprVisitor.h"
+#include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/StandardOps/Ops.h"
 #include "mlir/Support/Functional.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
+
 using namespace mlir;
 
 namespace {
@@ -40,9 +45,9 @@ class AffineApplyExpander
 public:
   // This internal class expects arguments to be non-null, checks must be
   // performed at the call site.
-  AffineApplyExpander(FuncBuilder *builder, ArrayRef<Value *> dimValues,
+  AffineApplyExpander(OpBuilder &builder, ArrayRef<Value *> dimValues,
                       ArrayRef<Value *> symbolValues, Location loc)
-      : builder(*builder), dimValues(dimValues), symbolValues(symbolValues),
+      : builder(builder), dimValues(dimValues), symbolValues(symbolValues),
         loc(loc) {}
 
   template <typename OpTy> Value *buildBinaryExpr(AffineBinaryOpExpr expr) {
@@ -74,14 +79,13 @@ public:
   Value *visitModExpr(AffineBinaryOpExpr expr) {
     auto rhsConst = expr.getRHS().dyn_cast<AffineConstantExpr>();
     if (!rhsConst) {
-      builder.getContext()->emitError(
+      emitError(
           loc,
           "semi-affine expressions (modulo by non-const) are not supported");
       return nullptr;
     }
     if (rhsConst.getValue() <= 0) {
-      builder.getContext()->emitError(
-          loc, "modulo by non-positive value is not supported");
+      emitError(loc, "modulo by non-positive value is not supported");
       return nullptr;
     }
 
@@ -112,14 +116,13 @@ public:
   Value *visitFloorDivExpr(AffineBinaryOpExpr expr) {
     auto rhsConst = expr.getRHS().dyn_cast<AffineConstantExpr>();
     if (!rhsConst) {
-      builder.getContext()->emitError(
+      emitError(
           loc,
           "semi-affine expressions (division by non-const) are not supported");
       return nullptr;
     }
     if (rhsConst.getValue() <= 0) {
-      builder.getContext()->emitError(
-          loc, "division by non-positive value is not supported");
+      emitError(loc, "division by non-positive value is not supported");
       return nullptr;
     }
 
@@ -154,14 +157,12 @@ public:
   Value *visitCeilDivExpr(AffineBinaryOpExpr expr) {
     auto rhsConst = expr.getRHS().dyn_cast<AffineConstantExpr>();
     if (!rhsConst) {
-      builder.getContext()->emitError(
-          loc,
-          "semi-affine expressions (division by non-const) are not supported");
+      emitError(loc) << "semi-affine expressions (division by non-const) are "
+                        "not supported";
       return nullptr;
     }
     if (rhsConst.getValue() <= 0) {
-      builder.getContext()->emitError(
-          loc, "division by non-positive value is not supported");
+      emitError(loc, "division by non-positive value is not supported");
       return nullptr;
     }
     auto lhs = visit(expr.getLHS());
@@ -205,7 +206,7 @@ public:
   }
 
 private:
-  FuncBuilder &builder;
+  OpBuilder &builder;
   ArrayRef<Value *> dimValues;
   ArrayRef<Value *> symbolValues;
 
@@ -215,21 +216,21 @@ private:
 
 // Create a sequence of operations that implement the `expr` applied to the
 // given dimension and symbol values.
-static mlir::Value *expandAffineExpr(FuncBuilder *builder, Location loc,
-                                     AffineExpr expr,
-                                     ArrayRef<Value *> dimValues,
-                                     ArrayRef<Value *> symbolValues) {
+mlir::Value *mlir::expandAffineExpr(OpBuilder &builder, Location loc,
+                                    AffineExpr expr,
+                                    ArrayRef<Value *> dimValues,
+                                    ArrayRef<Value *> symbolValues) {
   return AffineApplyExpander(builder, dimValues, symbolValues, loc).visit(expr);
 }
 
 // Create a sequence of operations that implement the `affineMap` applied to
 // the given `operands` (as it it were an AffineApplyOp).
 Optional<SmallVector<Value *, 8>> static expandAffineMap(
-    FuncBuilder *builder, Location loc, AffineMap affineMap,
+    OpBuilder &builder, Location loc, AffineMap affineMap,
     ArrayRef<Value *> operands) {
   auto numDims = affineMap.getNumDims();
   auto expanded = functional::map(
-      [numDims, builder, loc, operands](AffineExpr expr) {
+      [numDims, &builder, loc, operands](AffineExpr expr) {
         return expandAffineExpr(builder, loc, expr,
                                 operands.take_front(numDims),
                                 operands.drop_front(numDims));
@@ -239,16 +240,6 @@ Optional<SmallVector<Value *, 8>> static expandAffineMap(
     return expanded;
   return None;
 }
-
-namespace {
-struct LowerAffinePass : public FunctionPass<LowerAffinePass> {
-  void runOnFunction() override;
-
-  bool lowerAffineFor(AffineForOp forOp);
-  bool lowerAffineIf(AffineIfOp ifOp);
-  bool lowerAffineApply(AffineApplyOp op);
-};
-} // end anonymous namespace
 
 // Given a range of values, emit the code that reduces them with "min" or "max"
 // depending on the provided comparison predicate.  The predicate defines which
@@ -263,7 +254,7 @@ struct LowerAffinePass : public FunctionPass<LowerAffinePass> {
 // recognize as a reduction by the subsequent passes.
 static Value *buildMinMaxReductionSeq(Location loc, CmpIPredicate predicate,
                                       ArrayRef<Value *> values,
-                                      FuncBuilder &builder) {
+                                      OpBuilder &builder) {
   assert(!llvm::empty(values) && "empty min/max chain");
 
   auto valueIt = values.begin();
@@ -276,366 +267,268 @@ static Value *buildMinMaxReductionSeq(Location loc, CmpIPredicate predicate,
   return value;
 }
 
-// Convert a "affine.for" loop to a flow of blocks.  Return `false` on success.
-//
-// Create an SESE region for the loop (including its body) and append it to the
-// end of the current region.  The loop region consists of the initialization
-// block that sets up the initial value of the loop induction variable (%iv) and
-// computes the loop bounds that are loop-invariant in functions; the condition
-// block that checks the exit condition of the loop; the body SESE region; and
-// the end block that post-dominates the loop.  The end block of the loop
-// becomes the new end of the current SESE region.  The body of the loop is
-// constructed recursively after starting a new region (it may be, for example,
-// a nested loop).  Induction variable modification is appended to the body SESE
-// region that always loops back to the condition block.
-//
-//      +---------------------------------+
-//      |   <code before the AffineForOp> |
-//      |   <compute initial %iv value>   |
-//      |   br cond(%iv)                  |
-//      +---------------------------------+
-//             |
-//  -------|   |
-//  |      v   v
-//  |   +--------------------------------+
-//  |   | cond(%iv):                     |
-//  |   |   <compare %iv to upper bound> |
-//  |   |   cond_br %r, body, end        |
-//  |   +--------------------------------+
-//  |          |               |
-//  |          |               -------------|
-//  |          v                            |
-//  |   +--------------------------------+  |
-//  |   | body:                          |  |
-//  |   |   <body contents>              |  |
-//  |   |   %new_iv =<add step to %iv>   |  |
-//  |   |   br cond(%new_iv)             |  |
-//  |   +--------------------------------+  |
-//  |          |                            |
-//  |-----------        |--------------------
-//                      v
-//      +--------------------------------+
-//      | end:                           |
-//      |   <code after the AffineForOp> |
-//      +--------------------------------+
-//
-bool LowerAffinePass::lowerAffineFor(AffineForOp forOp) {
-  auto loc = forOp.getLoc();
-  auto *forInst = forOp.getOperation();
-
-  // Start by splitting the block containing the 'affine.for' into two parts.
-  // The part before will get the init code, the part after will be the end
-  // point.
-  auto *initBlock = forInst->getBlock();
-  auto *endBlock = initBlock->splitBlock(forInst);
-
-  // Create the condition block, with its argument for the loop induction
-  // variable.  We set it up below.
-  auto *conditionBlock = new Block();
-  conditionBlock->insertBefore(endBlock);
-  auto *iv = conditionBlock->addArgument(IndexType::get(forInst->getContext()));
-
-  // Create the body block, moving the body of the forOp over to it and dropping
-  // the affine terminator.
-  auto *bodyBlock = new Block();
-  bodyBlock->insertBefore(endBlock);
-
-  auto *oldBody = forOp.getBody();
-  bodyBlock->getOperations().splice(bodyBlock->begin(),
-                                    oldBody->getOperations(), oldBody->begin(),
-                                    std::prev(oldBody->end()));
-
-  // The code in the body of the forOp now uses 'iv' as its indvar.
-  forOp.getInductionVar()->replaceAllUsesWith(iv);
-
-  // Append the induction variable stepping logic and branch back to the exit
-  // condition block.  Construct an affine expression f : (x -> x+step) and
-  // apply this expression to the induction variable.
-  FuncBuilder builder(bodyBlock);
-  auto affStep = builder.getAffineConstantExpr(forOp.getStep());
-  auto affDim = builder.getAffineDimExpr(0);
-  auto stepped = expandAffineExpr(&builder, loc, affDim + affStep, iv, {});
-  if (!stepped)
-    return true;
-  // We know we applied a one-dimensional map.
-  builder.create<BranchOp>(loc, conditionBlock, stepped);
-
-  // Now that the body block done, fill in the code to compute the bounds of the
-  // induction variable in the init block.
-  builder.setInsertionPointToEnd(initBlock);
-
-  // Compute loop bounds.
-  SmallVector<Value *, 8> operands(forOp.getLowerBoundOperands());
-  auto lbValues = expandAffineMap(&builder, forInst->getLoc(),
-                                  forOp.getLowerBoundMap(), operands);
+// Emit instructions that correspond to the affine map in the lower bound
+// applied to the respective operands, and compute the maximum value across
+// the results.
+Value *mlir::lowerAffineLowerBound(AffineForOp op, OpBuilder &builder) {
+  SmallVector<Value *, 8> boundOperands(op.getLowerBoundOperands());
+  auto lbValues = expandAffineMap(builder, op.getLoc(), op.getLowerBoundMap(),
+                                  boundOperands);
   if (!lbValues)
-    return true;
-  Value *lowerBound =
-      buildMinMaxReductionSeq(loc, CmpIPredicate::SGT, *lbValues, builder);
+    return nullptr;
+  return buildMinMaxReductionSeq(op.getLoc(), CmpIPredicate::SGT, *lbValues,
+                                 builder);
+}
 
-  operands.assign(forOp.getUpperBoundOperands().begin(),
-                  forOp.getUpperBoundOperands().end());
-  auto ubValues = expandAffineMap(&builder, forInst->getLoc(),
-                                  forOp.getUpperBoundMap(), operands);
+// Emit instructions that correspond to the affine map in the upper bound
+// applied to the respective operands, and compute the minimum value across
+// the results.
+Value *mlir::lowerAffineUpperBound(AffineForOp op, OpBuilder &builder) {
+  SmallVector<Value *, 8> boundOperands(op.getUpperBoundOperands());
+  auto ubValues = expandAffineMap(builder, op.getLoc(), op.getUpperBoundMap(),
+                                  boundOperands);
   if (!ubValues)
-    return true;
-  Value *upperBound =
-      buildMinMaxReductionSeq(loc, CmpIPredicate::SLT, *ubValues, builder);
-  builder.create<BranchOp>(loc, conditionBlock, lowerBound);
-
-  // With the body block done, we can fill in the condition block.
-  builder.setInsertionPointToEnd(conditionBlock);
-  auto comparison =
-      builder.create<CmpIOp>(loc, CmpIPredicate::SLT, iv, upperBound);
-  builder.create<CondBranchOp>(loc, comparison, bodyBlock, ArrayRef<Value *>(),
-                               endBlock, ArrayRef<Value *>());
-
-  // Ok, we're done!
-  forOp.erase();
-  return false;
+    return nullptr;
+  return buildMinMaxReductionSeq(op.getLoc(), CmpIPredicate::SLT, *ubValues,
+                                 builder);
 }
 
-// Convert an "if" operation into a flow of basic blocks.
-//
-// Create an SESE region for the if operation (including its "then" and
-// optional "else" operation blocks) and append it to the end of the current
-// region.  The conditional region consists of a sequence of condition-checking
-// blocks that implement the short-circuit scheme, followed by a "then" SESE
-// region and an "else" SESE region, and the continuation block that
-// post-dominates all blocks of the "if" operation.  The flow of blocks that
-// correspond to the "then" and "else" clauses are constructed recursively,
-// enabling easy nesting of "if" operations and if-then-else-if chains.
-//
-//      +--------------------------------+
-//      | <code before the AffineIfOp>   |
-//      | %zero = constant 0 : index     |
-//      | %v = affine.apply #expr1(%ops) |
-//      | %c = cmpi "sge" %v, %zero      |
-//      | cond_br %c, %next, %else       |
-//      +--------------------------------+
-//             |              |
-//             |              --------------|
-//             v                            |
-//      +--------------------------------+  |
-//      | next:                          |  |
-//      |   <repeat the check for expr2> |  |
-//      |   cond_br %c, %next2, %else    |  |
-//      +--------------------------------+  |
-//             |              |             |
-//            ...             --------------|
-//             |   <Per-expression checks>  |
-//             v                            |
-//      +--------------------------------+  |
-//      | last:                          |  |
-//      |   <repeat the check for exprN> |  |
-//      |   cond_br %c, %then, %else     |  |
-//      +--------------------------------+  |
-//             |              |             |
-//             |              --------------|
-//             v                            |
-//      +--------------------------------+  |
-//      | then:                          |  |
-//      |   <then contents>              |  |
-//      |   br continue                  |  |
-//      +--------------------------------+  |
-//             |                            |
-//   |----------               |-------------
-//   |                         V
-//   |  +--------------------------------+
-//   |  | else:                          |
-//   |  |   <else contents>              |
-//   |  |   br continue                  |
-//   |  +--------------------------------+
-//   |         |
-//   ------|   |
-//         v   v
-//      +--------------------------------+
-//      | continue:                      |
-//      |   <code after the AffineIfOp>  |
-//      +--------------------------------+
-//
-bool LowerAffinePass::lowerAffineIf(AffineIfOp ifOp) {
-  auto *ifInst = ifOp.getOperation();
-  auto loc = ifInst->getLoc();
+namespace {
+// Affine terminators are removed.
+class AffineTerminatorLowering : public OpRewritePattern<AffineTerminatorOp> {
+public:
+  using OpRewritePattern<AffineTerminatorOp>::OpRewritePattern;
 
-  // Start by splitting the block containing the 'affine.if' into two parts. The
-  // part before will contain the condition, the part after will be the
-  // continuation point.
-  auto *condBlock = ifInst->getBlock();
-  auto *continueBlock = condBlock->splitBlock(ifInst);
-
-  // Create a block for the 'then' code, inserting it between the cond and
-  // continue blocks.  Move the operations over from the AffineIfOp and add a
-  // branch to the continuation point.
-  Block *thenBlock = new Block();
-  thenBlock->insertBefore(continueBlock);
-
-  // If the 'then' block is not empty, then splice the operations except for
-  // the terminator.
-  auto &oldThenBlocks = ifOp.getThenBlocks();
-  if (!oldThenBlocks.empty()) {
-    // We currently only handle one 'then' block.
-    if (std::next(oldThenBlocks.begin()) != oldThenBlocks.end())
-      return true;
-
-    Block *oldThen = &oldThenBlocks.front();
-
-    thenBlock->getOperations().splice(
-        thenBlock->begin(), oldThen->getOperations(), oldThen->begin(),
-        std::prev(oldThen->end()));
+  PatternMatchResult matchAndRewrite(AffineTerminatorOp op,
+                                     PatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<loop::TerminatorOp>(op);
+    return matchSuccess();
   }
+};
 
-  FuncBuilder builder(thenBlock);
-  builder.create<BranchOp>(loc, continueBlock);
+class AffineForLowering : public OpRewritePattern<AffineForOp> {
+public:
+  using OpRewritePattern<AffineForOp>::OpRewritePattern;
 
-  // Handle the 'else' block the same way, but we skip it if we have no else
-  // code.
-  Block *elseBlock = continueBlock;
-  auto &oldElseBlocks = ifOp.getElseBlocks();
-  if (!oldElseBlocks.empty()) {
-    // We currently only handle one 'else' block.
-    if (std::next(oldElseBlocks.begin()) != oldElseBlocks.end())
-      return true;
-
-    auto *oldElse = &oldElseBlocks.front();
-    elseBlock = new Block();
-    elseBlock->insertBefore(continueBlock);
-
-    elseBlock->getOperations().splice(
-        elseBlock->begin(), oldElse->getOperations(), oldElse->begin(),
-        std::prev(oldElse->end()));
-    builder.setInsertionPointToEnd(elseBlock);
-    builder.create<BranchOp>(loc, continueBlock);
+  PatternMatchResult matchAndRewrite(AffineForOp op,
+                                     PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value *lowerBound = lowerAffineLowerBound(op, rewriter);
+    Value *upperBound = lowerAffineUpperBound(op, rewriter);
+    Value *step = rewriter.create<ConstantIndexOp>(loc, op.getStep());
+    auto f = rewriter.create<loop::ForOp>(loc, lowerBound, upperBound, step);
+    f.region().getBlocks().clear();
+    rewriter.inlineRegionBefore(op.region(), f.region(), f.region().end());
+    rewriter.replaceOp(op, {});
+    return matchSuccess();
   }
+};
 
-  // Ok, now we just have to handle the condition logic.
-  auto integerSet = ifOp.getIntegerSet();
+class AffineIfLowering : public OpRewritePattern<AffineIfOp> {
+public:
+  using OpRewritePattern<AffineIfOp>::OpRewritePattern;
 
-  // Implement short-circuit logic.  For each affine expression in the
-  // 'affine.if' condition, convert it into an affine map and call
-  // `affine.apply` to obtain the resulting value.  Perform the equality or the
-  // greater-than-or-equality test between this value and zero depending on the
-  // equality flag of the condition.  If the test fails, jump immediately to the
-  // false branch, which may be the else block if it is present or the
-  // continuation block otherwise. If the test succeeds, jump to the next block
-  // testing the next conjunct of the condition in the similar way.  When all
-  // conjuncts have been handled, jump to the 'then' block instead.
-  builder.setInsertionPointToEnd(condBlock);
-  Value *zeroConstant = builder.create<ConstantIndexOp>(loc, 0);
+  PatternMatchResult matchAndRewrite(AffineIfOp op,
+                                     PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
 
-  for (auto tuple :
-       llvm::zip(integerSet.getConstraints(), integerSet.getEqFlags())) {
-    AffineExpr constraintExpr = std::get<0>(tuple);
-    bool isEquality = std::get<1>(tuple);
+    // Now we just have to handle the condition logic.
+    auto integerSet = op.getIntegerSet();
+    Value *zeroConstant = rewriter.create<ConstantIndexOp>(loc, 0);
+    SmallVector<Value *, 8> operands(op.getOperation()->getOperands());
+    auto operandsRef = llvm::makeArrayRef(operands);
 
-    // Create the fall-through block for the next condition right before the
-    // 'thenBlock'.
-    auto *nextBlock = new Block();
-    nextBlock->insertBefore(thenBlock);
+    // Calculate cond as a conjunction without short-circuiting.
+    Value *cond = nullptr;
+    for (unsigned i = 0, e = integerSet.getNumConstraints(); i < e; ++i) {
+      AffineExpr constraintExpr = integerSet.getConstraint(i);
+      bool isEquality = integerSet.isEq(i);
 
-    // Build and apply an affine expression
-    SmallVector<Value *, 8> operands(ifInst->getOperands());
-    auto operandsRef = ArrayRef<Value *>(operands);
-    auto numDims = integerSet.getNumDims();
-    Value *affResult = expandAffineExpr(&builder, loc, constraintExpr,
-                                        operandsRef.take_front(numDims),
-                                        operandsRef.drop_front(numDims));
-    if (!affResult)
-      return true;
+      // Build and apply an affine expression
+      auto numDims = integerSet.getNumDims();
+      Value *affResult = expandAffineExpr(rewriter, loc, constraintExpr,
+                                          operandsRef.take_front(numDims),
+                                          operandsRef.drop_front(numDims));
+      if (!affResult)
+        return matchFailure();
+      auto pred = isEquality ? CmpIPredicate::EQ : CmpIPredicate::SGE;
+      Value *cmpVal =
+          rewriter.create<CmpIOp>(loc, pred, affResult, zeroConstant);
+      cond =
+          cond ? rewriter.create<AndOp>(loc, cond, cmpVal).getResult() : cmpVal;
+    }
+    cond = cond ? cond
+                : rewriter.create<ConstantIntOp>(loc, /*value=*/1, /*width=*/1);
 
-    // Compare the result of the apply and branch.
-    auto comparisonOp = builder.create<CmpIOp>(
-        loc, isEquality ? CmpIPredicate::EQ : CmpIPredicate::SGE, affResult,
-        zeroConstant);
-    builder.create<CondBranchOp>(loc, comparisonOp.getResult(), nextBlock,
-                                 /*trueArgs*/ ArrayRef<Value *>(), elseBlock,
-                                 /*falseArgs*/ ArrayRef<Value *>());
-    builder.setInsertionPointToEnd(nextBlock);
+    bool hasElseRegion = !op.elseRegion().empty();
+    auto ifOp = rewriter.create<loop::IfOp>(loc, cond, hasElseRegion);
+    rewriter.inlineRegionBefore(op.thenRegion(), &ifOp.thenRegion().back());
+    ifOp.thenRegion().back().erase();
+    if (hasElseRegion) {
+      rewriter.inlineRegionBefore(op.elseRegion(), &ifOp.elseRegion().back());
+      ifOp.elseRegion().back().erase();
+    }
+
+    // Ok, we're done!
+    rewriter.replaceOp(op, {});
+    return matchSuccess();
   }
-
-  // We will have ended up with an empty block as our continuation block (or, in
-  // the degenerate case where there were zero conditions, we have the original
-  // condition block).  Redirect that to the thenBlock.
-  condBlock = builder.getInsertionBlock();
-  if (condBlock->empty()) {
-    condBlock->replaceAllUsesWith(thenBlock);
-    condBlock->eraseFromFunction();
-  } else {
-    builder.create<BranchOp>(loc, thenBlock);
-  }
-
-  // Ok, we're done!
-  ifInst->erase();
-  return false;
-}
+};
 
 // Convert an "affine.apply" operation into a sequence of arithmetic
-// operations using the StandardOps dialect.  Return true on error.
-bool LowerAffinePass::lowerAffineApply(AffineApplyOp op) {
-  FuncBuilder builder(op.getOperation());
-  auto maybeExpandedMap =
-      expandAffineMap(&builder, op.getLoc(), op.getAffineMap(),
-                      llvm::to_vector<8>(op.getOperands()));
-  if (!maybeExpandedMap)
-    return true;
+// operations using the StandardOps dialect.
+class AffineApplyLowering : public OpRewritePattern<AffineApplyOp> {
+public:
+  using OpRewritePattern<AffineApplyOp>::OpRewritePattern;
 
-  Value *original = op.getResult();
-  Value *expanded = (*maybeExpandedMap)[0];
-  if (!expanded)
-    return true;
-  original->replaceAllUsesWith(expanded);
-  op.erase();
-  return false;
-}
-
-// Entry point of the function convertor.
-//
-// Conversion is performed by recursively visiting operations of a Function.
-// It reasons in terms of single-entry single-exit (SESE) regions that are not
-// materialized in the code.  Instead, the pointer to the last block of the
-// region is maintained throughout the conversion as the insertion point of the
-// IR builder since we never change the first block after its creation.  "Block"
-// operations such as loops and branches create new SESE regions for their
-// bodies, and surround them with additional basic blocks for the control flow.
-// Individual operations are simply appended to the end of the last basic block
-// of the current region.  The SESE invariant allows us to easily handle nested
-// structures of arbitrary complexity.
-//
-// During the conversion, we maintain a mapping between the Values present in
-// the original function and their Value images in the function under
-// construction.  When an Value is used, it gets replaced with the
-// corresponding Value that has been defined previously.  The value flow
-// starts with function arguments converted to basic block arguments.
-void LowerAffinePass::runOnFunction() {
-  SmallVector<Operation *, 8> instsToRewrite;
-
-  // Collect all the For operations as well as AffineIfOps and AffineApplyOps.
-  // We do this as a prepass to avoid invalidating the walker with our rewrite.
-  getFunction().walk([&](Operation *op) {
-    if (op->isa<AffineApplyOp>() || op->isa<AffineForOp>() ||
-        op->isa<AffineIfOp>())
-      instsToRewrite.push_back(op);
-  });
-
-  // Rewrite all of the ifs and fors.  We walked the operations in postorders,
-  // so we know that we will rewrite them in the reverse order.
-  for (auto *op : llvm::reverse(instsToRewrite)) {
-    if (auto ifOp = op->dyn_cast<AffineIfOp>()) {
-      if (lowerAffineIf(ifOp))
-        return signalPassFailure();
-    } else if (auto forOp = op->dyn_cast<AffineForOp>()) {
-      if (lowerAffineFor(forOp))
-        return signalPassFailure();
-    } else if (lowerAffineApply(op->cast<AffineApplyOp>())) {
-      return signalPassFailure();
-    }
+  PatternMatchResult matchAndRewrite(AffineApplyOp op,
+                                     PatternRewriter &rewriter) const override {
+    auto maybeExpandedMap =
+        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(),
+                        llvm::to_vector<8>(op.getOperands()));
+    if (!maybeExpandedMap)
+      return matchFailure();
+    rewriter.replaceOp(op, *maybeExpandedMap);
+    return matchSuccess();
   }
+};
+
+// Apply the affine map from an 'affine.load' operation to its operands, and
+// feed the results to a newly created 'std.load' operation (which replaces the
+// original 'affine.load').
+class AffineLoadLowering : public OpRewritePattern<AffineLoadOp> {
+public:
+  using OpRewritePattern<AffineLoadOp>::OpRewritePattern;
+
+  PatternMatchResult matchAndRewrite(AffineLoadOp op,
+                                     PatternRewriter &rewriter) const override {
+    // Expand affine map from 'affineLoadOp'.
+    SmallVector<Value *, 8> indices(op.getMapOperands());
+    auto maybeExpandedMap =
+        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(), indices);
+    if (!maybeExpandedMap)
+      return matchFailure();
+
+    // Build std.load memref[expandedMap.results].
+    rewriter.replaceOpWithNewOp<LoadOp>(op, op.getMemRef(), *maybeExpandedMap);
+    return matchSuccess();
+  }
+};
+
+// Apply the affine map from an 'affine.store' operation to its operands, and
+// feed the results to a newly created 'std.store' operation (which replaces the
+// original 'affine.store').
+class AffineStoreLowering : public OpRewritePattern<AffineStoreOp> {
+public:
+  using OpRewritePattern<AffineStoreOp>::OpRewritePattern;
+
+  PatternMatchResult matchAndRewrite(AffineStoreOp op,
+                                     PatternRewriter &rewriter) const override {
+    // Expand affine map from 'affineStoreOp'.
+    SmallVector<Value *, 8> indices(op.getMapOperands());
+    auto maybeExpandedMap =
+        expandAffineMap(rewriter, op.getLoc(), op.getAffineMap(), indices);
+    if (!maybeExpandedMap)
+      return matchFailure();
+
+    // Build std.store valutToStore, memref[expandedMap.results].
+    rewriter.replaceOpWithNewOp<StoreOp>(op, op.getValueToStore(),
+                                         op.getMemRef(), *maybeExpandedMap);
+    return matchSuccess();
+  }
+};
+
+// Apply the affine maps from an 'affine.dma_start' operation to each of their
+// respective map operands, and feed the results to a newly created
+// 'std.dma_start' operation (which replaces the original 'affine.dma_start').
+class AffineDmaStartLowering : public OpRewritePattern<AffineDmaStartOp> {
+public:
+  using OpRewritePattern<AffineDmaStartOp>::OpRewritePattern;
+
+  PatternMatchResult matchAndRewrite(AffineDmaStartOp op,
+                                     PatternRewriter &rewriter) const override {
+    SmallVector<Value *, 8> operands(op.getOperands());
+    auto operandsRef = llvm::makeArrayRef(operands);
+
+    // Expand affine map for DMA source memref.
+    auto maybeExpandedSrcMap = expandAffineMap(
+        rewriter, op.getLoc(), op.getSrcMap(),
+        operandsRef.drop_front(op.getSrcMemRefOperandIndex() + 1));
+    if (!maybeExpandedSrcMap)
+      return matchFailure();
+    // Expand affine map for DMA destination memref.
+    auto maybeExpandedDstMap = expandAffineMap(
+        rewriter, op.getLoc(), op.getDstMap(),
+        operandsRef.drop_front(op.getDstMemRefOperandIndex() + 1));
+    if (!maybeExpandedDstMap)
+      return matchFailure();
+    // Expand affine map for DMA tag memref.
+    auto maybeExpandedTagMap = expandAffineMap(
+        rewriter, op.getLoc(), op.getTagMap(),
+        operandsRef.drop_front(op.getTagMemRefOperandIndex() + 1));
+    if (!maybeExpandedTagMap)
+      return matchFailure();
+
+    // Build std.dma_start operation with affine map results.
+    rewriter.replaceOpWithNewOp<DmaStartOp>(
+        op, op.getSrcMemRef(), *maybeExpandedSrcMap, op.getDstMemRef(),
+        *maybeExpandedDstMap, op.getNumElements(), op.getTagMemRef(),
+        *maybeExpandedTagMap, op.getStride(), op.getNumElementsPerStride());
+    return matchSuccess();
+  }
+};
+
+// Apply the affine map from an 'affine.dma_wait' operation tag memref,
+// and feed the results to a newly created 'std.dma_wait' operation (which
+// replaces the original 'affine.dma_wait').
+class AffineDmaWaitLowering : public OpRewritePattern<AffineDmaWaitOp> {
+public:
+  using OpRewritePattern<AffineDmaWaitOp>::OpRewritePattern;
+
+  PatternMatchResult matchAndRewrite(AffineDmaWaitOp op,
+                                     PatternRewriter &rewriter) const override {
+    // Expand affine map for DMA tag memref.
+    SmallVector<Value *, 8> indices(op.getTagIndices());
+    auto maybeExpandedTagMap =
+        expandAffineMap(rewriter, op.getLoc(), op.getTagMap(), indices);
+    if (!maybeExpandedTagMap)
+      return matchFailure();
+
+    // Build std.dma_wait operation with affine map results.
+    rewriter.replaceOpWithNewOp<DmaWaitOp>(
+        op, op.getTagMemRef(), *maybeExpandedTagMap, op.getNumElements());
+    return matchSuccess();
+  }
+};
+
+} // end namespace
+
+void mlir::populateAffineToStdConversionPatterns(
+    OwningRewritePatternList &patterns, MLIRContext *ctx) {
+  patterns
+      .insert<AffineApplyLowering, AffineDmaStartLowering,
+              AffineDmaWaitLowering, AffineLoadLowering, AffineStoreLowering,
+              AffineForLowering, AffineIfLowering, AffineTerminatorLowering>(
+          ctx);
 }
+
+namespace {
+class LowerAffinePass : public FunctionPass<LowerAffinePass> {
+  void runOnFunction() override {
+    OwningRewritePatternList patterns;
+    populateAffineToStdConversionPatterns(patterns, &getContext());
+    ConversionTarget target(getContext());
+    target.addLegalDialect<loop::LoopOpsDialect, StandardOpsDialect>();
+    if (failed(applyPartialConversion(getFunction(), target, patterns)))
+      signalPassFailure();
+  }
+};
+} // namespace
 
 /// Lowers If and For operations within a function into their lower level CFG
 /// equivalent blocks.
-FunctionPassBase *mlir::createLowerAffinePass() {
-  return new LowerAffinePass();
+std::unique_ptr<OpPassBase<FuncOp>> mlir::createLowerAffinePass() {
+  return std::make_unique<LowerAffinePass>();
 }
 
 static PassRegistration<LowerAffinePass>

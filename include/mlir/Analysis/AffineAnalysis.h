@@ -71,8 +71,17 @@ struct MemRefAccess {
   bool isStore() const;
 
   /// Populates 'accessMap' with composition of AffineApplyOps reachable from
-  // 'indices'.
+  /// 'indices'.
   void getAccessMap(AffineValueMap *accessMap) const;
+
+  /// Equal if both affine accesses can be proved to be equivalent at compile
+  /// time (considering the memrefs, their respective affine access maps  and
+  /// operands). The equality of access functions + operands is checked by
+  /// subtracting fully composed value maps, and then simplifying the difference
+  /// using the expression flattener.
+  /// TODO: this does not account for aliasing of memrefs.
+  bool operator==(const MemRefAccess &rhs) const;
+  bool operator!=(const MemRefAccess &rhs) const { return !(*this == rhs); }
 };
 
 // DependenceComponent contains state about the direction of a dependence as an
@@ -94,18 +103,33 @@ struct DependenceComponent {
 /// Checks whether two accesses to the same memref access the same element.
 /// Each access is specified using the MemRefAccess structure, which contains
 /// the operation, indices and memref associated with the access. Returns
-/// 'false' if it can be determined conclusively that the accesses do not
+/// 'NoDependence' if it can be determined conclusively that the accesses do not
 /// access the same memref element. If 'allowRAR' is true, will consider
 /// read-after-read dependences (typically used by applications trying to
 /// optimize input reuse).
 // TODO(andydavis) Wrap 'dependenceConstraints' and 'dependenceComponents' into
 // a single struct.
 // TODO(andydavis) Make 'dependenceConstraints' optional arg.
-bool checkMemrefAccessDependence(
+struct DependenceResult {
+  enum ResultEnum {
+    HasDependence, // A dependence exists between 'srcAccess' and 'dstAccess'.
+    NoDependence,  // No dependence exists between 'srcAccess' and 'dstAccess'.
+    Failure,       // Dependence check failed due to unsupported cases.
+  } value;
+  DependenceResult(ResultEnum v) : value(v) {}
+};
+
+DependenceResult checkMemrefAccessDependence(
     const MemRefAccess &srcAccess, const MemRefAccess &dstAccess,
     unsigned loopDepth, FlatAffineConstraints *dependenceConstraints,
     llvm::SmallVector<DependenceComponent, 2> *dependenceComponents,
     bool allowRAR = false);
+
+/// Utility function that returns true if the provided DependenceResult
+/// corresponds to a dependence result.
+inline bool hasDependence(DependenceResult result) {
+  return result.value == DependenceResult::HasDependence;
+}
 
 /// Returns in 'depCompsVec', dependence components for dependences between all
 /// load and store ops in loop nest rooted at 'forOp', at loop depths in range

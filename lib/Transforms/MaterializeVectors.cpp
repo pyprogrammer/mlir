@@ -1,4 +1,4 @@
-//===- MaterializeVectors.cpp - MaterializeVectors Pass Impl ----*- C++ -*-===//
+//===- MaterializeVectors.cpp - MaterializeVectors Pass Impl --------------===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -20,7 +20,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/AffineAnalysis.h"
 #include "mlir/Analysis/Dominance.h"
 #include "mlir/Analysis/LoopAnalysis.h"
@@ -28,6 +27,9 @@
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Analysis/Utils.h"
 #include "mlir/Analysis/VectorAnalysis.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
+#include "mlir/Dialect/VectorOps/VectorOps.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Attributes.h"
@@ -36,11 +38,9 @@
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/StandardOps/Ops.h"
 #include "mlir/Support/Functional.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/Passes.h"
-#include "mlir/VectorOps/VectorOps.h"
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -99,7 +99,7 @@
 /// ```mlir
 ///    mlfunc @materialize(%M : index, %N : index, %O : index, %P : index) {
 ///      %A = alloc (%M, %N, %O, %P) : memref<?x?x?x?xf32>
-///      %f1 = constant splat<vector<4x4x4xf32>, 1.000000e+00> :
+///      %f1 = constant dense<vector<4x4x4xf32>, 1.000000e+00> :
 ///      vector<4x4x4xf32> affine.for %i0 = 0 to %M step 4 {
 ///        affine.for %i1 = 0 to %N step 4 {
 ///          affine.for %i2 = 0 to %O {
@@ -117,7 +117,7 @@
 /// ```mlir
 ///    mlfunc @materialize(%M : index, %N : index, %O : index, %P : index) {
 ///      %A = alloc (%M, %N, %O, %P) : memref<?x?x?x?xf32, 0>
-///      %f1 = constant splat<vector<4x4xf32>, 1.000000e+00> : vector<4x4x4xf32>
+///      %f1 = constant dense<vector<4x4xf32>, 1.000000e+00> : vector<4x4x4xf32>
 ///       affine.for %i0 = 0 to %arg0 step 4 {
 ///         affine.for %i1 = 0 to %arg1 step 4 {
 ///           affine.for %i2 = 0 to %arg2 {
@@ -143,10 +143,11 @@
 /// ```
 
 using llvm::dbgs;
-using llvm::DenseSet;
 using llvm::SetVector;
 
 using namespace mlir;
+using vector::VectorTransferReadOp;
+using vector::VectorTransferWriteOp;
 
 using functional::makePtrDynCaster;
 using functional::map;
@@ -238,7 +239,7 @@ static SmallVector<unsigned, 8> delinearize(unsigned linearIndex,
   return res;
 }
 
-static Operation *instantiate(FuncBuilder *b, Operation *opInst,
+static Operation *instantiate(OpBuilder b, Operation *opInst,
                               VectorType hwVectorType,
                               DenseMap<Value *, Value *> *substitutionsMap);
 
@@ -256,14 +257,14 @@ static Value *substitute(Value *v, VectorType hwVectorType,
   auto it = substitutionsMap->find(v);
   if (it == substitutionsMap->end()) {
     auto *opInst = v->getDefiningOp();
-    if (opInst->isa<ConstantOp>()) {
-      FuncBuilder b(opInst);
-      auto *op = instantiate(&b, opInst, hwVectorType, substitutionsMap);
+    if (isa<ConstantOp>(opInst)) {
+      OpBuilder b(opInst);
+      auto *op = instantiate(b, opInst, hwVectorType, substitutionsMap);
       auto res = substitutionsMap->insert(std::make_pair(v, op->getResult(0)));
       assert(res.second && "Insertion failed");
       return res.first->second;
     }
-    v->getDefiningOp()->emitError("Missing substitution");
+    v->getDefiningOp()->emitError("missing substitution");
     return nullptr;
   }
   return it->second;
@@ -331,7 +332,7 @@ static Value *substitute(Value *v, VectorType hwVectorType,
 /// TODO(ntv): these implementation details should be captured in a
 /// vectorization trait at the op level directly.
 static SmallVector<mlir::Value *, 8>
-reindexAffineIndices(FuncBuilder *b, VectorType hwVectorType,
+reindexAffineIndices(OpBuilder b, VectorType hwVectorType,
                      ArrayRef<unsigned> hwVectorInstance,
                      ArrayRef<Value *> memrefIndices) {
   auto vectorShape = hwVectorType.getShape();
@@ -347,14 +348,14 @@ reindexAffineIndices(FuncBuilder *b, VectorType hwVectorType,
   // The first numMemRefIndices correspond to AffineForOp that have not been
   // vectorized, the transformation is the identity on those.
   for (i = 0; i < numMemRefIndices; ++i) {
-    auto d_i = b->getAffineDimExpr(i);
+    auto d_i = b.getAffineDimExpr(i);
     affineExprs.push_back(d_i);
   }
   // The next numVectorIndices correspond to super-vector dimensions that
   // do not have a hardware vector dimension counterpart. For those we only
   // need to increment the index by the corresponding hwVectorInstance.
   for (i = numMemRefIndices; i < numMemRefIndices + numVectorIndices; ++i) {
-    auto d_i = b->getAffineDimExpr(i);
+    auto d_i = b.getAffineDimExpr(i);
     auto offset = hwVectorInstance[i - numMemRefIndices];
     affineExprs.push_back(d_i + offset);
   }
@@ -363,7 +364,7 @@ reindexAffineIndices(FuncBuilder *b, VectorType hwVectorType,
   // index by "hwVectorInstance" multiples of the corresponding hardware
   // vector size.
   for (; i < numIndices; ++i) {
-    auto d_i = b->getAffineDimExpr(i);
+    auto d_i = b.getAffineDimExpr(i);
     auto offset = hwVectorInstance[i - numMemRefIndices];
     auto stride = vectorShape[i - numMemRefIndices - numVectorIndices];
     affineExprs.push_back(d_i + offset * stride);
@@ -373,8 +374,8 @@ reindexAffineIndices(FuncBuilder *b, VectorType hwVectorType,
   SmallVector<mlir::Value *, 8> res;
   res.reserve(affineExprs.size());
   for (auto expr : affineExprs) {
-    auto map = AffineMap::get(numIndices, 0, expr, {});
-    res.push_back(makeComposedAffineApply(b, b->getInsertionPoint()->getLoc(),
+    auto map = AffineMap::get(numIndices, 0, expr);
+    res.push_back(makeComposedAffineApply(b, b.getInsertionPoint()->getLoc(),
                                           map, memrefIndices));
   }
   return res;
@@ -388,7 +389,7 @@ materializeAttributes(Operation *opInst, VectorType hwVectorType) {
   SmallVector<NamedAttribute, 1> res;
   for (auto a : opInst->getAttrs()) {
     if (auto splat = a.second.dyn_cast<SplatElementsAttr>()) {
-      auto attr = SplatElementsAttr::get(hwVectorType, splat.getValue());
+      auto attr = SplatElementsAttr::get(hwVectorType, splat.getSplatValue());
       res.push_back(NamedAttribute(a.first, attr));
     } else {
       res.push_back(a);
@@ -404,12 +405,12 @@ materializeAttributes(Operation *opInst, VectorType hwVectorType) {
 /// substitutionsMap.
 ///
 /// If the underlying substitution fails, this fails too and returns nullptr.
-static Operation *instantiate(FuncBuilder *b, Operation *opInst,
+static Operation *instantiate(OpBuilder b, Operation *opInst,
                               VectorType hwVectorType,
                               DenseMap<Value *, Value *> *substitutionsMap) {
-  assert(!opInst->isa<VectorTransferReadOp>() &&
+  assert(!isa<VectorTransferReadOp>(opInst) &&
          "Should call the function specialized for VectorTransferReadOp");
-  assert(!opInst->isa<VectorTransferWriteOp>() &&
+  assert(!isa<VectorTransferWriteOp>(opInst) &&
          "Should call the function specialized for VectorTransferWriteOp");
   if (opInst->getNumRegions() != 0)
     return nullptr;
@@ -428,10 +429,9 @@ static Operation *instantiate(FuncBuilder *b, Operation *opInst,
 
   auto attrs = materializeAttributes(opInst, hwVectorType);
 
-  OperationState state(b->getContext(), opInst->getLoc(),
-                       opInst->getName().getStringRef(), operands,
-                       {hwVectorType}, attrs);
-  return b->createOperation(state);
+  OperationState state(opInst->getLoc(), opInst->getName().getStringRef(),
+                       operands, {hwVectorType}, attrs);
+  return b.createOperation(state);
 }
 
 /// Computes the permutationMap required for a VectorTransferOp from the memref
@@ -470,7 +470,7 @@ static AffineMap projectedPermutationMap(VectorTransferOpTy transfer,
   if (keep.empty()) {
     return permutationMap;
   }
-  auto projectionMap = AffineMap::get(optionalRatio->size(), 0, keep, {});
+  auto projectionMap = AffineMap::get(optionalRatio->size(), 0, keep);
   LLVM_DEBUG(projectionMap.print(dbgs() << "\nprojectionMap: "));
   return simplifyAffineMap(projectionMap.compose(permutationMap));
 }
@@ -481,7 +481,7 @@ static AffineMap projectedPermutationMap(VectorTransferOpTy transfer,
 /// `hwVectorType` int the covering of the super-vector type. For a more
 /// detailed description of the problem, see the description of
 /// reindexAffineIndices.
-static Operation *instantiate(FuncBuilder *b, VectorTransferReadOp read,
+static Operation *instantiate(OpBuilder b, VectorTransferReadOp read,
                               VectorType hwVectorType,
                               ArrayRef<unsigned> hwVectorInstance,
                               DenseMap<Value *, Value *> *substitutionsMap) {
@@ -493,9 +493,9 @@ static Operation *instantiate(FuncBuilder *b, VectorTransferReadOp read,
   if (!map) {
     return nullptr;
   }
-  auto cloned = b->create<VectorTransferReadOp>(read.getLoc(), hwVectorType,
-                                                read.getMemRef(), affineIndices,
-                                                map, read.getPaddingValue());
+  auto cloned = b.create<VectorTransferReadOp>(read.getLoc(), hwVectorType,
+                                               read.getMemRef(), affineIndices,
+                                               map, read.getPaddingValue());
   return cloned.getOperation();
 }
 
@@ -505,7 +505,7 @@ static Operation *instantiate(FuncBuilder *b, VectorTransferReadOp read,
 /// `hwVectorType` int the covering of th3e super-vector type. For a more
 /// detailed description of the problem, see the description of
 /// reindexAffineIndices.
-static Operation *instantiate(FuncBuilder *b, VectorTransferWriteOp write,
+static Operation *instantiate(OpBuilder b, VectorTransferWriteOp write,
                               VectorType hwVectorType,
                               ArrayRef<unsigned> hwVectorInstance,
                               DenseMap<Value *, Value *> *substitutionsMap) {
@@ -513,7 +513,7 @@ static Operation *instantiate(FuncBuilder *b, VectorTransferWriteOp write,
       map(makePtrDynCaster<Value>(), write.getIndices());
   auto affineIndices =
       reindexAffineIndices(b, hwVectorType, hwVectorInstance, indices);
-  auto cloned = b->create<VectorTransferWriteOp>(
+  auto cloned = b.create<VectorTransferWriteOp>(
       write.getLoc(),
       substitute(write.getVector(), hwVectorType, substitutionsMap),
       write.getMemRef(), affineIndices,
@@ -547,22 +547,22 @@ static bool instantiateMaterialization(Operation *op,
   LLVM_DEBUG(dbgs() << "\ninstantiate: " << *op);
 
   // Create a builder here for unroll-and-jam effects.
-  FuncBuilder b(op);
+  OpBuilder b(op);
   // AffineApplyOp are ignored: instantiating the proper vector op will take
   // care of AffineApplyOps by composing them properly.
-  if (op->isa<AffineApplyOp>()) {
+  if (isa<AffineApplyOp>(op)) {
     return false;
   }
   if (op->getNumRegions() != 0)
     return op->emitError("NYI path Op with region"), true;
 
-  if (auto write = op->dyn_cast<VectorTransferWriteOp>()) {
-    auto *clone = instantiate(&b, write, state->hwVectorType,
+  if (auto write = dyn_cast<VectorTransferWriteOp>(op)) {
+    auto *clone = instantiate(b, write, state->hwVectorType,
                               state->hwVectorInstance, state->substitutionsMap);
     return clone == nullptr;
   }
-  if (auto read = op->dyn_cast<VectorTransferReadOp>()) {
-    auto *clone = instantiate(&b, read, state->hwVectorType,
+  if (auto read = dyn_cast<VectorTransferReadOp>(op)) {
+    auto *clone = instantiate(b, read, state->hwVectorType,
                               state->hwVectorInstance, state->substitutionsMap);
     if (!clone) {
       return true;
@@ -578,10 +578,10 @@ static bool instantiateMaterialization(Operation *op,
     return op->emitError("NYI: ops with != 1 results"), true;
   }
   if (op->getResult(0)->getType() != state->superVectorType) {
-    return op->emitError("Op does not return a supervector."), true;
+    return op->emitError("op does not return a supervector."), true;
   }
   auto *clone =
-      instantiate(&b, op, state->hwVectorType, state->substitutionsMap);
+      instantiate(b, op, state->hwVectorType, state->substitutionsMap);
   if (!clone) {
     return true;
   }
@@ -630,14 +630,14 @@ static bool emitSlice(MaterializationState *state,
     for (auto *op : *slice) {
       auto fail = instantiateMaterialization(op, &scopedState);
       if (fail) {
-        op->emitError("Unhandled super-vector materialization failure");
+        op->emitError("unhandled super-vector materialization failure");
         return true;
       }
     }
   }
 
-  LLVM_DEBUG(dbgs() << "\nMLFunction is now\n");
-  LLVM_DEBUG((*slice)[0]->getFunction()->print(dbgs()));
+  LLVM_DEBUG(dbgs() << "\nFunction is now\n");
+  LLVM_DEBUG((*slice)[0]->getParentOfType<FuncOp>().print(dbgs()));
 
   // slice are topologically sorted, we can just erase them in reverse
   // order. Reverse iterator does not just work simply with an operator*
@@ -668,7 +668,7 @@ static bool emitSlice(MaterializationState *state,
 /// because we currently disallow vectorization of defs that come from another
 /// scope.
 /// TODO(ntv): please document return value.
-static bool materialize(Function *f, const SetVector<Operation *> &terminators,
+static bool materialize(FuncOp f, const SetVector<Operation *> &terminators,
                         MaterializationState *state) {
   DenseSet<Operation *> seen;
   DominanceInfo domInfo(f);
@@ -679,7 +679,7 @@ static bool materialize(Function *f, const SetVector<Operation *> &terminators,
       continue;
     }
 
-    auto terminator = term->cast<VectorTransferWriteOp>();
+    auto terminator = cast<VectorTransferWriteOp>(term);
     LLVM_DEBUG(dbgs() << "\nFrom terminator:" << *term);
 
     // Get the transitive use-defs starting from terminator, limited to the
@@ -722,7 +722,7 @@ static bool materialize(Function *f, const SetVector<Operation *> &terminators,
       return true;
     }
     LLVM_DEBUG(dbgs() << "\nMLFunction is now\n");
-    LLVM_DEBUG(f->print(dbgs()));
+    LLVM_DEBUG(f.print(dbgs()));
   }
   return false;
 }
@@ -732,13 +732,13 @@ void MaterializeVectorsPass::runOnFunction() {
   NestedPatternContext mlContext;
 
   // TODO(ntv): Check to see if this supports arbitrary top-level code.
-  Function *f = &getFunction();
-  if (f->getBlocks().size() != 1)
+  FuncOp f = getFunction();
+  if (f.getBlocks().size() != 1)
     return;
 
   using matcher::Op;
   LLVM_DEBUG(dbgs() << "\nMaterializeVectors on Function\n");
-  LLVM_DEBUG(f->print(dbgs()));
+  LLVM_DEBUG(f.print(dbgs()));
 
   MaterializationState state(hwVectorSize);
   // Get the hardware vector type.
@@ -749,7 +749,7 @@ void MaterializeVectorsPass::runOnFunction() {
   // Capture terminators; i.e. vector.transfer_write ops involving a strict
   // super-vector of subVectorType.
   auto filter = [subVectorType](Operation &op) {
-    if (!op.isa<VectorTransferWriteOp>()) {
+    if (!isa<VectorTransferWriteOp>(op)) {
       return false;
     }
     return matcher::operatesOnSuperVectorsOf(op, subVectorType);
@@ -766,13 +766,14 @@ void MaterializeVectorsPass::runOnFunction() {
     signalPassFailure();
 }
 
-FunctionPassBase *
+std::unique_ptr<OpPassBase<FuncOp>>
 mlir::createMaterializeVectorsPass(llvm::ArrayRef<int64_t> vectorSize) {
-  return new MaterializeVectorsPass(vectorSize);
+  return std::make_unique<MaterializeVectorsPass>(vectorSize);
 }
 
 static PassRegistration<MaterializeVectorsPass>
-    pass("materialize-vectors", "Materializes super-vectors to vectors of the "
-                                "proper size for the hardware");
+    pass("affine-materialize-vectors",
+         "Materializes super-vectors to vectors of the "
+         "proper size for the hardware");
 
 #undef DEBUG_TYPE

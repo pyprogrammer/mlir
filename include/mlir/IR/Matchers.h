@@ -24,10 +24,8 @@
 #ifndef MLIR_MATCHERS_H
 #define MLIR_MATCHERS_H
 
-#include "mlir/IR/Attributes.h"
-#include "mlir/IR/Operation.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/StandardTypes.h"
-#include "mlir/IR/Value.h"
 #include <type_traits>
 
 namespace mlir {
@@ -62,12 +60,12 @@ struct attr_value_binder {
 
 /// The matcher that matches a constant foldable operation that has no side
 /// effect, no operands and produces a single result.
-struct constant_op_binder {
-  Attribute *bind_value;
+template <typename AttrT> struct constant_op_binder {
+  AttrT *bind_value;
 
   /// Creates a matcher instance that binds the constant attribute value to
   /// bind_value if match succeeds.
-  constant_op_binder(Attribute *bind_value) : bind_value(bind_value) {}
+  constant_op_binder(AttrT *bind_value) : bind_value(bind_value) {}
 
   bool match(Operation *op) {
     if (op->getNumOperands() > 0 || op->getNumResults() != 1)
@@ -75,10 +73,12 @@ struct constant_op_binder {
     if (!op->hasNoSideEffect())
       return false;
 
-    SmallVector<Attribute, 1> foldedAttr;
-    if (succeeded(op->constantFold(/*operands=*/llvm::None, foldedAttr))) {
-      *bind_value = foldedAttr.front();
-      return true;
+    SmallVector<OpFoldResult, 1> foldedOp;
+    if (succeeded(op->fold(/*operands=*/llvm::None, foldedOp))) {
+      if (auto attr = foldedOp.front().dyn_cast<Attribute>()) {
+        if ((*bind_value = attr.dyn_cast<AttrT>()))
+          return true;
+      }
     }
     return false;
   }
@@ -94,17 +94,17 @@ struct constant_int_op_binder {
 
   bool match(Operation *op) {
     Attribute attr;
-    if (!constant_op_binder(&attr).match(op))
+    if (!constant_op_binder<Attribute>(&attr).match(op))
       return false;
     auto type = op->getResult(0)->getType();
 
     if (type.isa<IntegerType>()) {
       return attr_value_binder<IntegerAttr>(bind_value).match(attr);
     }
-    if (type.isa<VectorOrTensorType>()) {
+    if (type.isa<VectorType>() || type.isa<RankedTensorType>()) {
       if (auto splatAttr = attr.dyn_cast<SplatElementsAttr>()) {
         return attr_value_binder<IntegerAttr>(bind_value)
-            .match(splatAttr.getValue());
+            .match(splatAttr.getSplatValue());
       }
     }
     return false;
@@ -123,7 +123,7 @@ template <int64_t TargetValue> struct constant_int_value_matcher {
 
 /// The matcher that matches a certain kind of op.
 template <typename OpClass> struct op_matcher {
-  bool match(Operation *op) { return op->isa<OpClass>(); }
+  bool match(Operation *op) { return isa<OpClass>(op); }
 };
 
 } // end namespace detail
@@ -152,8 +152,9 @@ m_ConstantInt(IntegerAttr::ValueType *bind_value) {
 
 /// Matches a value from a constant foldable operation and writes the value to
 /// bind_value.
-inline detail::constant_op_binder m_Constant(Attribute *bind_value) {
-  return detail::constant_op_binder(bind_value);
+template <typename AttrT>
+inline detail::constant_op_binder<AttrT> m_Constant(AttrT *bind_value) {
+  return detail::constant_op_binder<AttrT>(bind_value);
 }
 
 /// Matches a constant scalar / vector splat / tensor splat integer one.

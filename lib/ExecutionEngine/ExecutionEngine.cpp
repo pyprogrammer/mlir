@@ -22,12 +22,12 @@
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/IR/Function.h"
 #include "mlir/IR/Module.h"
-#include "mlir/LLVMIR/Transforms.h"
-#include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassManager.h"
+#include "mlir/Support/FileUtilities.h"
 #include "mlir/Target/LLVMIR.h"
-#include "mlir/Transforms/Passes.h"
 
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/ExecutionEngine/ObjectCache.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
@@ -36,168 +36,91 @@
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/TargetRegistry.h"
+#include "llvm/Support/ToolOutputFile.h"
+
+#define DEBUG_TYPE "execution-engine"
 
 using namespace mlir;
+using llvm::dbgs;
 using llvm::Error;
+using llvm::errs;
 using llvm::Expected;
-
-namespace {
-// Memory manager for the JIT's objectLayer.  Its main goal is to fallback to
-// resolving functions in the current process if they cannot be resolved in the
-// JIT-compiled modules.
-class MemoryManager : public llvm::SectionMemoryManager {
-public:
-  MemoryManager(llvm::orc::ExecutionSession &execSession)
-      : session(execSession) {}
-
-  // Resolve the named symbol.  First, try looking it up in the main library of
-  // the execution session.  If there is no such symbol, try looking it up in
-  // the current process (for example, if it is a standard library function).
-  // Return `nullptr` if lookup fails.
-  llvm::JITSymbol findSymbol(const std::string &name) override {
-    auto mainLibSymbol = session.lookup({&session.getMainJITDylib()}, name);
-    if (mainLibSymbol)
-      return mainLibSymbol.get();
-    auto address = llvm::RTDyldMemoryManager::getSymbolAddressInProcess(name);
-    if (!address) {
-      llvm::errs() << "Could not look up: " << name << '\n';
-      return nullptr;
-    }
-    return llvm::JITSymbol(address, llvm::JITSymbolFlags::Exported);
-  }
-
-private:
-  llvm::orc::ExecutionSession &session;
-};
-} // end anonymous namespace
-
-namespace mlir {
-namespace impl {
-// Simple layered Orc JIT compilation engine.
-class OrcJIT {
-public:
-  using IRTransformer = std::function<Error(llvm::Module *)>;
-
-  // Construct a JIT engine for the target host defined by `machineBuilder`,
-  // using the data layout provided as `dataLayout`.
-  // Setup the object layer to use our custom memory manager in order to resolve
-  // calls to library functions present in the process.
-  OrcJIT(llvm::orc::JITTargetMachineBuilder machineBuilder,
-         llvm::DataLayout layout, IRTransformer transform)
-      : irTransformer(transform),
-        objectLayer(
-            session,
-            [this]() { return llvm::make_unique<MemoryManager>(session); }),
-        compileLayer(
-            session, objectLayer,
-            llvm::orc::ConcurrentIRCompiler(std::move(machineBuilder))),
-        transformLayer(session, compileLayer, makeIRTransformFunction()),
-        dataLayout(layout), mangler(session, this->dataLayout),
-        threadSafeCtx(llvm::make_unique<llvm::LLVMContext>()) {
-    session.getMainJITDylib().setGenerator(
-        cantFail(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
-            layout.getGlobalPrefix())));
-  }
-
-  // Create a JIT engine for the current host.
-  static Expected<std::unique_ptr<OrcJIT>>
-  createDefault(IRTransformer transformer) {
-    auto machineBuilder = llvm::orc::JITTargetMachineBuilder::detectHost();
-    if (!machineBuilder)
-      return machineBuilder.takeError();
-
-    auto dataLayout = machineBuilder->getDefaultDataLayoutForTarget();
-    if (!dataLayout)
-      return dataLayout.takeError();
-
-    return llvm::make_unique<OrcJIT>(std::move(*machineBuilder),
-                                     std::move(*dataLayout), transformer);
-  }
-
-  // Add an LLVM module to the main library managed by the JIT engine.
-  Error addModule(std::unique_ptr<llvm::Module> M) {
-    return transformLayer.add(
-        session.getMainJITDylib(),
-        llvm::orc::ThreadSafeModule(std::move(M), threadSafeCtx));
-  }
-
-  // Lookup a symbol in the main library managed by the JIT engine.
-  Expected<llvm::JITEvaluatedSymbol> lookup(StringRef Name) {
-    return session.lookup({&session.getMainJITDylib()}, mangler(Name.str()));
-  }
-
-private:
-  // Wrap the `irTransformer` into a function that can be called by the
-  // IRTranformLayer.  If `irTransformer` is not set up, return the module as is
-  // without errors.
-  llvm::orc::IRTransformLayer::TransformFunction makeIRTransformFunction() {
-    return [this](llvm::orc::ThreadSafeModule module,
-                  const llvm::orc::MaterializationResponsibility &resp)
-               -> Expected<llvm::orc::ThreadSafeModule> {
-      (void)resp;
-      if (!irTransformer)
-        return std::move(module);
-      if (Error err = irTransformer(module.getModule()))
-        return std::move(err);
-      return std::move(module);
-    };
-  }
-
-  IRTransformer irTransformer;
-  llvm::orc::ExecutionSession session;
-  llvm::orc::RTDyldObjectLinkingLayer objectLayer;
-  llvm::orc::IRCompileLayer compileLayer;
-  llvm::orc::IRTransformLayer transformLayer;
-  llvm::DataLayout dataLayout;
-  llvm::orc::MangleAndInterner mangler;
-  llvm::orc::ThreadSafeContext threadSafeCtx;
-};
-} // end namespace impl
-} // namespace mlir
+using llvm::LLVMContext;
+using llvm::MemoryBuffer;
+using llvm::MemoryBufferRef;
+using llvm::Module;
+using llvm::SectionMemoryManager;
+using llvm::StringError;
+using llvm::Triple;
+using llvm::orc::DynamicLibrarySearchGenerator;
+using llvm::orc::ExecutionSession;
+using llvm::orc::IRCompileLayer;
+using llvm::orc::JITTargetMachineBuilder;
+using llvm::orc::RTDyldObjectLinkingLayer;
+using llvm::orc::ThreadSafeModule;
+using llvm::orc::TMOwningSimpleCompiler;
 
 // Wrap a string into an llvm::StringError.
 static inline Error make_string_error(const llvm::Twine &message) {
-  return llvm::make_error<llvm::StringError>(message.str(),
-                                             llvm::inconvertibleErrorCode());
+  return llvm::make_error<StringError>(message.str(),
+                                       llvm::inconvertibleErrorCode());
 }
 
-// Given a list of PassRegistryEntry coming from a higher level, populates the
-// given pass manager and appends the default set of required passes to lower to
-// LLVMIR.
-// Currently, these passes are:
-// - constant folding
-// - CSE
-// - canonicalization
-// - affine lowering
-static void getDefaultPasses(
-    PassManager &manager,
-    const std::vector<const mlir::PassRegistryEntry *> &mlirPassRegistryList) {
-  // Run each of the passes that were selected.
-  for (const auto *passEntry : mlirPassRegistryList)
-    passEntry->addToPipeline(manager);
+namespace mlir {
 
-  // Append the extra passes for lowering to MLIR.
-  manager.addPass(mlir::createCanonicalizerPass());
-  manager.addPass(mlir::createCSEPass());
-  manager.addPass(mlir::createCanonicalizerPass());
-  manager.addPass(mlir::createLowerAffinePass());
-  manager.addPass(mlir::createConvertToLLVMIRPass());
+void SimpleObjectCache::notifyObjectCompiled(const Module *M,
+                                             MemoryBufferRef ObjBuffer) {
+  cachedObjects[M->getModuleIdentifier()] = MemoryBuffer::getMemBufferCopy(
+      ObjBuffer.getBuffer(), ObjBuffer.getBufferIdentifier());
+}
+
+std::unique_ptr<MemoryBuffer> SimpleObjectCache::getObject(const Module *M) {
+  auto I = cachedObjects.find(M->getModuleIdentifier());
+  if (I == cachedObjects.end()) {
+    LLVM_DEBUG(dbgs() << "No object for " << M->getModuleIdentifier()
+                      << " in cache. Compiling.\n");
+    return nullptr;
+  }
+  LLVM_DEBUG(dbgs() << "Object for " << M->getModuleIdentifier()
+                    << " loaded from cache.\n");
+  return MemoryBuffer::getMemBuffer(I->second->getMemBufferRef());
+}
+
+void SimpleObjectCache::dumpToObjectFile(llvm::StringRef outputFilename) {
+  // Set up the output file.
+  std::string errorMessage;
+  auto file = openOutputFile(outputFilename, &errorMessage);
+  if (!file) {
+    llvm::errs() << errorMessage << "\n";
+    return;
+  }
+
+  // Dump the object generated for a single module to the output file.
+  assert(cachedObjects.size() == 1 && "Expected only one object entry.");
+  auto &cachedObject = cachedObjects.begin()->second;
+  file->os() << cachedObject->getBuffer();
+  file->keep();
+}
+
+void ExecutionEngine::dumpToObjectFile(llvm::StringRef filename) {
+  cache->dumpToObjectFile(filename);
 }
 
 // Setup LLVM target triple from the current machine.
-bool ExecutionEngine::setupTargetTriple(llvm::Module *llvmModule) {
+bool ExecutionEngine::setupTargetTriple(Module *llvmModule) {
   // Setup the machine properties from the current architecture.
   auto targetTriple = llvm::sys::getDefaultTargetTriple();
   std::string errorMessage;
   auto target = llvm::TargetRegistry::lookupTarget(targetTriple, errorMessage);
   if (!target) {
-    llvm::errs() << "NO target: " << errorMessage << "\n";
+    errs() << "NO target: " << errorMessage << "\n";
     return true;
   }
-  auto machine =
-      target->createTargetMachine(targetTriple, "generic", "", {}, {});
+  std::unique_ptr<llvm::TargetMachine> machine(
+      target->createTargetMachine(targetTriple, "generic", "", {}, {}));
   llvmModule->setDataLayout(machine->createDataLayout());
   llvmModule->setTargetTriple(targetTriple);
   return false;
@@ -210,7 +133,7 @@ static std::string makePackedFunctionName(StringRef name) {
 // For each function in the LLVM module, define an interface function that wraps
 // all the arguments of the original function and all its results into an i8**
 // pointer to provide a unified invocation interface.
-void packFunctionArguments(llvm::Module *module) {
+void packFunctionArguments(Module *module) {
   auto &ctx = module->getContext();
   llvm::IRBuilder<> builder(ctx);
   llvm::DenseSet<llvm::Function *> interfaceFunctions;
@@ -270,21 +193,17 @@ void packFunctionArguments(llvm::Module *module) {
   }
 }
 
-// Out of line for PIMPL unique_ptr.
-ExecutionEngine::~ExecutionEngine() = default;
+ExecutionEngine::ExecutionEngine(bool enableObjectCache)
+    : cache(enableObjectCache ? nullptr : new SimpleObjectCache()) {}
 
 Expected<std::unique_ptr<ExecutionEngine>> ExecutionEngine::create(
-    Module *m, PassManager *pm,
-    std::function<llvm::Error(llvm::Module *)> transformer) {
-  auto engine = llvm::make_unique<ExecutionEngine>();
-  auto expectedJIT = impl::OrcJIT::createDefault(transformer);
-  if (!expectedJIT)
-    return expectedJIT.takeError();
+    ModuleOp m, std::function<Error(llvm::Module *)> transformer,
+    Optional<llvm::CodeGenOpt::Level> jitCodeGenOptLevel,
+    ArrayRef<StringRef> sharedLibPaths, bool enableObjectCache) {
+  auto engine = std::make_unique<ExecutionEngine>(enableObjectCache);
 
-  if (pm && failed(pm->run(m)))
-    return make_string_error("passes failed");
-
-  auto llvmModule = translateModuleToLLVMIR(*m);
+  std::unique_ptr<llvm::LLVMContext> ctx(new llvm::LLVMContext);
+  auto llvmModule = translateModuleToLLVMIR(m);
   if (!llvmModule)
     return make_string_error("could not convert to LLVM IR");
   // FIXME: the triple should be passed to the translation or dialect conversion
@@ -293,19 +212,84 @@ Expected<std::unique_ptr<ExecutionEngine>> ExecutionEngine::create(
   setupTargetTriple(llvmModule.get());
   packFunctionArguments(llvmModule.get());
 
-  if (auto err = (*expectedJIT)->addModule(std::move(llvmModule)))
-    return std::move(err);
-  engine->jit = std::move(*expectedJIT);
+  // Clone module in a new LLVMContext since translateModuleToLLVMIR buries
+  // ownership too deeply.
+  // TODO(zinenko): Reevaluate model of ownership of LLVMContext in LLVMDialect.
+  SmallVector<char, 1> buffer;
+  {
+    llvm::raw_svector_ostream os(buffer);
+    WriteBitcodeToFile(*llvmModule, os);
+  }
+  llvm::MemoryBufferRef bufferRef(llvm::StringRef(buffer.data(), buffer.size()),
+                                  "cloned module buffer");
+  auto expectedModule = parseBitcodeFile(bufferRef, *ctx);
+  if (!expectedModule)
+    return expectedModule.takeError();
+  std::unique_ptr<Module> deserModule = std::move(*expectedModule);
+
+  // Callback to create the object layer with symbol resolution to current
+  // process and dynamically linked libraries.
+  auto objectLinkingLayerCreator = [&](ExecutionSession &session,
+                                       const Triple &TT) {
+    auto objectLayer = std::make_unique<RTDyldObjectLinkingLayer>(
+        session, []() { return std::make_unique<SectionMemoryManager>(); });
+    auto dataLayout = deserModule->getDataLayout();
+
+    // Resolve symbols that are statically linked in the current process.
+    session.getMainJITDylib().addGenerator(
+        cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            dataLayout.getGlobalPrefix())));
+
+    // Resolve symbols from shared libraries.
+    for (auto libPath : sharedLibPaths) {
+      auto mb = llvm::MemoryBuffer::getFile(libPath);
+      if (!mb) {
+        errs() << "Fail to create MemoryBuffer for: " << libPath << "\n";
+        continue;
+      }
+      auto &JD = session.createJITDylib(libPath);
+      auto loaded = DynamicLibrarySearchGenerator::Load(
+          libPath.data(), dataLayout.getGlobalPrefix());
+      if (!loaded) {
+        errs() << "Could not load: " << libPath << "\n";
+        continue;
+      }
+      JD.addGenerator(std::move(*loaded));
+      cantFail(objectLayer->add(JD, std::move(mb.get())));
+    }
+
+    return objectLayer;
+  };
+
+  // Callback to inspect the cache and recompile on demand. This follows Lang's
+  // LLJITWithObjectCache example.
+  auto compileFunctionCreator = [&](JITTargetMachineBuilder JTMB)
+      -> Expected<IRCompileLayer::CompileFunction> {
+    if (jitCodeGenOptLevel)
+      JTMB.setCodeGenOptLevel(jitCodeGenOptLevel.getValue());
+    auto TM = JTMB.createTargetMachine();
+    if (!TM)
+      return TM.takeError();
+    return IRCompileLayer::CompileFunction(
+        TMOwningSimpleCompiler(std::move(*TM), engine->cache.get()));
+  };
+
+  // Create the LLJIT by calling the LLJITBuilder with 2 callbacks.
+  auto jit =
+      cantFail(llvm::orc::LLJITBuilder()
+                   .setCompileFunctionCreator(compileFunctionCreator)
+                   .setObjectLinkingLayerCreator(objectLinkingLayerCreator)
+                   .create());
+
+  // Add a ThreadSafemodule to the engine and return.
+  ThreadSafeModule tsm(std::move(deserModule), std::move(ctx));
+  if (transformer)
+    cantFail(tsm.withModuleDo(
+        [&](llvm::Module &module) { return transformer(&module); }));
+  cantFail(jit->addIRModule(std::move(tsm)));
+  engine->jit = std::move(jit);
 
   return std::move(engine);
-}
-
-Expected<std::unique_ptr<ExecutionEngine>> ExecutionEngine::create(
-    Module *m, std::function<llvm::Error(llvm::Module *)> transformer) {
-  // Construct and run the default MLIR pipeline.
-  PassManager manager;
-  getDefaultPasses(manager, {});
-  return create(m, &manager, transformer);
 }
 
 Expected<void (*)(void **)> ExecutionEngine::lookup(StringRef name) const {
@@ -319,8 +303,7 @@ Expected<void (*)(void **)> ExecutionEngine::lookup(StringRef name) const {
   return fptr;
 }
 
-llvm::Error ExecutionEngine::invoke(StringRef name,
-                                    MutableArrayRef<void *> args) {
+Error ExecutionEngine::invoke(StringRef name, MutableArrayRef<void *> args) {
   auto expectedFPtr = lookup(name);
   if (!expectedFPtr)
     return expectedFPtr.takeError();
@@ -328,5 +311,6 @@ llvm::Error ExecutionEngine::invoke(StringRef name,
 
   (*fptr)(args.data());
 
-  return llvm::Error::success();
+  return Error::success();
 }
+} // end namespace mlir

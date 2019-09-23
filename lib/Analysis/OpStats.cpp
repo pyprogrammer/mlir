@@ -45,15 +45,15 @@ void PrintOpStatsPass::runOnModule() {
   opCount.clear();
 
   // Compute the operation statistics for each function in the module.
-  for (auto &fn : getModule())
-    fn.walk([&](Operation *op) { ++opCount[op->getName().getStringRef()]; });
+  for (auto &op : getModule())
+    op.walk([&](Operation *op) { ++opCount[op->getName().getStringRef()]; });
   printSummary();
 }
 
 void PrintOpStatsPass::printSummary() {
   os << "Operations encountered:\n";
   os << "-----------------------\n";
-  std::vector<StringRef> sorted(opCount.keys().begin(), opCount.keys().end());
+  SmallVector<StringRef, 64> sorted(opCount.keys());
   llvm::sort(sorted);
 
   // Split an operation name from its dialect prefix.

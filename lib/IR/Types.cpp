@@ -17,23 +17,30 @@
 
 #include "mlir/IR/Types.h"
 #include "TypeDetail.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Dialect.h"
 #include "llvm/ADT/Twine.h"
 
 using namespace mlir;
 using namespace mlir::detail;
 
-unsigned Type::getKind() const { return type->getKind(); }
+//===----------------------------------------------------------------------===//
+// Type
+//===----------------------------------------------------------------------===//
+
+unsigned Type::getKind() const { return impl->getKind(); }
 
 /// Get the dialect this type is registered to.
-const Dialect &Type::getDialect() const { return type->getDialect(); }
+Dialect &Type::getDialect() const { return impl->getDialect(); }
 
 MLIRContext *Type::getContext() const { return getDialect().getContext(); }
 
-unsigned Type::getSubclassData() const { return type->getSubclassData(); }
-void Type::setSubclassData(unsigned val) { type->setSubclassData(val); }
+unsigned Type::getSubclassData() const { return impl->getSubclassData(); }
+void Type::setSubclassData(unsigned val) { impl->setSubclassData(val); }
 
-/// Function Type.
+//===----------------------------------------------------------------------===//
+// FunctionType
+//===----------------------------------------------------------------------===//
 
 FunctionType FunctionType::get(ArrayRef<Type> inputs, ArrayRef<Type> results,
                                MLIRContext *context) {
@@ -50,7 +57,9 @@ ArrayRef<Type> FunctionType::getResults() const {
   return getImpl()->getResults();
 }
 
-/// OpaqueType
+//===----------------------------------------------------------------------===//
+// OpaqueType
+//===----------------------------------------------------------------------===//
 
 OpaqueType OpaqueType::get(Identifier dialect, StringRef typeData,
                            MLIRContext *context) {
@@ -76,8 +85,7 @@ LogicalResult OpaqueType::verifyConstructionInvariants(
     StringRef typeData) {
   if (!Dialect::isValidNamespace(dialect.strref())) {
     if (loc)
-      context->emitError(*loc, "invalid dialect namespace '" +
-                                   dialect.strref() + "'");
+      emitError(*loc) << "invalid dialect namespace '" << dialect << "'";
     return failure();
   }
   return success();

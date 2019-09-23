@@ -22,7 +22,7 @@
 #ifndef MLIR_IR_OPIMPLEMENTATION_H
 #define MLIR_IR_OPIMPLEMENTATION_H
 
-#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/DialectInterface.h"
 #include "mlir/IR/OpDefinition.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/SMLoc.h"
@@ -30,10 +30,7 @@
 
 namespace mlir {
 
-class AffineExpr;
-class AffineMap;
 class Builder;
-class Function;
 
 //===----------------------------------------------------------------------===//
 // OpAsmPrinter
@@ -68,11 +65,7 @@ public:
     }
   }
   virtual void printType(Type type) = 0;
-  virtual void printFunctionReference(Function *func) = 0;
   virtual void printAttribute(Attribute attr) = 0;
-  virtual void printAttributeAndType(Attribute attr) = 0;
-  virtual void printAffineMap(AffineMap map) = 0;
-  virtual void printAffineExpr(AffineExpr expr) = 0;
 
   /// Print a successor, and use list, of a terminator operation given the
   /// terminator and the successor index.
@@ -91,6 +84,54 @@ public:
   /// Prints a region.
   virtual void printRegion(Region &blocks, bool printEntryBlockArgs = true,
                            bool printBlockTerminators = true) = 0;
+
+  /// Renumber the arguments for the specified region to the same names as the
+  /// SSA values in namesToUse.  This may only be used for IsolatedFromAbove
+  /// operations.  If any entry in namesToUse is null, the corresponding
+  /// argument name is left alone.
+  virtual void shadowRegionArgs(Region &region,
+                                ArrayRef<Value *> namesToUse) = 0;
+
+  /// Prints an affine map of SSA ids, where SSA id names are used in place
+  /// of dims/symbols.
+  /// Operand values must come from single-result sources, and be valid
+  /// dimensions/symbol identifiers according to mlir::isValidDim/Symbol.
+  virtual void printAffineMapOfSSAIds(AffineMapAttr mapAttr,
+                                      ArrayRef<Value *> operands) = 0;
+
+  /// Print an optional arrow followed by a type list.
+  void printOptionalArrowTypeList(ArrayRef<Type> types) {
+    if (types.empty())
+      return;
+    auto &os = getStream() << " -> ";
+    bool wrapped = types.size() != 1 || types[0].isa<FunctionType>();
+    if (wrapped)
+      os << '(';
+    interleaveComma(types, *this);
+    if (wrapped)
+      os << ')';
+  }
+
+  /// Print the complete type of an operation in functional form.
+  void printFunctionalType(Operation *op) {
+    auto &os = getStream();
+    os << "(";
+    interleaveComma(op->getNonSuccessorOperands(), os, [&](Value *operand) {
+      if (operand)
+        printType(operand->getType());
+      else
+        os << "<<NULL>";
+    });
+    os << ") -> ";
+    if (op->getNumResults() == 1 &&
+        !op->getResult(0)->getType().isa<FunctionType>()) {
+      printType(op->getResult(0)->getType());
+    } else {
+      os << '(';
+      interleaveComma(op->getResultTypes(), os);
+      os << ')';
+    }
+  }
 
 private:
   OpAsmPrinter(const OpAsmPrinter &) = delete;
@@ -113,19 +154,13 @@ inline OpAsmPrinter &operator<<(OpAsmPrinter &p, Attribute attr) {
   return p;
 }
 
-inline OpAsmPrinter &operator<<(OpAsmPrinter &p, AffineMap map) {
-  p.printAffineMap(map);
-  return p;
-}
-
 // Support printing anything that isn't convertible to one of the above types,
 // even if it isn't exactly one of them.  For example, we want to print
-// FunctionType with the Type& version above, not have it match this.
+// FunctionType with the Type version above, not have it match this.
 template <typename T, typename std::enable_if<
                           !std::is_convertible<T &, Value &>::value &&
                               !std::is_convertible<T &, Type &>::value &&
-                              !std::is_convertible<T &, Attribute &>::value &&
-                              !std::is_convertible<T &, AffineMap &>::value,
+                              !std::is_convertible<T &, Attribute &>::value,
                           T>::type * = nullptr>
 inline OpAsmPrinter &operator<<(OpAsmPrinter &p, const T &other) {
   p.getStream() << other;
@@ -155,135 +190,163 @@ class OpAsmParser {
 public:
   virtual ~OpAsmParser();
 
-  //===--------------------------------------------------------------------===//
-  // High level parsing methods.
-  //===--------------------------------------------------------------------===//
+  /// Emit a diagnostic at the specified location and return failure.
+  virtual InFlightDiagnostic emitError(llvm::SMLoc loc,
+                                       const Twine &message = {}) = 0;
 
-  // These emit an error and return true on failure, or return false on success.
-  // This allows these to be chained together into a linear sequence of ||
-  // expressions in many cases.
+  /// Return a builder which provides useful access to MLIRContext, global
+  /// objects like types and attributes.
+  virtual Builder &getBuilder() const = 0;
 
   /// Get the location of the next token and store it into the argument.  This
   /// always succeeds.
-  virtual bool getCurrentLocation(llvm::SMLoc *loc) = 0;
+  virtual llvm::SMLoc getCurrentLocation() = 0;
+  ParseResult getCurrentLocation(llvm::SMLoc *loc) {
+    *loc = getCurrentLocation();
+    return success();
+  }
 
-  /// This parses... a comma!
-  virtual bool parseComma() = 0;
+  /// Return the location of the original name token.
+  virtual llvm::SMLoc getNameLoc() const = 0;
+
+  // These methods emit an error and return failure or success. This allows
+  // these to be chained together into a linear sequence of || expressions in
+  // many cases.
+
+  /// Parse an operation in its generic form.
+  /// The parsed operation is parsed in the current context and inserted in the
+  /// provided block and insertion point. The results produced by this operation
+  /// aren't mapped to any named value in the parser. Returns nullptr on
+  /// failure.
+  virtual Operation *parseGenericOperation(Block *insertBlock,
+                                           Block::iterator insertPt) = 0;
+
+  //===--------------------------------------------------------------------===//
+  // Token Parsing
+  //===--------------------------------------------------------------------===//
+
+  /// Parse a '->' token.
+  virtual ParseResult parseArrow() = 0;
+
+  /// Parse a '->' token if present
+  virtual ParseResult parseOptionalArrow() = 0;
 
   /// Parse a `:` token.
-  virtual bool parseColon() = 0;
+  virtual ParseResult parseColon() = 0;
 
-  /// Parse a '(' token.
-  virtual bool parseLParen() = 0;
+  /// Parse a `:` token if present.
+  virtual ParseResult parseOptionalColon() = 0;
 
-  /// Parse a ')' token.
-  virtual bool parseRParen() = 0;
+  /// Parse a `,` token.
+  virtual ParseResult parseComma() = 0;
 
-  /// This parses an equal(=) token!
-  virtual bool parseEqual() = 0;
+  /// Parse a `,` token if present.
+  virtual ParseResult parseOptionalComma() = 0;
 
-  /// Parse a type.
-  virtual bool parseType(Type &result) = 0;
+  /// Parse a `=` token.
+  virtual ParseResult parseEqual() = 0;
 
-  /// Parse a colon followed by a type.
-  virtual bool parseColonType(Type &result) = 0;
-
-  /// Parse a type of a specific kind, e.g. a FunctionType.
-  template <typename TypeType> bool parseColonType(TypeType &result) {
-    llvm::SMLoc loc;
-    getCurrentLocation(&loc);
-
-    // Parse any kind of type.
-    Type type;
-    if (parseColonType(type))
-      return true;
-
-    // Check for the right kind of attribute.
-    result = type.dyn_cast<TypeType>();
-    if (!result)
-      return emitError(loc, "invalid kind of type specified");
-
-    return false;
-  }
-
-  /// Parse a colon followed by a type list, which must have at least one type.
-  virtual bool parseColonTypeList(SmallVectorImpl<Type> &result) = 0;
-
-  /// Parse a keyword followed by a type.
-  bool parseKeywordType(const char *keyword, Type &result) {
-    return parseKeyword(keyword) || parseType(result);
-  }
-
-  /// Parse a keyword.
-  bool parseKeyword(const char *keyword, const Twine &msg = "") {
+  /// Parse a given keyword.
+  ParseResult parseKeyword(StringRef keyword, const Twine &msg = "") {
+    auto loc = getCurrentLocation();
     if (parseOptionalKeyword(keyword))
-      return emitError(getNameLoc(), "expected '" + Twine(keyword) + "'" + msg);
-    return false;
+      return emitError(loc, "expected '") << keyword << "'" << msg;
+    return success();
   }
 
-  /// If a keyword is present, then parse it.
-  virtual bool parseOptionalKeyword(const char *keyword) = 0;
-
-  /// Add the specified type to the end of the specified type list and return
-  /// false.  This is a helper designed to allow parse methods to be simple and
-  /// chain through || operators.
-  bool addTypeToList(Type type, SmallVectorImpl<Type> &result) {
-    result.push_back(type);
-    return false;
+  /// Parse a keyword into 'keyword'.
+  ParseResult parseKeyword(StringRef *keyword) {
+    auto loc = getCurrentLocation();
+    if (parseOptionalKeyword(keyword))
+      return emitError(loc, "expected valid keyword");
+    return success();
   }
 
-  /// Add the specified types to the end of the specified type list and return
-  /// false.  This is a helper designed to allow parse methods to be simple and
-  /// chain through || operators.
-  bool addTypesToList(ArrayRef<Type> types, SmallVectorImpl<Type> &result) {
-    result.append(types.begin(), types.end());
-    return false;
-  }
+  /// Parse the given keyword if present.
+  virtual ParseResult parseOptionalKeyword(StringRef keyword) = 0;
+
+  /// Parse a keyword, if present, into 'keyword'.
+  virtual ParseResult parseOptionalKeyword(StringRef *keyword) = 0;
+
+  /// Parse a `(` token.
+  virtual ParseResult parseLParen() = 0;
+
+  /// Parse a `(` token if present.
+  virtual ParseResult parseOptionalLParen() = 0;
+
+  /// Parse a `)` token.
+  virtual ParseResult parseRParen() = 0;
+
+  /// Parse a `)` token if present.
+  virtual ParseResult parseOptionalRParen() = 0;
+
+  /// Parse a `[` token.
+  virtual ParseResult parseLSquare() = 0;
+
+  /// Parse a `[` token if present.
+  virtual ParseResult parseOptionalLSquare() = 0;
+
+  /// Parse a `]` token.
+  virtual ParseResult parseRSquare() = 0;
+
+  /// Parse a `]` token if present.
+  virtual ParseResult parseOptionalRSquare() = 0;
+
+  /// Parse a `...` token if present;
+  virtual ParseResult parseOptionalEllipsis() = 0;
+
+  //===--------------------------------------------------------------------===//
+  // Attribute Parsing
+  //===--------------------------------------------------------------------===//
 
   /// Parse an arbitrary attribute and return it in result.  This also adds the
   /// attribute to the specified attribute list with the specified name.
-  virtual bool parseAttribute(Attribute &result, StringRef attrName,
-                              SmallVectorImpl<NamedAttribute> &attrs) = 0;
+  ParseResult parseAttribute(Attribute &result, StringRef attrName,
+                             SmallVectorImpl<NamedAttribute> &attrs) {
+    return parseAttribute(result, Type(), attrName, attrs);
+  }
 
   /// Parse an arbitrary attribute of a given type and return it in result. This
   /// also adds the attribute to the specified attribute list with the specified
   /// name.
-  virtual bool parseAttribute(Attribute &result, Type type, StringRef attrName,
-                              SmallVectorImpl<NamedAttribute> &attrs) = 0;
+  virtual ParseResult
+  parseAttribute(Attribute &result, Type type, StringRef attrName,
+                 SmallVectorImpl<NamedAttribute> &attrs) = 0;
 
   /// Parse an attribute of a specific kind and type.
   template <typename AttrType>
-  bool parseAttribute(AttrType &result, Type type, StringRef attrName,
-                      SmallVectorImpl<NamedAttribute> &attrs) {
-    llvm::SMLoc loc;
-    getCurrentLocation(&loc);
+  ParseResult parseAttribute(AttrType &result, Type type, StringRef attrName,
+                             SmallVectorImpl<NamedAttribute> &attrs) {
+    llvm::SMLoc loc = getCurrentLocation();
 
     // Parse any kind of attribute.
     Attribute attr;
     if (parseAttribute(attr, type, attrName, attrs))
-      return true;
+      return failure();
 
     // Check for the right kind of attribute.
     result = attr.dyn_cast<AttrType>();
     if (!result)
       return emitError(loc, "invalid kind of constant specified");
 
-    return false;
+    return success();
   }
 
-  /// If a named attribute dictionary is present, parse it into result.
-  virtual bool
+  /// Parse a named dictionary into 'result' if it is present.
+  virtual ParseResult
   parseOptionalAttributeDict(SmallVectorImpl<NamedAttribute> &result) = 0;
 
-  /// Parse a function name like '@foo' and return the name in a form that can
-  /// be passed to resolveFunctionName when a function type is available.
-  virtual bool parseFunctionName(StringRef &result, llvm::SMLoc &loc) = 0;
+  //===--------------------------------------------------------------------===//
+  // Identifier Parsing
+  //===--------------------------------------------------------------------===//
 
-  /// Parse a function name like '@foo` if present and return the name without
-  /// the sigil in `result`.  Return true if the next token is not a function
-  /// name and keep `result` unchanged.
-  virtual bool parseOptionalFunctionName(StringRef &result,
-                                         llvm::SMLoc &loc) = 0;
+  virtual ParseResult
+  parseSymbolName(StringAttr &result, StringRef attrName,
+                  SmallVectorImpl<NamedAttribute> &attrs) = 0;
+
+  //===--------------------------------------------------------------------===//
+  // Operand Parsing
+  //===--------------------------------------------------------------------===//
 
   /// This is the representation of an operand reference.
   struct OperandType {
@@ -293,15 +356,11 @@ public:
   };
 
   /// Parse a single operand.
-  virtual bool parseOperand(OperandType &result) = 0;
+  virtual ParseResult parseOperand(OperandType &result) = 0;
 
-  /// Parse a single operation successor and it's operand list.
-  virtual bool parseSuccessorAndUseList(Block *&dest,
-                                        SmallVectorImpl<Value *> &operands) = 0;
-
-  /// These are the supported delimiters around operand lists, used by
-  /// parseOperandList.
-  enum Delimiter {
+  /// These are the supported delimiters around operand lists and region
+  /// argument lists, used by parseOperandList and parseRegionArgumentList.
+  enum class Delimiter {
     /// Zero or more operands with no delimiters.
     None,
     /// Parens surrounding zero or more operands.
@@ -316,76 +375,219 @@ public:
 
   /// Parse zero or more SSA comma-separated operand references with a specified
   /// surrounding delimiter, and an optional required operand count.
-  virtual bool parseOperandList(SmallVectorImpl<OperandType> &result,
-                                int requiredOperandCount = -1,
-                                Delimiter delimiter = Delimiter::None) = 0;
+  virtual ParseResult
+  parseOperandList(SmallVectorImpl<OperandType> &result,
+                   int requiredOperandCount = -1,
+                   Delimiter delimiter = Delimiter::None) = 0;
+  ParseResult parseOperandList(SmallVectorImpl<OperandType> &result,
+                               Delimiter delimiter) {
+    return parseOperandList(result, /*requiredOperandCount=*/-1, delimiter);
+  }
 
   /// Parse zero or more trailing SSA comma-separated trailing operand
   /// references with a specified surrounding delimiter, and an optional
   /// required operand count. A leading comma is expected before the operands.
-  virtual bool
+  virtual ParseResult
   parseTrailingOperandList(SmallVectorImpl<OperandType> &result,
                            int requiredOperandCount = -1,
                            Delimiter delimiter = Delimiter::None) = 0;
+  ParseResult parseTrailingOperandList(SmallVectorImpl<OperandType> &result,
+                                       Delimiter delimiter) {
+    return parseTrailingOperandList(result, /*requiredOperandCount=*/-1,
+                                    delimiter);
+  }
 
-  /// Parses a region. Any parsed blocks are appended to "region" and must be
-  /// moved to the op regions after the op is created.
-  virtual bool parseRegion(Region &region) = 0;
+  /// Resolve an operand to an SSA value, emitting an error on failure.
+  virtual ParseResult resolveOperand(const OperandType &operand, Type type,
+                                     SmallVectorImpl<Value *> &result) = 0;
 
-  /// Parses an argument for the entry block of the next region to be parsed.
-  virtual bool parseRegionEntryBlockArgument(Type argType) = 0;
-
-  //===--------------------------------------------------------------------===//
-  // Methods for interacting with the parser
-  //===--------------------------------------------------------------------===//
-
-  /// Return a builder which provides useful access to MLIRContext, global
-  /// objects like types and attributes.
-  virtual Builder &getBuilder() const = 0;
-
-  /// Return the location of the original name token.
-  virtual llvm::SMLoc getNameLoc() const = 0;
-
-  /// Resolve an operand to an SSA value, emitting an error and returning true
-  /// on failure.
-  virtual bool resolveOperand(const OperandType &operand, Type type,
-                              SmallVectorImpl<Value *> &result) = 0;
-
-  /// Resolve a list of operands to SSA values, emitting an error and returning
-  /// true on failure, or appending the results to the list on success.
-  /// This method should be used when all operands have the same type.
-  virtual bool resolveOperands(ArrayRef<OperandType> operands, Type type,
-                               SmallVectorImpl<Value *> &result) {
+  /// Resolve a list of operands to SSA values, emitting an error on failure, or
+  /// appending the results to the list on success. This method should be used
+  /// when all operands have the same type.
+  ParseResult resolveOperands(ArrayRef<OperandType> operands, Type type,
+                              SmallVectorImpl<Value *> &result) {
     for (auto elt : operands)
       if (resolveOperand(elt, type, result))
-        return true;
-    return false;
+        return failure();
+    return success();
   }
 
   /// Resolve a list of operands and a list of operand types to SSA values,
-  /// emitting an error and returning true on failure, or appending the results
+  /// emitting an error and returning failure, or appending the results
   /// to the list on success.
-  virtual bool resolveOperands(ArrayRef<OperandType> operands,
-                               ArrayRef<Type> types, llvm::SMLoc loc,
-                               SmallVectorImpl<Value *> &result) {
+  ParseResult resolveOperands(ArrayRef<OperandType> operands,
+                              ArrayRef<Type> types, llvm::SMLoc loc,
+                              SmallVectorImpl<Value *> &result) {
     if (operands.size() != types.size())
-      return emitError(loc, Twine(operands.size()) +
-                                " operands present, but expected " +
-                                Twine(types.size()));
+      return emitError(loc)
+             << operands.size() << " operands present, but expected "
+             << types.size();
 
-    for (unsigned i = 0, e = operands.size(); i != e; ++i) {
+    for (unsigned i = 0, e = operands.size(); i != e; ++i)
       if (resolveOperand(operands[i], types[i], result))
-        return true;
-    }
-    return false;
+        return failure();
+    return success();
   }
 
-  /// Resolve a parse function name and a type into a function reference.
-  virtual bool resolveFunctionName(StringRef name, FunctionType type,
-                                   llvm::SMLoc loc, Function *&result) = 0;
+  /// Parses an affine map attribute where dims and symbols are SSA operands.
+  /// Operand values must come from single-result sources, and be valid
+  /// dimensions/symbol identifiers according to mlir::isValidDim/Symbol.
+  virtual ParseResult
+  parseAffineMapOfSSAIds(SmallVectorImpl<OperandType> &operands, Attribute &map,
+                         StringRef attrName,
+                         SmallVectorImpl<NamedAttribute> &attrs) = 0;
 
-  /// Emit a diagnostic at the specified location and return true.
-  virtual bool emitError(llvm::SMLoc loc, const Twine &message) = 0;
+  //===--------------------------------------------------------------------===//
+  // Region Parsing
+  //===--------------------------------------------------------------------===//
+
+  /// Parses a region. Any parsed blocks are appended to "region" and must be
+  /// moved to the op regions after the op is created. The first block of the
+  /// region takes "arguments" of types "argTypes". If "enableNameShadowing" is
+  /// set to true, the argument names are allowed to shadow the names of other
+  /// existing SSA values defined above the region scope. "enableNameShadowing"
+  /// can only be set to true for regions attached to operations that are
+  /// "IsolatedFromAbove".
+  virtual ParseResult parseRegion(Region &region,
+                                  ArrayRef<OperandType> arguments,
+                                  ArrayRef<Type> argTypes,
+                                  bool enableNameShadowing = false) = 0;
+
+  /// Parses a region if present.
+  virtual ParseResult parseOptionalRegion(Region &region,
+                                          ArrayRef<OperandType> arguments,
+                                          ArrayRef<Type> argTypes,
+                                          bool enableNameShadowing = false) = 0;
+
+  /// Parse a region argument, this argument is resolved when calling
+  /// 'parseRegion'.
+  virtual ParseResult parseRegionArgument(OperandType &argument) = 0;
+
+  /// Parse zero or more region arguments with a specified surrounding
+  /// delimiter, and an optional required argument count. Region arguments
+  /// define new values; so this also checks if values with the same names have
+  /// not been defined yet.
+  virtual ParseResult
+  parseRegionArgumentList(SmallVectorImpl<OperandType> &result,
+                          int requiredOperandCount = -1,
+                          Delimiter delimiter = Delimiter::None) = 0;
+  virtual ParseResult
+  parseRegionArgumentList(SmallVectorImpl<OperandType> &result,
+                          Delimiter delimiter) {
+    return parseRegionArgumentList(result, /*requiredOperandCount=*/-1,
+                                   delimiter);
+  }
+
+  /// Parse a region argument if present.
+  virtual ParseResult parseOptionalRegionArgument(OperandType &argument) = 0;
+
+  //===--------------------------------------------------------------------===//
+  // Successor Parsing
+  //===--------------------------------------------------------------------===//
+
+  /// Parse a single operation successor and its operand list.
+  virtual ParseResult
+  parseSuccessorAndUseList(Block *&dest,
+                           SmallVectorImpl<Value *> &operands) = 0;
+
+  //===--------------------------------------------------------------------===//
+  // Type Parsing
+  //===--------------------------------------------------------------------===//
+
+  /// Parse a type.
+  virtual ParseResult parseType(Type &result) = 0;
+
+  /// Parse an optional arrow followed by a type list.
+  virtual ParseResult
+  parseOptionalArrowTypeList(SmallVectorImpl<Type> &result) = 0;
+
+  /// Parse a colon followed by a type.
+  virtual ParseResult parseColonType(Type &result) = 0;
+
+  /// Parse a colon followed by a type of a specific kind, e.g. a FunctionType.
+  template <typename TypeType> ParseResult parseColonType(TypeType &result) {
+    llvm::SMLoc loc = getCurrentLocation();
+
+    // Parse any kind of type.
+    Type type;
+    if (parseColonType(type))
+      return failure();
+
+    // Check for the right kind of attribute.
+    result = type.dyn_cast<TypeType>();
+    if (!result)
+      return emitError(loc, "invalid kind of type specified");
+
+    return success();
+  }
+
+  /// Parse a colon followed by a type list, which must have at least one type.
+  virtual ParseResult parseColonTypeList(SmallVectorImpl<Type> &result) = 0;
+
+  /// Parse an optional colon followed by a type list, which if present must
+  /// have at least one type.
+  virtual ParseResult
+  parseOptionalColonTypeList(SmallVectorImpl<Type> &result) = 0;
+
+  /// Parse a keyword followed by a type.
+  ParseResult parseKeywordType(const char *keyword, Type &result) {
+    return failure(parseKeyword(keyword) || parseType(result));
+  }
+
+  /// Add the specified type to the end of the specified type list and return
+  /// success.  This is a helper designed to allow parse methods to be simple
+  /// and chain through || operators.
+  ParseResult addTypeToList(Type type, SmallVectorImpl<Type> &result) {
+    result.push_back(type);
+    return success();
+  }
+
+  /// Add the specified types to the end of the specified type list and return
+  /// success.  This is a helper designed to allow parse methods to be simple
+  /// and chain through || operators.
+  ParseResult addTypesToList(ArrayRef<Type> types,
+                             SmallVectorImpl<Type> &result) {
+    result.append(types.begin(), types.end());
+    return success();
+  }
+
+private:
+  /// Parse either an operand list or a region argument list depending on
+  /// whether isOperandList is true.
+  ParseResult parseOperandOrRegionArgList(SmallVectorImpl<OperandType> &result,
+                                          bool isOperandList,
+                                          int requiredOperandCount,
+                                          Delimiter delimiter);
+};
+
+//===--------------------------------------------------------------------===//
+// Dialect OpAsm interface.
+//===--------------------------------------------------------------------===//
+
+class OpAsmDialectInterface
+    : public DialectInterface::Base<OpAsmDialectInterface> {
+public:
+  OpAsmDialectInterface(Dialect *dialect) : Base(dialect) {}
+
+  /// Hooks for getting identifier aliases for symbols. The identifier is used
+  /// in place of the symbol when printing textual IR.
+  ///
+  /// Hook for defining Attribute kind aliases. This will generate an alias for
+  /// all attributes of the given kind in the form : <alias>[0-9]+. These
+  /// aliases must not contain `.`.
+  virtual void getAttributeKindAliases(
+      SmallVectorImpl<std::pair<unsigned, StringRef>> &aliases) const {}
+  /// Hook for defining Attribute aliases. These aliases must not contain `.` or
+  /// end with a numeric digit([0-9]+).
+  virtual void getAttributeAliases(
+      SmallVectorImpl<std::pair<Attribute, StringRef>> &aliases) const {}
+  /// Hook for defining Type aliases.
+  virtual void
+  getTypeAliases(SmallVectorImpl<std::pair<Type, StringRef>> &aliases) const {}
+
+  /// Get a special name to use when printing the given operation. The desired
+  /// name should be streamed into 'os'.
+  virtual void getOpResultName(Operation *op, raw_ostream &os) const {}
 };
 
 } // end namespace mlir

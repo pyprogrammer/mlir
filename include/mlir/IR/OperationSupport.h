@@ -28,7 +28,6 @@
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
-#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/Support/TrailingObjects.h"
@@ -42,15 +41,23 @@ struct OperationState;
 class OpAsmParser;
 class OpAsmParserResult;
 class OpAsmPrinter;
+class OpFoldResult;
+class ParseResult;
 class Pattern;
 class Region;
 class RewritePattern;
 class Type;
 class Value;
 
-/// This is a vector that owns the patterns inside of it.
-using OwningPatternList = std::vector<std::unique_ptr<Pattern>>;
-using OwningRewritePatternList = std::vector<std::unique_ptr<RewritePattern>>;
+/// This is an adaptor from a list of values to named operands of OpTy.  In a
+/// generic operation context, e.g., in dialect conversions, an ordered array of
+/// `Value`s is treated as operands of `OpTy`.  This adaptor takes a reference
+/// to the array and provides accessors with the same names as `OpTy` for
+/// operands.  This makes possible to create function templates that operate on
+/// either OpTy or OperandAdaptor<OpTy> seamlessly.
+template <typename OpTy> using OperandAdaptor = typename OpTy::OperandAdaptor;
+
+class OwningRewritePatternList;
 
 enum class OperationProperty {
   /// This bit is set for an operation if it is a commutative operation: that
@@ -65,6 +72,12 @@ enum class OperationProperty {
   /// This bit is set for an operation if it is a terminator: that means
   /// an operation at the end of a block.
   Terminator = 0x4,
+
+  /// This bit is set for operations that are completely isolated from above.
+  /// This is used for operations whose regions are explicit capture only, i.e.
+  /// they are never allowed to implicitly reference values defined above the
+  /// parent operation.
+  IsolatedFromAbove = 0x8,
 };
 
 /// This is a "type erased" representation of a registered operation.  This
@@ -82,27 +95,22 @@ public:
   Dialect &dialect;
 
   /// Return true if this "op class" can match against the specified operation.
-  bool (&isClassFor)(Operation *op);
+  bool (&classof)(Operation *op);
 
   /// Use the specified object to parse this ops custom assembly format.
-  bool (&parseAssembly)(OpAsmParser *parser, OperationState *result);
+  ParseResult (&parseAssembly)(OpAsmParser &parser, OperationState &result);
 
   /// This hook implements the AsmPrinter for this operation.
-  void (&printAssembly)(Operation *op, OpAsmPrinter *p);
+  void (&printAssembly)(Operation *op, OpAsmPrinter &p);
 
   /// This hook implements the verifier for this operation.  It should emits an
   /// error message and returns failure if a problem is detected, or returns
   /// success if everything is ok.
   LogicalResult (&verifyInvariants)(Operation *op);
 
-  /// This hook implements a constant folder for this operation.  It fills in
-  /// `results` on success.
-  LogicalResult (&constantFoldHook)(Operation *op, ArrayRef<Attribute> operands,
-                                    SmallVectorImpl<Attribute> &results);
-
   /// This hook implements a generalized folder for this operation.  Operations
   /// can implement this to provide simplifications rules that are applied by
-  /// the FuncBuilder::foldOrCreate API and the canonicalization pass.
+  /// the Builder::createOrFold API and the canonicalization pass.
   ///
   /// This is an intentionally limited interface - implementations of this hook
   /// can only perform the following changes to the operation:
@@ -117,10 +125,10 @@ public:
   ///     instead.
   ///
   /// This allows expression of some simple in-place canonicalizations (e.g.
-  /// "x+0 -> x", "min(x,y,x,z) -> min(x,y,z)", "x+y-x -> y", etc), but does
-  /// not allow for canonicalizations that need to introduce new operations, not
-  /// even constants (e.g. "x-x -> 0" cannot be expressed).
-  LogicalResult (&foldHook)(Operation *op, SmallVectorImpl<Value *> &results);
+  /// "x+0 -> x", "min(x,y,x,z) -> min(x,y,z)", "x+y-x -> y", etc), as well as
+  /// generalized constant folding.
+  LogicalResult (&foldHook)(Operation *op, ArrayRef<Attribute> operands,
+                            SmallVectorImpl<OpFoldResult> &results);
 
   /// This hook returns any canonicalization pattern rewrites that the operation
   /// supports, for use by the canonicalization pass.
@@ -132,6 +140,19 @@ public:
     return opProperties & static_cast<OperationProperties>(property);
   }
 
+  /// Returns an instance of the concept object for the given interface if it
+  /// was registered to this operation, null otherwise. This should not be used
+  /// directly.
+  template <typename T> typename T::Concept *getInterface() const {
+    return reinterpret_cast<typename T::Concept *>(
+        getRawInterface(T::getInterfaceID()));
+  }
+
+  /// Returns if the operation has a particular trait.
+  template <template <typename T> class Trait> bool hasTrait() const {
+    return hasRawTrait(ClassID::getID<Trait>());
+  }
+
   /// Look up the specified operation in the specified MLIRContext and return a
   /// pointer to it if present.  Otherwise, return a null pointer.
   static const AbstractOperation *lookup(StringRef opName,
@@ -141,34 +162,42 @@ public:
   /// operations they contain.
   template <typename T> static AbstractOperation get(Dialect &dialect) {
     return AbstractOperation(
-        T::getOperationName(), dialect, T::getOperationProperties(),
-        T::isClassFor, T::parseAssembly, T::printAssembly, T::verifyInvariants,
-        T::constantFoldHook, T::foldHook, T::getCanonicalizationPatterns);
+        T::getOperationName(), dialect, T::getOperationProperties(), T::classof,
+        T::parseAssembly, T::printAssembly, T::verifyInvariants, T::foldHook,
+        T::getCanonicalizationPatterns, T::getRawInterface, T::hasTrait);
   }
 
 private:
   AbstractOperation(
       StringRef name, Dialect &dialect, OperationProperties opProperties,
-      bool (&isClassFor)(Operation *op),
-      bool (&parseAssembly)(OpAsmParser *parser, OperationState *result),
-      void (&printAssembly)(Operation *op, OpAsmPrinter *p),
+      bool (&classof)(Operation *op),
+      ParseResult (&parseAssembly)(OpAsmParser &parser, OperationState &result),
+      void (&printAssembly)(Operation *op, OpAsmPrinter &p),
       LogicalResult (&verifyInvariants)(Operation *op),
-      LogicalResult (&constantFoldHook)(Operation *op,
-                                        ArrayRef<Attribute> operands,
-                                        SmallVectorImpl<Attribute> &results),
-      LogicalResult (&foldHook)(Operation *op,
-                                SmallVectorImpl<Value *> &results),
+      LogicalResult (&foldHook)(Operation *op, ArrayRef<Attribute> operands,
+                                SmallVectorImpl<OpFoldResult> &results),
       void (&getCanonicalizationPatterns)(OwningRewritePatternList &results,
-                                          MLIRContext *context))
-      : name(name), dialect(dialect), isClassFor(isClassFor),
+                                          MLIRContext *context),
+      void *(&getRawInterface)(ClassID *interfaceID),
+      bool (&hasTrait)(ClassID *traitID))
+      : name(name), dialect(dialect), classof(classof),
         parseAssembly(parseAssembly), printAssembly(printAssembly),
-        verifyInvariants(verifyInvariants), constantFoldHook(constantFoldHook),
-        foldHook(foldHook),
+        verifyInvariants(verifyInvariants), foldHook(foldHook),
         getCanonicalizationPatterns(getCanonicalizationPatterns),
-        opProperties(opProperties) {}
+        opProperties(opProperties), getRawInterface(getRawInterface),
+        hasRawTrait(hasTrait) {}
 
   /// The properties of the operation.
   const OperationProperties opProperties;
+
+  /// Returns a raw instance of the concept for the given interface id if it is
+  /// registered to this operation, nullptr otherwise. This should not be used
+  /// directly.
+  void *(&getRawInterface)(ClassID *interfaceID);
+
+  /// This hook returns if the operation contains the trait corresponding
+  /// to the given ClassID.
+  bool (&hasRawTrait)(ClassID *traitID);
 };
 
 class OperationName {
@@ -178,6 +207,9 @@ public:
 
   OperationName(AbstractOperation *op) : representation(op) {}
   OperationName(StringRef name, MLIRContext *context);
+
+  /// Return the name of the dialect this operation is registered to.
+  StringRef getDialect() const;
 
   /// Return the name of this operation.  This always succeeds.
   StringRef getStringRef() const;
@@ -223,7 +255,6 @@ inline llvm::hash_code hash_value(OperationName arg) {
 /// be used as a temporary object on the stack.  It is generally unwise to put
 /// this in a collection.
 struct OperationState {
-  MLIRContext *const context;
   Location location;
   OperationName name;
   SmallVector<Value *, 4> operands;
@@ -238,13 +269,12 @@ struct OperationState {
   bool resizableOperandList = false;
 
 public:
-  OperationState(MLIRContext *context, Location location, StringRef name);
+  OperationState(Location location, StringRef name);
 
-  OperationState(MLIRContext *context, Location location, OperationName name);
+  OperationState(Location location, OperationName name);
 
-  OperationState(MLIRContext *context, Location location, StringRef name,
-                 ArrayRef<Value *> operands, ArrayRef<Type> types,
-                 ArrayRef<NamedAttribute> attributes,
+  OperationState(Location location, StringRef name, ArrayRef<Value *> operands,
+                 ArrayRef<Type> types, ArrayRef<NamedAttribute> attributes,
                  ArrayRef<Block *> successors = {},
                  MutableArrayRef<std::unique_ptr<Region>> regions = {},
                  bool resizableOperandList = false);
@@ -261,12 +291,17 @@ public:
 
   /// Add an attribute with the specified name.
   void addAttribute(StringRef name, Attribute attr) {
-    addAttribute(Identifier::get(name, context), attr);
+    addAttribute(Identifier::get(name, getContext()), attr);
   }
 
   /// Add an attribute with the specified name.
   void addAttribute(Identifier name, Attribute attr) {
     attributes.push_back({name, attr});
+  }
+
+  /// Add an array of named attributes.
+  void addAttributes(ArrayRef<NamedAttribute> newAttributes) {
+    attributes.append(newAttributes.begin(), newAttributes.end());
   }
 
   void addSuccessor(Block *successor, ArrayRef<Value *> succOperands) {
@@ -290,6 +325,9 @@ public:
   void setOperandListToResizable(bool isResizable = true) {
     resizableOperandList = isResizable;
   }
+
+  /// Get the context held by this operation state.
+  MLIRContext *getContext() { return location->getContext(); }
 };
 
 namespace detail {

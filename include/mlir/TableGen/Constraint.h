@@ -57,7 +57,7 @@ public:
   StringRef getDescription() const;
 
   // Constraint kind
-  enum Kind { CK_Type, CK_Attr, CK_Uncategorized };
+  enum Kind { CK_Attr, CK_Region, CK_Type, CK_Uncategorized };
 
   Kind getKind() const { return kind; }
 
@@ -74,9 +74,13 @@ private:
 
 // An constraint and the concrete entities to place the constraint on.
 struct AppliedConstraint {
-  AppliedConstraint(Constraint &&c, std::vector<std::string> &&e);
+  AppliedConstraint(Constraint &&constraint, StringRef self,
+                    std::vector<std::string> &&entities);
 
   Constraint constraint;
+  // The symbol to replace `$_self` special placeholder in the constraint.
+  std::string self;
+  // The symbols to replace `$N` positional placeholders in the constraint.
   std::vector<std::string> entities;
 };
 

@@ -12,19 +12,19 @@ we can teach the MLIR verifier to enforce some invariants on the IR.
 ```c++
 /// This is the definition of the Toy dialect. A dialect inherits from
 /// mlir::Dialect and registers custom operations and types (in its constructor).
-/// It can also overridde general behavior of dialects exposed as virtual
+/// It can also override general behavior of dialects exposed as virtual
 /// methods, for example regarding verification and parsing/printing.
 class ToyDialect : public mlir::Dialect {
  public:
   explicit ToyDialect(mlir::MLIRContext *ctx);
 
-  /// Parse a type registered to this dialect. Overridding this method is
+  /// Parse a type registered to this dialect. Overriding this method is
   /// required for dialects that have custom types.
   /// Technically this is only needed to be able to round-trip to textual IR.
   mlir::Type parseType(llvm::StringRef tyData,
                        mlir::Location loc) const override;
 
-  /// Print a type registered to this dialect. Overridding this method is
+  /// Print a type registered to this dialect. Overriding this method is
   /// only required for dialects that have custom types.
   /// Technically this is only needed to be able to round-trip to textual IR.
   void printType(mlir::Type type, llvm::raw_ostream &os) const override;
@@ -202,11 +202,11 @@ class GenericCallOp
   bool verify();
 
   /// Interface to the builder to allow:
-  ///   mlir::FuncBuilder::create<GenericCallOp>(...)
+  ///   mlir::OpBuilder::create<GenericCallOp>(...)
   /// This method populate the `state` that MLIR use to create operations.
   /// The `toy.generic_call` operation accepts a callee name and a list of
   /// arguments for the call.
-  static void build(mlir::FuncBuilder *builder, mlir::OperationState *state,
+  static void build(mlir::OpBuilder &builder, mlir::OperationState &state,
                     llvm::StringRef callee,
                     llvm::ArrayRef<mlir::Value *> arguments);
 
@@ -214,7 +214,6 @@ class GenericCallOp
   llvm::StringRef getCalleeName();
 
  private:
-  friend class mlir::Operation;
   using Op::Op;
 };
 ```

@@ -21,8 +21,8 @@
 
 #include "mlir/Transforms/Passes.h"
 
-#include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/LoopAnalysis.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
@@ -34,7 +34,7 @@
 
 using namespace mlir;
 
-#define DEBUG_TYPE "loop-unroll"
+#define DEBUG_TYPE "affine-loop-unroll"
 
 static llvm::cl::OptionCategory clOptionsCategory(DEBUG_TYPE " options");
 
@@ -92,8 +92,8 @@ void LoopUnroll::runOnFunction() {
     // Store innermost loops as we walk.
     std::vector<AffineForOp> loops;
 
-    void walkPostOrder(Function *f) {
-      for (auto &b : *f)
+    void walkPostOrder(FuncOp f) {
+      for (auto &b : f)
         walkPostOrder(b.begin(), b.end());
     }
 
@@ -111,9 +111,9 @@ void LoopUnroll::runOnFunction() {
       for (auto &region : opInst->getRegions())
         for (auto &block : region)
           hasInnerLoops |= walkPostOrder(block.begin(), block.end());
-      if (opInst->isa<AffineForOp>()) {
+      if (isa<AffineForOp>(opInst)) {
         if (!hasInnerLoops)
-          loops.push_back(opInst->cast<AffineForOp>());
+          loops.push_back(cast<AffineForOp>(opInst));
         return true;
       }
       return hasInnerLoops;
@@ -128,7 +128,7 @@ void LoopUnroll::runOnFunction() {
     // Gathers all loops with trip count <= minTripCount. Do a post order walk
     // so that loops are gathered from innermost to outermost (or else unrolling
     // an outer one may delete gathered inner ones).
-    getFunction().walk<AffineForOp>([&](AffineForOp forOp) {
+    getFunction().walk([&](AffineForOp forOp) {
       Optional<uint64_t> tripCount = getConstantTripCount(forOp);
       if (tripCount.hasValue() && tripCount.getValue() <= clUnrollFullThreshold)
         loops.push_back(forOp);
@@ -142,10 +142,10 @@ void LoopUnroll::runOnFunction() {
                                 ? clUnrollNumRepetitions
                                 : 1;
   // If the call back is provided, we will recurse until no loops are found.
-  Function &func = getFunction();
+  FuncOp func = getFunction();
   for (unsigned i = 0; i < numRepetitions || getUnrollFactor; i++) {
     InnermostLoopGatherer ilg;
-    ilg.walkPostOrder(&func);
+    ilg.walkPostOrder(func);
     auto &loops = ilg.loops;
     if (loops.empty())
       break;
@@ -180,12 +180,12 @@ LogicalResult LoopUnroll::runOnAffineForOp(AffineForOp forOp) {
   return loopUnrollByFactor(forOp, kDefaultUnrollFactor);
 }
 
-FunctionPassBase *mlir::createLoopUnrollPass(
+std::unique_ptr<OpPassBase<FuncOp>> mlir::createLoopUnrollPass(
     int unrollFactor, int unrollFull,
     const std::function<unsigned(AffineForOp)> &getUnrollFactor) {
-  return new LoopUnroll(
+  return std::make_unique<LoopUnroll>(
       unrollFactor == -1 ? None : Optional<unsigned>(unrollFactor),
       unrollFull == -1 ? None : Optional<bool>(unrollFull), getUnrollFactor);
 }
 
-static PassRegistration<LoopUnroll> pass("loop-unroll", "Unroll loops");
+static PassRegistration<LoopUnroll> pass("affine-loop-unroll", "Unroll loops");

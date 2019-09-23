@@ -94,8 +94,8 @@ each `mlir::Value` is a `linalg.range`.
 
 ### Simplifying assumption
 
-The `linalg.range` type is generally unrestricted beyond havind elements of
-`index` type. however it is used to build loop nests using the `affine.for`
+The `linalg.range` type is generally unrestricted beyond having elements of
+`index` type. However it is used to build loop nests using the `affine.for`
 [operation](../../Dialects/Affine.md) whose restrictions it inherits, at the
 point where `affine.for` operations are materialized. This is a tradeoff to
 reuse existing MLIR operations that are already known to lower to LLVM. As a
@@ -148,7 +148,7 @@ order to fold chains of slice operations (introduced in the following paragraph)
 and capture enough information in the ViewOp so it can be lowered to LLVM.
 
 The entry point to the builder is the method: `static void
-ViewOp::build(mlir::Builder *b, mlir::OperationState *result, mlir::Value
+ViewOp::build(mlir::Builder *b, mlir::OperationState &result, mlir::Value
 *memRef, llvm::ArrayRef<mlir::Value *> indexings = {});`
 
 A `ViewOp` pretty-prints as: `%1 = linalg.view %0[%m, %n, %k] :
@@ -229,7 +229,7 @@ enables constant folding and dead code elimination in the `canonicalizerPass`.
 
 Similarly to Toy, the dialect must be registered so that the pretty-printer and
 verifier can be enabled. Without registration, only the custom op form can be
-printed. Beware of ops printed in custom op form, when a short-hand form exists,
+printed. Beware of ops printed in custom op form, when a shorthand form exists,
 because there is a high chance the IR verification is not enabled.
 
 To register the Linalg dialect, call
@@ -243,13 +243,18 @@ multiple registrations of the same symbols. At that point, the constructor needs
 to be statically aware of all the types and ops. Since our code structure
 chooses to isolate independent portions of the tutorial, and certain ops are
 introduced in later parts, we explicitly separate `DialectConstruction.cpp` in
-its separate library. Linking with the proper library enables the types that
+its' separate library. Linking with the proper library enables the types that
 have been declared so far.
 
 ## Putting it all together
 
-The
-[example](https://github.com/tensorflow/mlir/blob/master/examples/Linalg/Linalg1/Example.cpp)
-demonstrates how to construct some simple IR snippets that pass through the
-verifier checks. We introduce a custom op called `some_consumer` to ensure that
-dead-code elimination does not optimize these simple examples out of existence.
+We create a `linalg1-opt` executable which links together `Linalg1` and the core
+`MlirOptLib` library to add traditional compiler support for file handling,
+parsing, command-line interface etc. The FileCheck'd test
+[example](https://github.com/tensorflow/mlir/blob/master/test/Examples/Linalg/Linalg1.mlir)
+demonstrates parsing, verification, pretty printing of the IR we have
+constructed so far. We introduce a custom op called `some_consumer` to ensure
+that dead-code elimination does not optimize these simple examples out of
+existence, in the case an extra -canonicalize option is passed to `linalg1-opt`.
+When called with `lower-linalg-to-llvm`, the test uses the
+[LLVM conversion](LLVMConversion.md) mechanisms.

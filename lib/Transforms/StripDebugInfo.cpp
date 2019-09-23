@@ -29,8 +29,8 @@ struct StripDebugInfo : public FunctionPass<StripDebugInfo> {
 } // end anonymous namespace
 
 void StripDebugInfo::runOnFunction() {
-  Function &func = getFunction();
-  UnknownLoc unknownLoc = UnknownLoc::get(&getContext());
+  FuncOp func = getFunction();
+  auto unknownLoc = UnknownLoc::get(&getContext());
 
   // Strip the debug info from the function and its operations.
   func.setLoc(unknownLoc);
@@ -38,8 +38,8 @@ void StripDebugInfo::runOnFunction() {
 }
 
 /// Creates a pass to strip debug information from a function.
-FunctionPassBase *mlir::createStripDebugInfoPass() {
-  return new StripDebugInfo();
+std::unique_ptr<OpPassBase<FuncOp>> mlir::createStripDebugInfoPass() {
+  return std::make_unique<StripDebugInfo>();
 }
 
 static PassRegistration<StripDebugInfo>

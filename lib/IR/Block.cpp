@@ -1,4 +1,4 @@
-//===- Block.cpp - MLIR Block and Region Classes --------------------------===//
+//===- Block.cpp - MLIR Block Class ---------------------------------------===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -16,7 +16,6 @@
 // =============================================================================
 
 #include "mlir/IR/Block.h"
-#include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
 using namespace mlir;
@@ -39,40 +38,32 @@ unsigned BlockArgument::getArgNumber() {
 Block::~Block() {
   assert(!verifyInstOrder() && "Expected valid operation ordering.");
   clear();
-
   llvm::DeleteContainerPointers(arguments);
 }
 
+Region *Block::getParent() { return parentValidInstOrderPair.getPointer(); }
+
 /// Returns the closest surrounding operation that contains this block or
-/// nullptr if this is a top-level operation block.
-Operation *Block::getContainingOp() {
-  return getParent() ? getParent()->getContainingOp() : nullptr;
+/// nullptr if this block is unlinked.
+Operation *Block::getParentOp() {
+  return getParent() ? getParent()->getParentOp() : nullptr;
 }
 
-Function *Block::getFunction() {
-  Block *block = this;
-  while (auto *op = block->getContainingOp()) {
-    block = op->getBlock();
-    if (!block)
-      return nullptr;
-  }
-  if (auto *list = block->getParent())
-    return list->getContainingFunction();
-  return nullptr;
-}
+/// Return if this block is the entry block in the parent region.
+bool Block::isEntryBlock() { return this == &getParent()->front(); }
 
-/// Insert this block (which must not already be in a function) right before
-/// the specified block.
+/// Insert this block (which must not already be in a region) right before the
+/// specified block.
 void Block::insertBefore(Block *block) {
   assert(!getParent() && "already inserted into a block!");
   assert(block->getParent() && "cannot insert before a block without a parent");
   block->getParent()->getBlocks().insert(Region::iterator(block), this);
 }
 
-/// Unlink this Block from its Function and delete it.
-void Block::eraseFromFunction() {
-  assert(getFunction() && "Block has no parent");
-  getFunction()->getBlocks().erase(this);
+/// Unlink this Block from its parent Region and delete it.
+void Block::erase() {
+  assert(getParent() && "Block has no parent");
+  getParent()->getBlocks().erase(this);
 }
 
 /// Returns 'op' if 'op' lies in this block, or otherwise finds the
@@ -104,6 +95,17 @@ void Block::dropAllDefinedValueUses() {
   for (auto &op : *this)
     op.dropAllDefinedValueUses();
   dropAllUses();
+}
+
+/// Returns true if the ordering of the child operations is valid, false
+/// otherwise.
+bool Block::isInstOrderValid() { return parentValidInstOrderPair.getInt(); }
+
+/// Invalidates the current ordering of operations.
+void Block::invalidateInstOrder() {
+  // Validate the current ordering.
+  assert(!verifyInstOrder());
+  parentValidInstOrderPair.setInt(false);
 }
 
 /// Verifies the current ordering of child operations. Returns false if the
@@ -138,17 +140,6 @@ void Block::recomputeInstOrder() {
     op.orderIndex = orderIndex++;
 }
 
-Block *PredecessorIterator::operator*() const {
-  // The use iterator points to an operand of a terminator.  The predecessor
-  // we return is the block that the terminator is embedded into.
-  return bbUseIterator.getUser()->getBlock();
-}
-
-/// Get the successor number in the predecessor terminator.
-unsigned PredecessorIterator::getSuccessorIndex() const {
-  return bbUseIterator->getOperandNumber();
-}
-
 //===----------------------------------------------------------------------===//
 // Argument list management.
 //===----------------------------------------------------------------------===//
@@ -170,12 +161,16 @@ auto Block::addArguments(ArrayRef<Type> types)
   return {arguments.data() + initialSize, arguments.data() + arguments.size()};
 }
 
-void Block::eraseArgument(unsigned index) {
+void Block::eraseArgument(unsigned index, bool updatePredTerms) {
   assert(index < arguments.size());
 
   // Delete the argument.
   delete arguments[index];
   arguments.erase(arguments.begin() + index);
+
+  // If we aren't updating predecessors, there is nothing left to do.
+  if (!updatePredTerms)
+    return;
 
   // Erase this argument from each of the predecessor's terminator.
   for (auto predIt = pred_begin(), predE = pred_end(); predIt != predE;
@@ -225,22 +220,6 @@ Block *Block::getSinglePredecessor() {
 }
 
 //===----------------------------------------------------------------------===//
-// Operation Walkers
-//===----------------------------------------------------------------------===//
-
-void Block::walk(const std::function<void(Operation *)> &callback) {
-  walk(begin(), end(), callback);
-}
-
-/// Walk the operations in the specified [begin, end) range of this block,
-/// calling the callback for each operation.
-void Block::walk(Block::iterator begin, Block::iterator end,
-                 const std::function<void(Operation *)> &callback) {
-  for (auto &op : llvm::make_early_inc_range(llvm::make_range(begin, end)))
-    op.walk(callback);
-}
-
-//===----------------------------------------------------------------------===//
 // Other
 //===----------------------------------------------------------------------===//
 
@@ -256,11 +235,11 @@ void Block::walk(Block::iterator begin, Block::iterator end,
 /// invalidated.
 Block *Block::splitBlock(iterator splitBefore) {
   // Start by creating a new basic block, and insert it immediate after this
-  // one in the containing function.
+  // one in the containing region.
   auto newBB = new Block();
-  getFunction()->getBlocks().insert(++Function::iterator(this), newBB);
+  getParent()->getBlocks().insert(std::next(Region::iterator(this)), newBB);
 
-  // Move all of the operations from the split point to the end of the function
+  // Move all of the operations from the split point to the end of the region
   // into the new block.
   newBB->getOperations().splice(newBB->end(), getOperations(), splitBefore,
                                 end());
@@ -268,106 +247,14 @@ Block *Block::splitBlock(iterator splitBefore) {
 }
 
 //===----------------------------------------------------------------------===//
-// Region
+// Predecessors
 //===----------------------------------------------------------------------===//
 
-Region::Region(Function *container) : container(container) {}
-
-Region::Region(Operation *container) : container(container) {}
-
-Region::~Region() {
-  // Operations may have cyclic references, which need to be dropped before we
-  // can start deleting them.
-  for (auto &bb : *this)
-    bb.dropAllReferences();
+Block *PredecessorIterator::unwrap(BlockOperand &value) {
+  return value.getOwner()->getBlock();
 }
 
-Operation *Region::getContainingOp() {
-  assert(!container.isNull() && "no container");
-  return container.dyn_cast<Operation *>();
-}
-
-Function *Region::getContainingFunction() {
-  assert(!container.isNull() && "no container");
-  return container.dyn_cast<Function *>();
-}
-
-/// Clone the internal blocks from this region into `dest`. Any
-/// cloned blocks are appended to the back of dest.
-void Region::cloneInto(Region *dest, BlockAndValueMapping &mapper,
-                       MLIRContext *context) {
-  assert(dest && "expected valid region to clone into");
-
-  // If the list is empty there is nothing to clone.
-  if (empty())
-    return;
-
-  iterator lastOldBlock = --dest->end();
-  for (Block &block : *this) {
-    Block *newBlock = new Block();
-    mapper.map(&block, newBlock);
-
-    // Clone the block arguments. The user might be deleting arguments to the
-    // block by specifying them in the mapper. If so, we don't add the
-    // argument to the cloned block.
-    for (auto *arg : block.getArguments())
-      if (!mapper.contains(arg))
-        mapper.map(arg, newBlock->addArgument(arg->getType()));
-
-    // Clone and remap the operations within this block.
-    for (auto &op : block)
-      newBlock->push_back(op.clone(mapper, context));
-
-    dest->push_back(newBlock);
-  }
-
-  // Now that each of the blocks have been cloned, go through and remap the
-  // operands of each of the operations.
-  auto remapOperands = [&](Operation *op) {
-    for (auto &operand : op->getOpOperands())
-      if (auto *mappedOp = mapper.lookupOrNull(operand.get()))
-        operand.set(mappedOp);
-    for (auto &succOp : op->getBlockOperands())
-      if (auto *mappedOp = mapper.lookupOrNull(succOp.get()))
-        succOp.set(mappedOp);
-  };
-
-  for (auto it = std::next(lastOldBlock), e = dest->end(); it != e; ++it)
-    it->walk(remapOperands);
-}
-
-Region *llvm::ilist_traits<::mlir::Block>::getContainingRegion() {
-  size_t Offset(
-      size_t(&((Region *)nullptr->*Region::getSublistAccess(nullptr))));
-  iplist<Block> *Anchor(static_cast<iplist<Block> *>(this));
-  return reinterpret_cast<Region *>(reinterpret_cast<char *>(Anchor) - Offset);
-}
-
-/// This is a trait method invoked when a basic block is added to a region.
-/// We keep the region pointer up to date.
-void llvm::ilist_traits<::mlir::Block>::addNodeToList(Block *block) {
-  assert(!block->getParent() && "already in a region!");
-  block->parentValidInstOrderPair.setPointer(getContainingRegion());
-}
-
-/// This is a trait method invoked when an operation is removed from a
-/// region.  We keep the region pointer up to date.
-void llvm::ilist_traits<::mlir::Block>::removeNodeFromList(Block *block) {
-  assert(block->getParent() && "not already in a region!");
-  block->parentValidInstOrderPair.setPointer(nullptr);
-}
-
-/// This is a trait method invoked when an operation is moved from one block
-/// to another.  We keep the block pointer up to date.
-void llvm::ilist_traits<::mlir::Block>::transferNodesFromList(
-    ilist_traits<Block> &otherList, block_iterator first, block_iterator last) {
-  // If we are transferring operations within the same function, the parent
-  // pointer doesn't need to be updated.
-  auto *curParent = getContainingRegion();
-  if (curParent == otherList.getContainingRegion())
-    return;
-
-  // Update the 'parent' member of each Block.
-  for (; first != last; ++first)
-    first->parentValidInstOrderPair.setPointer(curParent);
+/// Get the successor number in the predecessor terminator.
+unsigned PredecessorIterator::getSuccessorIndex() const {
+  return I->getOperandNumber();
 }

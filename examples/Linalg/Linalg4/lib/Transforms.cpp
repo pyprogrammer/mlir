@@ -23,7 +23,7 @@
 #include "linalg3/Intrinsics.h"
 #include "linalg3/TensorOps.h"
 
-#include "mlir/AffineOps/AffineOps.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
 #include "mlir/EDSC/Helpers.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Transforms/LoopUtils.h"
@@ -43,17 +43,16 @@ linalg::writeAsTiledLoops(Operation *op, ArrayRef<uint64_t> tileSizes) {
   return llvm::None;
 }
 
-void linalg::lowerToTiledLoops(mlir::Function *f,
-                               ArrayRef<uint64_t> tileSizes) {
-  f->walk([tileSizes](Operation *op) {
+void linalg::lowerToTiledLoops(mlir::FuncOp f, ArrayRef<uint64_t> tileSizes) {
+  f.walk([tileSizes](Operation *op) {
     if (writeAsTiledLoops(op, tileSizes).hasValue())
       op->erase();
   });
 }
 
 static bool isZeroIndex(Value *v) {
-  return v->getDefiningOp() && v->getDefiningOp()->isa<ConstantIndexOp>() &&
-         v->getDefiningOp()->dyn_cast<ConstantIndexOp>().getValue() == 0;
+  return isa_and_nonnull<ConstantIndexOp>(v->getDefiningOp()) &&
+         cast<ConstantIndexOp>(v->getDefiningOp()).getValue() == 0;
 }
 
 template <typename ConcreteOp>
@@ -73,7 +72,6 @@ makeTiledRanges(TensorContractionBase<ConcreteOp> &contraction,
     // 1. Take the first ivs results of the map, the other ones are not composed
     // but merely copied over.
     assert(map.getNumSymbols() == 0);
-    assert(map.getRangeSizes().empty());
     MLIRContext *context = ScopedContext::getContext();
     unsigned numParallel = op->getNumParallelDims();
     unsigned numReduction = op->getNumReductionDims();
@@ -93,7 +91,7 @@ makeTiledRanges(TensorContractionBase<ConcreteOp> &contraction,
     for (auto en : llvm::enumerate(map.getResults())) {
       auto index = en.index();
       auto expr = en.value();
-      AffineMap exprMap = AffineMap::get(numDims, 0, expr, {});
+      AffineMap exprMap = AffineMap::get(numDims, 0, expr);
       ValueHandle offset(makeFoldedComposedAffineApply(exprMap, ivs));
       // Offset is normally a function of loop induction variables.
       // If it is 0, it must come from a dimension that was not tiled.
@@ -149,24 +147,22 @@ writeContractionAsTiledViews(TensorContractionBase<ConcreteOp> &contraction,
          contraction.getNumParallelDims() + contraction.getNumReductionDims());
 
   auto *op = static_cast<ConcreteOp *>(&contraction);
-  ScopedContext scope(mlir::FuncBuilder(op->getOperation()), op->getLoc());
+  mlir::OpBuilder builder(op->getOperation());
+  ScopedContext scope(builder, op->getLoc());
   SmallVector<IndexHandle, 4> ivs(tileSizes.size());
-  auto pivs = IndexHandle::makeIndexHandlePointers(ivs);
+  auto pivs = makeIndexHandlePointers(ivs);
 
   // clang-format off
   using linalg::common::LoopNestRangeBuilder;
   auto ranges = makeGenericLoopRanges(operandRangesToLoopsMap(contraction),
                                       getRanges(contraction), tileSizes);
-  linalg::common::LoopNestRangeBuilder(pivs, ranges)({
+  linalg::common::LoopNestRangeBuilder(pivs, ranges)(
     [&contraction, &tileSizes, &ivs]() {
       SmallVector<Value *, 4> ivValues(ivs.begin(), ivs.end());
       auto views = makeTiledViews(contraction, ivValues, tileSizes);
-      ScopedContext::getBuilder()->create<ConcreteOp>(
+      ScopedContext::getBuilder().create<ConcreteOp>(
           ScopedContext::getLocation(), views);
-      /// NestedBuilders expect handles, we thus return an IndexHandle.
-      return IndexHandle();
-    }()
-  });
+    });
   // clang-format on
 
   SmallVector<mlir::AffineForOp, 8> res;
@@ -178,23 +174,23 @@ writeContractionAsTiledViews(TensorContractionBase<ConcreteOp> &contraction,
 
 llvm::Optional<SmallVector<mlir::AffineForOp, 8>>
 linalg::writeAsTiledViews(Operation *op, ArrayRef<Value *> tileSizes) {
-  if (auto matmulOp = op->dyn_cast<linalg::MatmulOp>()) {
+  if (auto matmulOp = dyn_cast<linalg::MatmulOp>(op)) {
     return writeContractionAsTiledViews(matmulOp, tileSizes);
-  } else if (auto matvecOp = op->dyn_cast<linalg::MatvecOp>()) {
+  } else if (auto matvecOp = dyn_cast<linalg::MatvecOp>(op)) {
     return writeContractionAsTiledViews(matvecOp, tileSizes);
-  } else if (auto dotOp = op->dyn_cast<linalg::DotOp>()) {
+  } else if (auto dotOp = dyn_cast<linalg::DotOp>(op)) {
     return writeContractionAsTiledViews(dotOp, tileSizes);
   }
   return llvm::None;
 }
 
-void linalg::lowerToTiledViews(mlir::Function *f, ArrayRef<Value *> tileSizes) {
-  f->walk([tileSizes](Operation *op) {
-    if (auto matmulOp = op->dyn_cast<linalg::MatmulOp>()) {
+void linalg::lowerToTiledViews(mlir::FuncOp f, ArrayRef<Value *> tileSizes) {
+  f.walk([tileSizes](Operation *op) {
+    if (auto matmulOp = dyn_cast<linalg::MatmulOp>(op)) {
       writeAsTiledViews(matmulOp, tileSizes);
-    } else if (auto matvecOp = op->dyn_cast<linalg::MatvecOp>()) {
+    } else if (auto matvecOp = dyn_cast<linalg::MatvecOp>(op)) {
       writeAsTiledViews(matvecOp, tileSizes);
-    } else if (auto dotOp = op->dyn_cast<linalg::DotOp>()) {
+    } else if (auto dotOp = dyn_cast<linalg::DotOp>(op)) {
       writeAsTiledViews(dotOp, tileSizes);
     } else {
       return;

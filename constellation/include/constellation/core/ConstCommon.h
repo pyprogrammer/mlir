@@ -37,19 +37,6 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"
 
-/// A basic function builder
-inline mlir::Function *makeFunction(mlir::Module &module, llvm::StringRef name,
-                                    llvm::ArrayRef<mlir::Type> types,
-                                    llvm::ArrayRef<mlir::Type> resultTypes) {
-    auto *context = module.getContext();
-    auto *function = new mlir::Function(
-            mlir::UnknownLoc::get(context), name,
-            mlir::FunctionType::get({types}, resultTypes, context));
-    function->addEntryBlock();
-    module.getFunctions().push_back(function);
-    return function;
-}
-
 /// A basic pass manager pre-populated with cleanup passes.
 inline std::unique_ptr<mlir::PassManager> cleanupPassManager() {
     std::unique_ptr<mlir::PassManager> pm(new mlir::PassManager());
@@ -60,7 +47,7 @@ inline std::unique_ptr<mlir::PassManager> cleanupPassManager() {
     return pm;
 }
 
-inline void cleanupAndPrintFunction(mlir::Function *f) {
+inline void cleanupAndPrintFunction(mlir::FuncOp *f) {
     bool printToOuts = true;
     auto check = [f, &printToOuts](mlir::LogicalResult result) {
         if (failed(result)) {

@@ -20,14 +20,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Analysis/SliceAnalysis.h"
-#include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/VectorAnalysis.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/LoopOps/LoopOps.h"
+#include "mlir/IR/Function.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/Functional.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/STLExtras.h"
-
 #include "llvm/ADT/SetVector.h"
-#include <type_traits>
 
 ///
 /// Implements Analysis functions specific to slicing in Function.
@@ -35,7 +36,6 @@
 
 using namespace mlir;
 
-using llvm::DenseSet;
 using llvm::SetVector;
 
 static void getForwardSliceImpl(Operation *op,
@@ -52,22 +52,21 @@ static void getForwardSliceImpl(Operation *op,
     return;
   }
 
-  if (auto forOp = op->dyn_cast<AffineForOp>()) {
-    for (auto &u : forOp.getInductionVar()->getUses()) {
-      auto *ownerInst = u.getOwner();
-      if (forwardSlice->count(ownerInst) == 0) {
+  if (auto forOp = dyn_cast<AffineForOp>(op)) {
+    for (auto *ownerInst : forOp.getInductionVar()->getUsers())
+      if (forwardSlice->count(ownerInst) == 0)
         getForwardSliceImpl(ownerInst, forwardSlice, filter);
-      }
-    }
+  } else if (auto forOp = dyn_cast<loop::ForOp>(op)) {
+    for (auto *ownerInst : forOp.getInductionVar()->getUsers())
+      if (forwardSlice->count(ownerInst) == 0)
+        getForwardSliceImpl(ownerInst, forwardSlice, filter);
   } else {
-    assert(op->getNumResults() <= 1 && "NYI: multiple results");
+    assert(op->getNumRegions() == 0 && "unexpected generic op with regions");
+    assert(op->getNumResults() <= 1 && "unexpected multiple results");
     if (op->getNumResults() > 0) {
-      for (auto &u : op->getResult(0)->getUses()) {
-        auto *ownerInst = u.getOwner();
-        if (forwardSlice->count(ownerInst) == 0) {
+      for (auto *ownerInst : op->getResult(0)->getUsers())
+        if (forwardSlice->count(ownerInst) == 0)
           getForwardSliceImpl(ownerInst, forwardSlice, filter);
-        }
-      }
     }
   }
 
@@ -91,9 +90,12 @@ void mlir::getForwardSlice(Operation *op, SetVector<Operation *> *forwardSlice,
 static void getBackwardSliceImpl(Operation *op,
                                  SetVector<Operation *> *backwardSlice,
                                  TransitiveFilter filter) {
-  if (!op) {
+  if (!op)
     return;
-  }
+
+  assert((op->getNumRegions() == 0 || isa<AffineForOp>(op) ||
+          isa<loop::ForOp>(op)) &&
+         "unexpected generic op with regions");
 
   // Evaluate whether we should keep this def.
   // This is useful in particular to implement scoping; i.e. return the
@@ -102,7 +104,24 @@ static void getBackwardSliceImpl(Operation *op,
     return;
   }
 
-  for (auto *operand : op->getOperands()) {
+  for (auto en : llvm::enumerate(op->getOperands())) {
+    auto *operand = en.value();
+    if (auto *blockArg = dyn_cast<BlockArgument>(operand)) {
+      if (auto affIv = getForInductionVarOwner(operand)) {
+        auto *affOp = affIv.getOperation();
+        if (backwardSlice->count(affOp) == 0)
+          getBackwardSliceImpl(affOp, backwardSlice, filter);
+      } else if (auto loopIv = loop::getForInductionVarOwner(operand)) {
+        auto *loopOp = loopIv.getOperation();
+        if (backwardSlice->count(loopOp) == 0)
+          getBackwardSliceImpl(loopOp, backwardSlice, filter);
+      } else if (blockArg->getOwner() !=
+                 &op->getParentOfType<FuncOp>().getBody().front()) {
+        op->emitError("unsupported CF for operand ") << en.index();
+        llvm_unreachable("Unsupported control flow");
+      }
+      continue;
+    }
     auto *op = operand->getDefiningOp();
     if (backwardSlice->count(op) == 0) {
       getBackwardSliceImpl(op, backwardSlice, filter);

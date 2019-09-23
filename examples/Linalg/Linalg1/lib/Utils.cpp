@@ -33,9 +33,9 @@ using namespace linalg::intrinsics;
 
 unsigned linalg::getViewRank(Value *view) {
   assert(view->getType().isa<ViewType>() && "expected a ViewType");
-  if (auto viewOp = view->getDefiningOp()->dyn_cast<ViewOp>())
+  if (auto viewOp = dyn_cast<ViewOp>(view->getDefiningOp()))
     return viewOp.getRank();
-  return view->getDefiningOp()->cast<SliceOp>().getRank();
+  return cast<SliceOp>(view->getDefiningOp()).getRank();
 }
 
 ViewOp linalg::emitAndReturnViewOpFromMemRef(Value *memRef) {
@@ -46,6 +46,6 @@ ViewOp linalg::emitAndReturnViewOpFromMemRef(Value *memRef) {
   for (unsigned i = 0; i < v.rank(); ++i) {
     indices[i] = range(v.lb(i), v.ub(i), constant_index(v.step(i)));
   }
-  return ScopedContext::getBuilder()->create<ViewOp>(
+  return ScopedContext::getBuilder().create<ViewOp>(
       ScopedContext::getLocation(), memRef, indices);
 }

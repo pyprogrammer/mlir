@@ -15,6 +15,10 @@
 // limitations under the License.
 // =============================================================================
 
+#include "mlir/Conversion/ControlFlowToCFG/ConvertControlFlowToCFG.h"
+#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h"
+#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVMPass.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/EDSC/Builders.h"
 #include "mlir/EDSC/Intrinsics.h"
 #include "mlir/IR/Attributes.h"
@@ -25,11 +29,11 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/StandardTypes.h"
 #include "mlir/IR/Types.h"
-#include "mlir/LLVMIR/LLVMDialect.h"
-#include "mlir/LLVMIR/Transforms.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/LowerAffine.h"
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/IR/DerivedTypes.h"
@@ -42,6 +46,7 @@
 #include "linalg1/ConvertToLLVMDialect.h"
 #include "linalg1/LLVMIntrinsics.h"
 #include "linalg1/Ops.h"
+#include "linalg1/Passes.h"
 
 using namespace mlir;
 
@@ -55,28 +60,19 @@ using namespace mlir;
 //     respective dynamic values.
 Type linalg::convertLinalgType(Type t) {
   auto *context = t.getContext();
-  auto *dialect =
-      static_cast<LLVM::LLVMDialect *>(context->getRegisteredDialect("llvm"));
+  auto *dialect = context->getRegisteredDialect<LLVM::LLVMDialect>();
 
   // Simple conversions.
   if (t.isa<IndexType>()) {
     int width = dialect->getLLVMModule().getDataLayout().getPointerSizeInBits();
-    auto *integerTy = llvm::IntegerType::get(dialect->getLLVMContext(), width);
-    return LLVM::LLVMType::get(context, integerTy);
+    return LLVM::LLVMType::getIntNTy(dialect, width);
   }
-  if (auto intTy = t.dyn_cast<IntegerType>()) {
-    int width = intTy.getWidth();
-    auto *integerTy = llvm::IntegerType::get(dialect->getLLVMContext(), width);
-    return LLVM::LLVMType::get(context, integerTy);
-  }
-  if (t.isF32()) {
-    auto *floatTy = llvm::Type::getFloatTy(dialect->getLLVMContext());
-    return LLVM::LLVMType::get(context, floatTy);
-  }
-  if (t.isF64()) {
-    auto *doubleTy = llvm::Type::getDoubleTy(dialect->getLLVMContext());
-    return LLVM::LLVMType::get(context, doubleTy);
-  }
+  if (auto intTy = t.dyn_cast<IntegerType>())
+    return LLVM::LLVMType::getIntNTy(dialect, intTy.getWidth());
+  if (t.isF32())
+    return LLVM::LLVMType::getFloatTy(dialect);
+  if (t.isF64())
+    return LLVM::LLVMType::getDoubleTy(dialect);
 
   // Range descriptor contains the range bounds and the step as 64-bit integers.
   //
@@ -86,9 +82,8 @@ Type linalg::convertLinalgType(Type t) {
   //   int64_t step;
   // };
   if (auto rangeTy = t.dyn_cast<linalg::RangeType>()) {
-    auto *int64Ty = llvm::Type::getInt64Ty(dialect->getLLVMContext());
-    auto *structTy = llvm::StructType::get(int64Ty, int64Ty, int64Ty);
-    return LLVM::LLVMType::get(context, structTy);
+    auto int64Ty = LLVM::LLVMType::getInt64Ty(dialect);
+    return LLVM::LLVMType::getStructTy(int64Ty, int64Ty, int64Ty);
   }
 
   // View descriptor contains the pointer to the data buffer, followed by a
@@ -115,46 +110,28 @@ Type linalg::convertLinalgType(Type t) {
   //   int64_t strides[Rank];
   // };
   if (auto viewTy = t.dyn_cast<linalg::ViewType>()) {
-    auto *elemTy = linalg::convertLinalgType(viewTy.getElementType())
-                       .cast<LLVM::LLVMType>()
-                       .getUnderlyingType()
-                       ->getPointerTo();
-    auto *int64Ty = llvm::Type::getInt64Ty(dialect->getLLVMContext());
-    auto *arrayTy = llvm::ArrayType::get(int64Ty, viewTy.getRank());
-    auto *structTy = llvm::StructType::get(elemTy, int64Ty, arrayTy, arrayTy);
-    return LLVM::LLVMType::get(context, structTy);
+    auto elemTy = linalg::convertLinalgType(viewTy.getElementType())
+                      .cast<LLVM::LLVMType>()
+                      .getPointerTo();
+    auto int64Ty = LLVM::LLVMType::getInt64Ty(dialect);
+    auto arrayTy = LLVM::LLVMType::getArrayTy(int64Ty, viewTy.getRank());
+    return LLVM::LLVMType::getStructTy(elemTy, int64Ty, arrayTy, arrayTy);
   }
 
   // All other types are kept as is.
   return t;
 }
 
-// Create an array attribute containing integer attributes with values provided
-// in `position`.
-static ArrayAttr makePositionAttr(FuncBuilder &builder,
-                                  ArrayRef<int> position) {
-  SmallVector<Attribute, 4> attrs;
-  attrs.reserve(position.size());
-  for (auto p : position)
-    attrs.push_back(builder.getIntegerAttr(builder.getIntegerType(64), p));
-  return builder.getArrayAttr(attrs);
-}
-
 // RangeOp creates a new range descriptor.
-class RangeOpConversion : public DialectOpConversion {
+class RangeOpConversion : public ConversionPattern {
 public:
   explicit RangeOpConversion(MLIRContext *context)
-      : DialectOpConversion(linalg::RangeOp::getOperationName(), 1, context) {}
+      : ConversionPattern(linalg::RangeOp::getOperationName(), 1, context) {}
 
-  PatternMatchResult match(Operation *op) const override {
-    if (op->isa<linalg::RangeOp>())
-      return matchSuccess();
-    return matchFailure();
-  }
-
-  SmallVector<Value *, 4> rewrite(Operation *op, ArrayRef<Value *> operands,
-                                  FuncBuilder &rewriter) const override {
-    auto rangeOp = op->cast<linalg::RangeOp>();
+  PatternMatchResult
+  matchAndRewrite(Operation *op, ArrayRef<Value *> operands,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto rangeOp = cast<linalg::RangeOp>(op);
     auto rangeDescriptorType =
         linalg::convertLinalgType(rangeOp.getResult()->getType());
 
@@ -164,29 +141,25 @@ public:
     // Fill in an aggregate value of the descriptor.
     Value *rangeDescriptor = undef(rangeDescriptorType);
     rangeDescriptor = insertvalue(rangeDescriptorType, rangeDescriptor,
-                                  operands[0], makePositionAttr(rewriter, 0));
+                                  operands[0], rewriter.getI64ArrayAttr(0));
     rangeDescriptor = insertvalue(rangeDescriptorType, rangeDescriptor,
-                                  operands[1], makePositionAttr(rewriter, 1));
+                                  operands[1], rewriter.getI64ArrayAttr(1));
     rangeDescriptor = insertvalue(rangeDescriptorType, rangeDescriptor,
-                                  operands[2], makePositionAttr(rewriter, 2));
-    return {rangeDescriptor};
+                                  operands[2], rewriter.getI64ArrayAttr(2));
+    rewriter.replaceOp(op, rangeDescriptor);
+    return matchSuccess();
   }
 };
 
-class ViewOpConversion : public DialectOpConversion {
+class ViewOpConversion : public ConversionPattern {
 public:
   explicit ViewOpConversion(MLIRContext *context)
-      : DialectOpConversion(linalg::ViewOp::getOperationName(), 1, context) {}
+      : ConversionPattern(linalg::ViewOp::getOperationName(), 1, context) {}
 
-  PatternMatchResult match(Operation *op) const override {
-    if (op->isa<linalg::ViewOp>())
-      return matchSuccess();
-    return matchFailure();
-  }
-
-  SmallVector<Value *, 4> rewrite(Operation *op, ArrayRef<Value *> operands,
-                                  FuncBuilder &rewriter) const override {
-    auto viewOp = op->cast<linalg::ViewOp>();
+  PatternMatchResult
+  matchAndRewrite(Operation *op, ArrayRef<Value *> operands,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto viewOp = cast<linalg::ViewOp>(op);
     auto viewDescriptorType = linalg::convertLinalgType(viewOp.getViewType());
     auto memrefType =
         viewOp.getSupportingMemRef()->getType().cast<MemRefType>();
@@ -194,8 +167,8 @@ public:
 
     // Helper function to create an integer array attribute out of a list of
     // values.
-    auto pos = [&rewriter](ArrayRef<int> values) {
-      return makePositionAttr(rewriter, values);
+    auto pos = [&rewriter](ArrayRef<int64_t> values) {
+      return rewriter.getI64ArrayAttr(values);
     };
 
     // Helper function to emit an LLVMIR Dialect 64-bit integer constant given
@@ -226,11 +199,9 @@ public:
       if (type.hasStaticShape())
         return memref;
 
-      auto elementTy = LLVM::LLVMType::get(
-          type.getContext(), linalg::convertLinalgType(type.getElementType())
-                                 .cast<LLVM::LLVMType>()
-                                 .getUnderlyingType()
-                                 ->getPointerTo());
+      auto elementTy = linalg::convertLinalgType(type.getElementType())
+                           .cast<LLVM::LLVMType>()
+                           .getPointerTo();
       return intrinsics::extractvalue(elementTy, memref, pos(0));
     };
 
@@ -301,35 +272,29 @@ public:
       ++i;
     }
 
-    return {viewDescriptor};
+    rewriter.replaceOp(op, viewDescriptor);
+    return matchSuccess();
   }
 };
 
-class SliceOpConversion : public DialectOpConversion {
+class SliceOpConversion : public ConversionPattern {
 public:
   explicit SliceOpConversion(MLIRContext *context)
-      : DialectOpConversion(linalg::SliceOp::getOperationName(), 1, context) {}
+      : ConversionPattern(linalg::SliceOp::getOperationName(), 1, context) {}
 
-  PatternMatchResult match(Operation *op) const override {
-    if (op->isa<linalg::SliceOp>())
-      return matchSuccess();
-    return matchFailure();
-  }
-
-  SmallVector<Value *, 4> rewrite(Operation *op, ArrayRef<Value *> operands,
-                                  FuncBuilder &rewriter) const override {
-    auto sliceOp = op->cast<linalg::SliceOp>();
+  PatternMatchResult
+  matchAndRewrite(Operation *op, ArrayRef<Value *> operands,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto sliceOp = cast<linalg::SliceOp>(op);
     auto newViewDescriptorType =
         linalg::convertLinalgType(sliceOp.getViewType());
-    auto elementType = rewriter.getType<LLVM::LLVMType>(
-        linalg::convertLinalgType(sliceOp.getElementType())
-            .cast<LLVM::LLVMType>()
-            .getUnderlyingType()
-            ->getPointerTo());
+    auto elementType = linalg::convertLinalgType(sliceOp.getElementType())
+                           .cast<LLVM::LLVMType>()
+                           .getPointerTo();
     auto int64Ty = linalg::convertLinalgType(rewriter.getIntegerType(64));
 
-    auto pos = [&rewriter](ArrayRef<int> values) {
-      return makePositionAttr(rewriter, values);
+    auto pos = [&rewriter](ArrayRef<int64_t> values) {
+      return rewriter.getI64ArrayAttr(values);
     };
 
     // First operand to `slice` is the old view descriptor.
@@ -398,118 +363,77 @@ public:
                                       stride, pos({3, i}));
     }
 
-    return {newViewDescriptor};
+    rewriter.replaceOp(op, newViewDescriptor);
+    return matchSuccess();
   }
 };
 
 // When converting the "some_consumer" operation, don't emit anything and
 // effectively drop it.
-class DropConsumer : public DialectOpConversion {
+class DropConsumer : public ConversionPattern {
 public:
   explicit DropConsumer(MLIRContext *context)
-      : DialectOpConversion("some_consumer", 1, context) {}
+      : ConversionPattern("some_consumer", 1, context) {}
 
-  PatternMatchResult match(Operation *op) const override {
-    if (op->getName().getStringRef() == "some_consumer")
-      return matchSuccess();
-    return matchFailure();
-  }
-
-  SmallVector<Value *, 4> rewrite(Operation *, ArrayRef<Value *>,
-                                  FuncBuilder &) const override {
-    return {};
+  PatternMatchResult
+  matchAndRewrite(Operation *op, ArrayRef<Value *> operands,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, llvm::None);
+    return matchSuccess();
   }
 };
 
-llvm::DenseSet<mlir::DialectOpConversion *>
-linalg::allocateDescriptorConverters(llvm::BumpPtrAllocator *allocator,
-                                     mlir::MLIRContext *context) {
-  return ConversionListBuilder<DropConsumer, RangeOpConversion,
-                               SliceOpConversion,
-                               ViewOpConversion>::build(allocator, context);
+void linalg::populateLinalg1ToLLVMConversionPatterns(
+    mlir::OwningRewritePatternList &patterns, mlir::MLIRContext *context) {
+  patterns.insert<DropConsumer, RangeOpConversion, SliceOpConversion,
+                  ViewOpConversion>(context);
 }
 
 namespace {
-// The conversion class from Linalg to LLVMIR.
-class Lowering : public DialectConversion {
-public:
-  explicit Lowering(std::function<llvm::DenseSet<mlir::DialectOpConversion *>(
-                        llvm::BumpPtrAllocator *, mlir::MLIRContext *context)>
-                        conversions)
-      : setup(conversions) {}
-
-protected:
-  // Initialize the list of converters.
-  llvm::DenseSet<DialectOpConversion *>
-  initConverters(MLIRContext *context) override {
-    converterStorage.Reset();
-    return setup(&converterStorage, context);
-  }
+/// A type conversion class that converts Linalg and Std types to LLVM.
+struct LinalgTypeConverter : public LLVMTypeConverter {
+  using LLVMTypeConverter::LLVMTypeConverter;
 
   // This gets called for block and region arguments, and attributes.
-  Type convertType(Type t) override { return linalg::convertLinalgType(t); }
-
-  // This gets called for function signatures.  Convert function arguments and
-  // results to the LLVM types, but keep the outer function type as built-in
-  // MLIR function type.  This does not support multi-result functions because
-  // LLVM does not.
-  FunctionType convertFunctionSignatureType(
-      FunctionType t, ArrayRef<NamedAttributeList> argAttrs,
-      SmallVectorImpl<NamedAttributeList> &convertedArgAttrs) override {
-    convertedArgAttrs.reserve(argAttrs.size());
-    convertedArgAttrs.insert(convertedArgAttrs.end(), argAttrs.begin(),
-                             argAttrs.end());
-
-    SmallVector<Type, 4> argTypes;
-    argTypes.reserve(t.getNumInputs());
-    for (auto ty : t.getInputs())
-      argTypes.push_back(linalg::convertLinalgType(ty));
-
-    SmallVector<Type, 1> resultTypes;
-    resultTypes.reserve(t.getNumResults());
-    for (auto ty : t.getResults())
-      resultTypes.push_back(linalg::convertLinalgType(ty));
-    assert(t.getNumResults() <= 1 && "NYI: multi-result functions");
-
-    return FunctionType::get(argTypes, resultTypes, t.getContext());
+  Type convertType(Type t) override {
+    if (auto result = LLVMTypeConverter::convertType(t))
+      return result;
+    return linalg::convertLinalgType(t);
   }
-
-private:
-  // Storage for individual converters.
-  llvm::BumpPtrAllocator converterStorage;
-
-  // Conversion setup.
-  std::function<llvm::DenseSet<mlir::DialectOpConversion *>(
-      llvm::BumpPtrAllocator *, mlir::MLIRContext *context)>
-      setup;
 };
 } // end anonymous namespace
 
-std::unique_ptr<mlir::DialectConversion> linalg::makeLinalgToLLVMLowering(
-    std::function<llvm::DenseSet<mlir::DialectOpConversion *>(
-        llvm::BumpPtrAllocator *, mlir::MLIRContext *context)>
-        initer) {
-  return llvm::make_unique<Lowering>(initer);
-}
-
-void linalg::convertToLLVM(mlir::Module &module) {
-  // Remove affine constructs if any by using an existing pass.
-  PassManager pm;
-  pm.addPass(createLowerAffinePass());
-  auto rr = pm.run(&module);
-  (void)rr;
-  assert(succeeded(rr) && "affine loop lowering failed");
-
+LogicalResult linalg::convertToLLVM(mlir::ModuleOp module) {
   // Convert Linalg ops to the LLVM IR dialect using the converter defined
   // above.
-  auto r = Lowering(allocateDescriptorConverters).convert(&module);
-  (void)r;
-  assert(succeeded(r) && "conversion failed");
+  LinalgTypeConverter converter(module.getContext());
+  OwningRewritePatternList patterns;
+  populateAffineToStdConversionPatterns(patterns, module.getContext());
+  populateLoopToStdConversionPatterns(patterns, module.getContext());
+  populateStdToLLVMConversionPatterns(converter, patterns);
+  populateLinalg1ToLLVMConversionPatterns(patterns, module.getContext());
 
-  // Convert the remaining standard MLIR operations to the LLVM IR dialect using
-  // the default converter.
-  auto converter = createStdToLLVMConverter();
-  r = converter->convert(&module);
-  (void)r;
-  assert(succeeded(r) && "second conversion failed");
+  ConversionTarget target(*module.getContext());
+  target.addLegalDialect<LLVM::LLVMDialect>();
+  target.addLegalOp<ModuleOp, ModuleTerminatorOp>();
+  target.addDynamicallyLegalOp<FuncOp>(
+      [&](FuncOp op) { return converter.isSignatureLegal(op.getType()); });
+  return applyFullConversion(module, target, patterns, &converter);
 }
+
+namespace {
+struct LowerLinalgToLLVMPass : public ModulePass<LowerLinalgToLLVMPass> {
+  void runOnModule() {
+    if (failed(linalg::convertToLLVM(getModule())))
+      signalPassFailure();
+  }
+};
+} // namespace
+
+OpPassBase<ModuleOp> *linalg::createLowerLinalgToLLVMPass() {
+  return new LowerLinalgToLLVMPass();
+}
+
+static PassRegistration<LowerLinalgToLLVMPass>
+    pass("lower-linalg-to-llvm",
+         "Lower the operations from the linalg dialect into the LLVM dialect");

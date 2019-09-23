@@ -26,11 +26,13 @@
 #include "toy/Passes.h"
 
 #include "linalg1/Dialect.h"
+#include "mlir/Analysis/Verifier.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Module.h"
 #include "mlir/Parser.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR.h"
 #include "mlir/Transforms/Passes.h"
@@ -101,8 +103,8 @@ std::unique_ptr<toy::ModuleAST> parseInputFile(llvm::StringRef filename) {
   return parser.ParseModule();
 }
 
-mlir::LogicalResult optimize(mlir::Module &module) {
-  mlir::PassManager pm;
+mlir::LogicalResult optimize(mlir::ModuleOp module) {
+  mlir::PassManager pm(module.getContext());
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(createShapeInferencePass());
   pm.addPass(mlir::createCanonicalizerPass());
@@ -111,11 +113,11 @@ mlir::LogicalResult optimize(mlir::Module &module) {
   // Apply any generic pass manager command line options.
   applyPassManagerCLOptions(pm);
 
-  return pm.run(&module);
+  return pm.run(module);
 }
 
-mlir::LogicalResult lowerDialect(mlir::Module &module, bool OnlyLinalg) {
-  mlir::PassManager pm;
+mlir::LogicalResult lowerDialect(mlir::ModuleOp module, bool OnlyLinalg) {
+  mlir::PassManager pm(module.getContext());
   pm.addPass(createEarlyLoweringPass());
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createCSEPass());
@@ -127,25 +129,14 @@ mlir::LogicalResult lowerDialect(mlir::Module &module, bool OnlyLinalg) {
   // Apply any generic pass manager command line options.
   applyPassManagerCLOptions(pm);
 
-  return pm.run(&module);
+  return pm.run(module);
 }
 
-mlir::LogicalResult lowerLLVMModule(mlir::Module &module) {
-  mlir::PassManager pm;
-  pm.addPass(createEarlyLoweringPass());
-  pm.addPass(createLateLoweringPass());
-
-  // Apply any generic pass manager command line options.
-  applyPassManagerCLOptions(pm);
-
-  return pm.run(&module);
-}
-
-std::unique_ptr<mlir::Module> loadFileAndProcessModule(
+mlir::OwningModuleRef loadFileAndProcessModule(
     mlir::MLIRContext &context, bool EnableLinalgLowering = false,
     bool EnableLLVMLowering = false, bool EnableOpt = false) {
 
-  std::unique_ptr<mlir::Module> module;
+  mlir::OwningModuleRef module;
   if (inputType == InputType::MLIR ||
       llvm::StringRef(inputFilename).endswith(".mlir")) {
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileOrErr =
@@ -156,12 +147,12 @@ std::unique_ptr<mlir::Module> loadFileAndProcessModule(
     }
     llvm::SourceMgr sourceMgr;
     sourceMgr.AddNewSourceBuffer(std::move(*fileOrErr), llvm::SMLoc());
-    module.reset(mlir::parseSourceFile(sourceMgr, &context));
+    module = mlir::parseSourceFile(sourceMgr, &context);
     if (!module) {
       llvm::errs() << "Error can't load file " << inputFilename << "\n";
       return nullptr;
     }
-    if (failed(module->verify())) {
+    if (failed(mlir::verify(*module))) {
       llvm::errs() << "Error verifying MLIR module\n";
       return nullptr;
     }
@@ -240,7 +231,8 @@ int dumpLLVMIR() {
   llvm::InitializeNativeTargetAsmPrinter();
   mlir::ExecutionEngine::setupTargetTriple(llvmModule.get());
   auto optPipeline = mlir::makeOptimizingTransformer(
-      /* optLevel=*/EnableOpt ? 3 : 0, /* sizeLevel=*/0);
+      /* optLevel=*/EnableOpt ? 3 : 0, /* sizeLevel=*/0,
+      /* targetMachine=*/nullptr);
   if (auto err = optPipeline(llvmModule.get())) {
     llvm::errs() << "Failed to optimize LLVM IR " << err << "\n";
     return -1;
@@ -259,14 +251,12 @@ int runJit() {
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
 
-  // Create an MLIR execution engine.  Note that it takes a null pass manager
-  // to make sure it won't run "default" passes on the MLIR that would trigger
-  // a second conversion to LLVM IR.  The execution engine eagerly JIT-compiles
+  // Create an MLIR execution engine. The execution engine eagerly JIT-compiles
   // the module.
   auto optPipeline = mlir::makeOptimizingTransformer(
-      /* optLevel=*/EnableOpt ? 3 : 0, /* sizeLevel=*/0);
-  auto maybeEngine =
-      mlir::ExecutionEngine::create(module.get(), /*pm=*/nullptr, optPipeline);
+      /* optLevel=*/EnableOpt ? 3 : 0, /* sizeLevel=*/0,
+      /* targetMachine=*/nullptr);
+  auto maybeEngine = mlir::ExecutionEngine::create(*module, optPipeline);
   assert(maybeEngine && "failed to construct an execution engine");
   auto &engine = maybeEngine.get();
 

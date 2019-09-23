@@ -24,6 +24,7 @@
 #include "toy/Parser.h"
 #include <memory>
 
+#include "mlir/Analysis/Verifier.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Module.h"
 #include "mlir/Parser.h"
@@ -79,7 +80,7 @@ int dumpMLIR() {
   mlir::registerDialect<ToyDialect>();
 
   mlir::MLIRContext context;
-  std::unique_ptr<mlir::Module> module;
+  mlir::OwningModuleRef module;
   if (inputType == InputType::MLIR ||
       llvm::StringRef(inputFilename).endswith(".mlir")) {
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileOrErr =
@@ -90,12 +91,12 @@ int dumpMLIR() {
     }
     llvm::SourceMgr sourceMgr;
     sourceMgr.AddNewSourceBuffer(std::move(*fileOrErr), llvm::SMLoc());
-    module.reset(mlir::parseSourceFile(sourceMgr, &context));
+    module = mlir::parseSourceFile(sourceMgr, &context);
     if (!module) {
       llvm::errs() << "Error can't load file " << inputFilename << "\n";
       return 3;
     }
-    if (failed(module->verify())) {
+    if (failed(mlir::verify(*module))) {
       llvm::errs() << "Error verifying MLIR module\n";
       return 4;
     }

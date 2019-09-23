@@ -33,8 +33,12 @@ namespace edsc {
 template <typename Load, typename Store> class TemplatedIndexedValue;
 
 // By default, edsc::IndexedValue provides an index notation around the affine
-// load and stores.
-using IndexedValue = TemplatedIndexedValue<intrinsics::load, intrinsics::store>;
+// load and stores. edsc::StdIndexedValue provides the standard load/store
+// counterpart.
+using IndexedValue =
+    TemplatedIndexedValue<intrinsics::affine_load, intrinsics::affine_store>;
+using StdIndexedValue =
+    TemplatedIndexedValue<intrinsics::std_load, intrinsics::std_store>;
 
 // Base class for MemRefView and VectorView.
 class View {
@@ -113,7 +117,8 @@ private:
 /// Assigning to an IndexedValue emits an actual `Store` operation, while
 /// converting an IndexedValue to a ValueHandle emits an actual `Load`
 /// operation.
-template <typename Load, typename Store> struct TemplatedIndexedValue {
+template <typename Load, typename Store> class TemplatedIndexedValue {
+public:
   explicit TemplatedIndexedValue(Type t) : base(t) {}
   explicit TemplatedIndexedValue(Value *v)
       : TemplatedIndexedValue(ValueHandle(v)) {}

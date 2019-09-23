@@ -1,4 +1,4 @@
-//===- Builders.cpp - MLIR Declarative Builder Classes ----------*- C++ -*-===//
+//===- Builders.cpp - MLIR Declarative Builder Classes --------------------===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -16,31 +16,40 @@
 // =============================================================================
 
 #include "mlir/EDSC/Builders.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
 #include "mlir/IR/AffineExpr.h"
-#include "mlir/StandardOps/Ops.h"
 
 #include "llvm/ADT/Optional.h"
 
 using namespace mlir;
 using namespace mlir::edsc;
 
-mlir::edsc::ScopedContext::ScopedContext(Function *fun, Location *loc)
-    : builder(fun), location(loc ? *loc : fun->getLoc()),
-      enclosingScopedContext(ScopedContext::getCurrentScopedContext()),
-      nestedBuilder(nullptr) {
-  getCurrentScopedContext() = this;
-}
-
-mlir::edsc::ScopedContext::ScopedContext(FuncBuilder builder, Location location)
+mlir::edsc::ScopedContext::ScopedContext(OpBuilder &builder, Location location)
     : builder(builder), location(location),
       enclosingScopedContext(ScopedContext::getCurrentScopedContext()),
       nestedBuilder(nullptr) {
   getCurrentScopedContext() = this;
 }
 
+/// Sets the insertion point of the builder to 'newInsertPt' for the duration
+/// of the scope. The existing insertion point of the builder is restored on
+/// destruction.
+mlir::edsc::ScopedContext::ScopedContext(OpBuilder &builder,
+                                         OpBuilder::InsertPoint newInsertPt,
+                                         Location location)
+    : builder(builder), prevBuilderInsertPoint(builder.saveInsertionPoint()),
+      location(location),
+      enclosingScopedContext(ScopedContext::getCurrentScopedContext()),
+      nestedBuilder(nullptr) {
+  getCurrentScopedContext() = this;
+  builder.restoreInsertionPoint(newInsertPt);
+}
+
 mlir::edsc::ScopedContext::~ScopedContext() {
   assert(!nestedBuilder &&
          "Active NestedBuilder must have been exited at this point!");
+  if (prevBuilderInsertPoint)
+    builder.restoreInsertionPoint(*prevBuilderInsertPoint);
   getCurrentScopedContext() = enclosingScopedContext;
 }
 
@@ -49,10 +58,10 @@ ScopedContext *&mlir::edsc::ScopedContext::getCurrentScopedContext() {
   return context;
 }
 
-FuncBuilder *mlir::edsc::ScopedContext::getBuilder() {
+OpBuilder &mlir::edsc::ScopedContext::getBuilder() {
   assert(ScopedContext::getCurrentScopedContext() &&
          "Unexpected Null ScopedContext");
-  return &ScopedContext::getCurrentScopedContext()->builder;
+  return ScopedContext::getCurrentScopedContext()->builder;
 }
 
 Location mlir::edsc::ScopedContext::getLocation() {
@@ -62,14 +71,13 @@ Location mlir::edsc::ScopedContext::getLocation() {
 }
 
 MLIRContext *mlir::edsc::ScopedContext::getContext() {
-  assert(getBuilder() && "Unexpected null builder");
-  return getBuilder()->getContext();
+  return getBuilder().getContext();
 }
 
 mlir::edsc::ValueHandle::ValueHandle(index_t cst) {
-  auto *b = ScopedContext::getBuilder();
+  auto &b = ScopedContext::getBuilder();
   auto loc = ScopedContext::getLocation();
-  v = b->create<ConstantIndexOp>(loc, cst.v).getResult();
+  v = b.create<ConstantIndexOp>(loc, cst.v).getResult();
   t = v->getType();
 }
 
@@ -83,7 +91,6 @@ ValueHandle &mlir::edsc::ValueHandle::operator=(const ValueHandle &other) {
 ValueHandle
 mlir::edsc::ValueHandle::createComposedAffineApply(AffineMap map,
                                                    ArrayRef<Value *> operands) {
-  assert(ScopedContext::getBuilder() && "Unexpected null builder");
   Operation *op =
       makeComposedAffineApply(ScopedContext::getBuilder(),
                               ScopedContext::getLocation(), map, operands)
@@ -100,7 +107,7 @@ ValueHandle ValueHandle::create(StringRef name, ArrayRef<ValueHandle> operands,
   if (op->getNumResults() == 1) {
     return ValueHandle(op->getResult(0));
   }
-  if (auto f = op->dyn_cast<AffineForOp>()) {
+  if (auto f = dyn_cast<AffineForOp>(op)) {
     return ValueHandle(f.getInductionVar());
   }
   llvm_unreachable("unsupported operation, use an OperationHandle instead");
@@ -110,26 +117,25 @@ OperationHandle OperationHandle::create(StringRef name,
                                         ArrayRef<ValueHandle> operands,
                                         ArrayRef<Type> resultTypes,
                                         ArrayRef<NamedAttribute> attributes) {
-  OperationState state(ScopedContext::getContext(),
-                       ScopedContext::getLocation(), name);
+  OperationState state(ScopedContext::getLocation(), name);
   SmallVector<Value *, 4> ops(operands.begin(), operands.end());
   state.addOperands(ops);
   state.addTypes(resultTypes);
   for (const auto &attr : attributes) {
     state.addAttribute(attr.first, attr.second);
   }
-  return OperationHandle(ScopedContext::getBuilder()->createOperation(state));
+  return OperationHandle(ScopedContext::getBuilder().createOperation(state));
 }
 
 BlockHandle mlir::edsc::BlockHandle::create(ArrayRef<Type> argTypes) {
-  auto *currentB = ScopedContext::getBuilder();
-  auto *ib = currentB->getInsertionBlock();
-  auto ip = currentB->getInsertionPoint();
+  auto &currentB = ScopedContext::getBuilder();
+  auto *ib = currentB.getInsertionBlock();
+  auto ip = currentB.getInsertionPoint();
   BlockHandle res;
-  res.block = ScopedContext::getBuilder()->createBlock();
+  res.block = ScopedContext::getBuilder().createBlock(ib->getParent());
   // createBlock sets the insertion point inside the block.
   // We do not want this behavior when using declarative builders with nesting.
-  currentB->setInsertionPoint(ib, ip);
+  currentB.setInsertionPoint(ib, ip);
   for (auto t : argTypes) {
     res.block->addArgument(t);
   }
@@ -147,8 +153,8 @@ static llvm::Optional<ValueHandle> emitStaticFor(ArrayRef<ValueHandle> lbs,
   if (!lbDef || !ubDef)
     return llvm::Optional<ValueHandle>();
 
-  auto lbConst = lbDef->dyn_cast<ConstantIndexOp>();
-  auto ubConst = ubDef->dyn_cast<ConstantIndexOp>();
+  auto lbConst = dyn_cast<ConstantIndexOp>(lbDef);
+  auto ubConst = dyn_cast<ConstantIndexOp>(ubDef);
   if (!lbConst || !ubConst)
     return llvm::Optional<ValueHandle>();
 
@@ -166,8 +172,8 @@ mlir::edsc::LoopBuilder::LoopBuilder(ValueHandle *iv,
     SmallVector<Value *, 4> lbs(lbHandles.begin(), lbHandles.end());
     SmallVector<Value *, 4> ubs(ubHandles.begin(), ubHandles.end());
     *iv = ValueHandle::create<AffineForOp>(
-        lbs, ScopedContext::getBuilder()->getMultiDimIdentityMap(lbs.size()),
-        ubs, ScopedContext::getBuilder()->getMultiDimIdentityMap(ubs.size()),
+        lbs, ScopedContext::getBuilder().getMultiDimIdentityMap(lbs.size()),
+        ubs, ScopedContext::getBuilder().getMultiDimIdentityMap(ubs.size()),
         step);
   }
   auto *body = getForInductionVarOwner(iv->getValue()).getBody();
@@ -175,7 +181,7 @@ mlir::edsc::LoopBuilder::LoopBuilder(ValueHandle *iv,
 }
 
 ValueHandle
-mlir::edsc::LoopBuilder::operator()(ArrayRef<CapturableHandle> stmts) {
+mlir::edsc::LoopBuilder::operator()(llvm::function_ref<void(void)> fun) {
   // Call to `exit` must be explicit and asymmetric (cannot happen in the
   // destructor) because of ordering wrt comma operator.
   /// The particular use case concerns nested blocks:
@@ -194,6 +200,8 @@ mlir::edsc::LoopBuilder::operator()(ArrayRef<CapturableHandle> stmts) {
   ///      }),
   ///    });
   /// ```
+  if (fun)
+    fun();
   exit();
   return ValueHandle::null();
 }
@@ -212,14 +220,16 @@ mlir::edsc::LoopNestBuilder::LoopNestBuilder(ArrayRef<ValueHandle *> ivs,
 }
 
 ValueHandle
-mlir::edsc::LoopNestBuilder::operator()(ArrayRef<CapturableHandle> stmts) {
+mlir::edsc::LoopNestBuilder::operator()(llvm::function_ref<void(void)> fun) {
+  if (fun)
+    fun();
   // Iterate on the calling operator() on all the loops in the nest.
   // The iteration order is from innermost to outermost because enter/exit needs
   // to be asymmetric (i.e. enter() occurs on LoopBuilder construction, exit()
   // occurs on calling operator()). The asymmetry is required for properly
   // nesting imperfectly nested regions (see LoopBuilder::operator()).
   for (auto lit = loops.rbegin(), eit = loops.rend(); lit != eit; ++lit) {
-    (*lit)({});
+    (*lit)();
   }
   return ValueHandle::null();
 }
@@ -248,9 +258,11 @@ mlir::edsc::BlockBuilder::BlockBuilder(BlockHandle *bh,
 
 /// Only serves as an ordering point between entering nested block and creating
 /// stmts.
-void mlir::edsc::BlockBuilder::operator()(ArrayRef<CapturableHandle> stmts) {
+void mlir::edsc::BlockBuilder::operator()(llvm::function_ref<void(void)> fun) {
   // Call to `exit` must be explicit and asymmetric (cannot happen in the
   // destructor) because of ordering wrt comma operator.
+  if (fun)
+    fun();
   exit();
 }
 
@@ -295,7 +307,7 @@ static ValueHandle createBinaryIndexHandle(
   if (v1) {
     operands.push_back(v1);
   }
-  auto map = AffineMap::get(numDims, numSymbols, {affCombiner(d0, d1)}, {});
+  auto map = AffineMap::get(numDims, numSymbols, {affCombiner(d0, d1)});
   // TODO: createOrFold when available.
   return ValueHandle::createComposedAffineApply(map, operands);
 }
@@ -315,7 +327,8 @@ static ValueHandle createBinaryHandle(
     return createBinaryHandle<IOp>(lhs, rhs);
   } else if (thisType.isa<FloatType>()) {
     return createBinaryHandle<FOp>(lhs, rhs);
-  } else if (auto aggregateType = thisType.dyn_cast<VectorOrTensorType>()) {
+  } else if (thisType.isa<VectorType>() || thisType.isa<TensorType>()) {
+    auto aggregateType = thisType.cast<ShapedType>();
     if (aggregateType.getElementType().isa<IntegerType>())
       return createBinaryHandle<IOp>(lhs, rhs);
     else if (aggregateType.getElementType().isa<FloatType>())
@@ -376,8 +389,8 @@ ValueHandle mlir::edsc::op::operator||(ValueHandle lhs, ValueHandle rhs) {
   return !(!lhs && !rhs);
 }
 
-static ValueHandle createComparisonExpr(CmpIPredicate predicate,
-                                        ValueHandle lhs, ValueHandle rhs) {
+static ValueHandle createIComparisonExpr(CmpIPredicate predicate,
+                                         ValueHandle lhs, ValueHandle rhs) {
   auto lhsType = lhs.getType();
   auto rhsType = rhs.getType();
   (void)lhsType;
@@ -386,27 +399,61 @@ static ValueHandle createComparisonExpr(CmpIPredicate predicate,
   assert((lhsType.isa<IndexType>() || lhsType.isa<IntegerType>()) &&
          "only integer comparisons are supported");
 
-  auto op = ScopedContext::getBuilder()->create<CmpIOp>(
+  auto op = ScopedContext::getBuilder().create<CmpIOp>(
       ScopedContext::getLocation(), predicate, lhs.getValue(), rhs.getValue());
   return ValueHandle(op.getResult());
 }
 
+static ValueHandle createFComparisonExpr(CmpFPredicate predicate,
+                                         ValueHandle lhs, ValueHandle rhs) {
+  auto lhsType = lhs.getType();
+  auto rhsType = rhs.getType();
+  (void)lhsType;
+  (void)rhsType;
+  assert(lhsType == rhsType && "cannot mix types in operators");
+  assert(lhsType.isa<FloatType>() && "only float comparisons are supported");
+
+  auto op = ScopedContext::getBuilder().create<CmpFOp>(
+      ScopedContext::getLocation(), predicate, lhs.getValue(), rhs.getValue());
+  return ValueHandle(op.getResult());
+}
+
+// All floating point comparison are ordered through EDSL
 ValueHandle mlir::edsc::op::operator==(ValueHandle lhs, ValueHandle rhs) {
-  return createComparisonExpr(CmpIPredicate::EQ, lhs, rhs);
+  auto type = lhs.getType();
+  return type.isa<FloatType>()
+             ? createFComparisonExpr(CmpFPredicate::OEQ, lhs, rhs)
+             : createIComparisonExpr(CmpIPredicate::EQ, lhs, rhs);
 }
 ValueHandle mlir::edsc::op::operator!=(ValueHandle lhs, ValueHandle rhs) {
-  return createComparisonExpr(CmpIPredicate::NE, lhs, rhs);
+  auto type = lhs.getType();
+  return type.isa<FloatType>()
+             ? createFComparisonExpr(CmpFPredicate::ONE, lhs, rhs)
+             : createIComparisonExpr(CmpIPredicate::NE, lhs, rhs);
 }
 ValueHandle mlir::edsc::op::operator<(ValueHandle lhs, ValueHandle rhs) {
-  // TODO(ntv,zinenko): signed by default, how about unsigned?
-  return createComparisonExpr(CmpIPredicate::SLT, lhs, rhs);
+  auto type = lhs.getType();
+  return type.isa<FloatType>()
+             ? createFComparisonExpr(CmpFPredicate::OLT, lhs, rhs)
+             :
+             // TODO(ntv,zinenko): signed by default, how about unsigned?
+             createIComparisonExpr(CmpIPredicate::SLT, lhs, rhs);
 }
 ValueHandle mlir::edsc::op::operator<=(ValueHandle lhs, ValueHandle rhs) {
-  return createComparisonExpr(CmpIPredicate::SLE, lhs, rhs);
+  auto type = lhs.getType();
+  return type.isa<FloatType>()
+             ? createFComparisonExpr(CmpFPredicate::OLE, lhs, rhs)
+             : createIComparisonExpr(CmpIPredicate::SLE, lhs, rhs);
 }
 ValueHandle mlir::edsc::op::operator>(ValueHandle lhs, ValueHandle rhs) {
-  return createComparisonExpr(CmpIPredicate::SGT, lhs, rhs);
+  auto type = lhs.getType();
+  return type.isa<FloatType>()
+             ? createFComparisonExpr(CmpFPredicate::OGT, lhs, rhs)
+             : createIComparisonExpr(CmpIPredicate::SGT, lhs, rhs);
 }
 ValueHandle mlir::edsc::op::operator>=(ValueHandle lhs, ValueHandle rhs) {
-  return createComparisonExpr(CmpIPredicate::SGE, lhs, rhs);
+  auto type = lhs.getType();
+  return type.isa<FloatType>()
+             ? createFComparisonExpr(CmpFPredicate::OGE, lhs, rhs)
+             : createIComparisonExpr(CmpIPredicate::SGE, lhs, rhs);
 }

@@ -16,7 +16,7 @@
 // =============================================================================
 
 #include "mlir/IR/Value.h"
-#include "mlir/IR/Function.h"
+#include "mlir/IR/Block.h"
 #include "mlir/IR/Operation.h"
 using namespace mlir;
 
@@ -28,21 +28,21 @@ Operation *Value::getDefiningOp() {
   return nullptr;
 }
 
-/// Return the function that this Value is defined in.
-Function *Value::getFunction() {
-  switch (getKind()) {
-  case Value::Kind::BlockArgument:
-    return cast<BlockArgument>(this)->getFunction();
-  case Value::Kind::OpResult:
-    return getDefiningOp()->getFunction();
-  }
+Location Value::getLoc() {
+  if (auto *op = getDefiningOp())
+    return op->getLoc();
+  return UnknownLoc::get(getContext());
 }
 
-Location Value::getLoc() {
-  if (auto *op = getDefiningOp()) {
-    return op->getLoc();
+/// Return the Region in which this Value is defined.
+Region *Value::getParentRegion() {
+  switch (getKind()) {
+  case Value::Kind::BlockArgument:
+    return cast<BlockArgument>(this)->getOwner()->getParent();
+  case Value::Kind::OpResult:
+    return getDefiningOp()->getParentRegion();
   }
-  return UnknownLoc::get(getContext());
+  llvm_unreachable("Unknown Value Kind");
 }
 
 //===----------------------------------------------------------------------===//
@@ -64,21 +64,4 @@ void IRObjectWithUseList::dropAllUses() {
   while (!use_empty()) {
     use_begin()->drop();
   }
-}
-
-//===----------------------------------------------------------------------===//
-// BlockArgument implementation.
-//===----------------------------------------------------------------------===//
-
-/// Return the function that this argument is defined in.
-Function *BlockArgument::getFunction() {
-  if (auto *owner = getOwner())
-    return owner->getFunction();
-  return nullptr;
-}
-
-/// Returns if the current argument is a function argument.
-bool BlockArgument::isFunctionArgument() {
-  auto *containingFn = getFunction();
-  return containingFn && &containingFn->front() == getOwner();
 }

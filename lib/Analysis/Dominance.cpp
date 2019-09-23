@@ -1,4 +1,4 @@
-//===- Dominance.cpp - Dominator analysis for functions -------------------===//
+//===- Dominance.cpp - Dominator analysis for CFGs ------------------------===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -23,6 +23,7 @@
 #include "mlir/Analysis/Dominance.h"
 #include "mlir/IR/Operation.h"
 #include "llvm/Support/GenericDomTreeConstruction.h"
+
 using namespace mlir;
 using namespace mlir::detail;
 
@@ -34,24 +35,17 @@ template class llvm::DomTreeNodeBase<Block>;
 // DominanceInfoBase
 //===----------------------------------------------------------------------===//
 
-/// Recalculate the dominance info for the provided function.
 template <bool IsPostDom>
-void DominanceInfoBase<IsPostDom>::recalculate(Function *function) {
+void DominanceInfoBase<IsPostDom>::recalculate(Operation *op) {
   dominanceInfos.clear();
 
-  // Build the top level function dominance.
-  auto functionDominance = llvm::make_unique<base>();
-  functionDominance->recalculate(function->getBody());
-  dominanceInfos.try_emplace(&function->getBody(),
-                             std::move(functionDominance));
-
   /// Build the dominance for each of the operation regions.
-  function->walk([&](Operation *op) {
+  op->walk([&](Operation *op) {
     for (auto &region : op->getRegions()) {
       // Don't compute dominance if the region is empty.
       if (region.empty())
         continue;
-      auto opDominance = llvm::make_unique<base>();
+      auto opDominance = std::make_unique<base>();
       opDominance->recalculate(region);
       dominanceInfos.try_emplace(&region, std::move(opDominance));
     }
@@ -65,6 +59,10 @@ bool DominanceInfoBase<IsPostDom>::properlyDominates(Block *a, Block *b) {
   if (a == b)
     return false;
 
+  // If either a or b are null, then conservatively return false.
+  if (!a || !b)
+    return false;
+
   // If both blocks are not in the same region, 'a' properly dominates 'b' if
   // 'b' is defined in an operation region that (recursively) ends up being
   // dominated by 'a'. Walk up the list of containers enclosing B.
@@ -72,10 +70,10 @@ bool DominanceInfoBase<IsPostDom>::properlyDominates(Block *a, Block *b) {
   if (regionA != regionB) {
     Operation *bAncestor;
     do {
-      bAncestor = regionB->getContainingOp();
-      // If 'bAncestor' is the top level function, then 'a' is a block
-      // that post dominates 'b'.
-      if (!bAncestor)
+      bAncestor = regionB->getParentOp();
+      // If 'bAncestor' is the top level region, then 'a' is a block that post
+      // dominates 'b'.
+      if (!bAncestor || !bAncestor->getBlock())
         return IsPostDom;
 
       regionB = bAncestor->getBlock()->getParent();
@@ -88,8 +86,12 @@ bool DominanceInfoBase<IsPostDom>::properlyDominates(Block *a, Block *b) {
   }
 
   // Otherwise, use the standard dominance functionality.
+
+  // If we don't have a dominance information for this region, assume that b is
+  // dominated by anything.
   auto baseInfoIt = dominanceInfos.find(regionA);
-  assert(baseInfoIt != dominanceInfos.end() && "region info not found");
+  if (baseInfoIt == dominanceInfos.end())
+    return true;
   return baseInfoIt->second->properlyDominates(a, b);
 }
 
@@ -103,6 +105,10 @@ template class mlir::detail::DominanceInfoBase</*IsPostDom=*/false>;
 /// Return true if operation A properly dominates operation B.
 bool DominanceInfo::properlyDominates(Operation *a, Operation *b) {
   auto *aBlock = a->getBlock(), *bBlock = b->getBlock();
+
+  // If a or b are not within a block, then a does not dominate b.
+  if (!aBlock || !bBlock)
+    return false;
 
   // If the blocks are the same, then check if b is before a in the block.
   if (aBlock == bBlock)
@@ -122,8 +128,14 @@ bool DominanceInfo::properlyDominates(Operation *a, Operation *b) {
 
 /// Return true if value A properly dominates operation B.
 bool DominanceInfo::properlyDominates(Value *a, Operation *b) {
-  if (auto *aInst = a->getDefiningOp())
+  if (auto *aInst = a->getDefiningOp()) {
+    // The values defined by an operation do *not* dominate any nested
+    // operations.
+    if (aInst->getParentRegion() != b->getParentRegion() &&
+        aInst->isAncestor(b))
+      return false;
     return properlyDominates(aInst, b);
+  }
 
   // block arguments properly dominate all operations in their own block, so
   // we use a dominates check here, not a properlyDominates check.
@@ -137,6 +149,10 @@ bool DominanceInfo::properlyDominates(Value *a, Operation *b) {
 /// Returns true if statement 'a' properly postdominates statement b.
 bool PostDominanceInfo::properlyPostDominates(Operation *a, Operation *b) {
   auto *aBlock = a->getBlock(), *bBlock = b->getBlock();
+
+  // If a or b are not within a block, then a does not post dominate b.
+  if (!aBlock || !bBlock)
+    return false;
 
   // If the blocks are the same, check if b is before a in the block.
   if (aBlock == bBlock)

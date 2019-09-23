@@ -22,12 +22,10 @@
 
 #include "mlir/Analysis/Utils.h"
 
-#include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/AffineAnalysis.h"
-#include "mlir/Analysis/AffineStructures.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/StandardOps/Ops.h"
-#include "llvm/ADT/DenseMap.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -44,8 +42,8 @@ void mlir::getLoopIVs(Operation &op, SmallVectorImpl<AffineForOp> *loops) {
   AffineForOp currAffineForOp;
   // Traverse up the hierarchy collecing all 'affine.for' operation while
   // skipping over 'affine.if' operations.
-  while (currOp && ((currAffineForOp = currOp->dyn_cast<AffineForOp>()) ||
-                    currOp->isa<AffineIfOp>())) {
+  while (currOp && ((currAffineForOp = dyn_cast<AffineForOp>(currOp)) ||
+                    isa<AffineIfOp>(currOp))) {
     if (currAffineForOp)
       loops->push_back(currAffineForOp);
     currOp = currOp->getParentOp();
@@ -170,8 +168,10 @@ LogicalResult MemRefRegion::unionBoundingBox(const MemRefRegion &other) {
 // TODO(bondhugula): extend this to any other memref dereferencing ops
 // (dma_start, dma_wait).
 LogicalResult MemRefRegion::compute(Operation *op, unsigned loopDepth,
-                                    ComputationSliceState *sliceState) {
-  assert((op->isa<LoadOp>() || op->isa<StoreOp>()) && "load/store op expected");
+                                    ComputationSliceState *sliceState,
+                                    bool addMemRefDimBounds) {
+  assert((isa<AffineLoadOp>(op) || isa<AffineStoreOp>(op)) &&
+         "affine load/store op expected");
 
   MemRefAccess access(op);
   memref = access.memref;
@@ -238,7 +238,7 @@ LogicalResult MemRefRegion::compute(Operation *op, unsigned loopDepth,
       assert(isValidSymbol(symbol));
       // Check if the symbol is a constant.
       if (auto *op = symbol->getDefiningOp()) {
-        if (auto constOp = op->dyn_cast<ConstantIndexOp>()) {
+        if (auto constOp = dyn_cast<ConstantIndexOp>(op)) {
           cst.setIdToConstant(*symbol, constOp.getValue());
         }
       }
@@ -298,6 +298,20 @@ LogicalResult MemRefRegion::compute(Operation *op, unsigned loopDepth,
 
   assert(cst.getNumDimIds() == rank && "unexpected MemRefRegion format");
 
+  // Add upper/lower bounds for each memref dimension with static size
+  // to guard against potential over-approximation from projection.
+  // TODO(andydavis) Support dynamic memref dimensions.
+  if (addMemRefDimBounds) {
+    auto memRefType = memref->getType().cast<MemRefType>();
+    for (unsigned r = 0; r < rank; r++) {
+      cst.addConstantLowerBound(r, 0);
+      int64_t dimSize = memRefType.getDimSize(r);
+      if (ShapedType::isDynamic(dimSize))
+        continue;
+      cst.addConstantUpperBound(r, dimSize - 1);
+    }
+  }
+
   LLVM_DEBUG(llvm::dbgs() << "Memory region:\n");
   LLVM_DEBUG(cst.dump());
   return success();
@@ -349,7 +363,7 @@ Optional<int64_t> MemRefRegion::getRegionSize() {
 /// size of the vector as well.
 //  TODO(mlir-team): improve/complete this when we have target data.
 Optional<uint64_t> mlir::getMemRefSizeInBytes(MemRefType memRefType) {
-  if (memRefType.getNumDynamicDims() > 0)
+  if (!memRefType.hasStaticShape())
     return None;
   auto elementType = memRefType.getElementType();
   if (!elementType.isIntOrFloat() && !elementType.isa<VectorType>())
@@ -365,14 +379,14 @@ Optional<uint64_t> mlir::getMemRefSizeInBytes(MemRefType memRefType) {
 template <typename LoadOrStoreOpPointer>
 LogicalResult mlir::boundCheckLoadOrStoreOp(LoadOrStoreOpPointer loadOrStoreOp,
                                             bool emitError) {
-  static_assert(std::is_same<LoadOrStoreOpPointer, LoadOp>::value ||
-                    std::is_same<LoadOrStoreOpPointer, StoreOp>::value,
-                "argument should be either a LoadOp or a StoreOp");
+  static_assert(std::is_same<LoadOrStoreOpPointer, AffineLoadOp>::value ||
+                    std::is_same<LoadOrStoreOpPointer, AffineStoreOp>::value,
+                "argument should be either a AffineLoadOp or a AffineStoreOp");
 
   Operation *opInst = loadOrStoreOp.getOperation();
-
   MemRefRegion region(opInst->getLoc());
-  if (failed(region.compute(opInst, /*loopDepth=*/0)))
+  if (failed(region.compute(opInst, /*loopDepth=*/0, /*sliceState=*/nullptr,
+                            /*addMemRefDimBounds=*/false)))
     return success();
 
   LLVM_DEBUG(llvm::dbgs() << "Memory region");
@@ -398,8 +412,8 @@ LogicalResult mlir::boundCheckLoadOrStoreOp(LoadOrStoreOpPointer loadOrStoreOp,
     ucst.addConstantLowerBound(r, dimSize);
     outOfBounds = !ucst.isEmpty();
     if (outOfBounds && emitError) {
-      loadOrStoreOp.emitOpError(
-          "memref out of upper bound access along dimension #" + Twine(r + 1));
+      loadOrStoreOp.emitOpError()
+          << "memref out of upper bound access along dimension #" << (r + 1);
     }
 
     // Check for a negative index.
@@ -409,17 +423,17 @@ LogicalResult mlir::boundCheckLoadOrStoreOp(LoadOrStoreOpPointer loadOrStoreOp,
     lcst.addConstantUpperBound(r, -1);
     outOfBounds = !lcst.isEmpty();
     if (outOfBounds && emitError) {
-      loadOrStoreOp.emitOpError(
-          "memref out of lower bound access along dimension #" + Twine(r + 1));
+      loadOrStoreOp.emitOpError()
+          << "memref out of lower bound access along dimension #" << (r + 1);
     }
   }
   return failure(outOfBounds);
 }
 
 // Explicitly instantiate the template so that the compiler knows we need them!
-template LogicalResult mlir::boundCheckLoadOrStoreOp(LoadOp loadOp,
+template LogicalResult mlir::boundCheckLoadOrStoreOp(AffineLoadOp loadOp,
                                                      bool emitError);
-template LogicalResult mlir::boundCheckLoadOrStoreOp(StoreOp storeOp,
+template LogicalResult mlir::boundCheckLoadOrStoreOp(AffineStoreOp storeOp,
                                                      bool emitError);
 
 // Returns in 'positions' the Block positions of 'op' in each ancestor
@@ -432,7 +446,7 @@ static void findInstPosition(Operation *op, Block *limitBlock,
     // rely on linear scans.
     int instPosInBlock = std::distance(block->begin(), op->getIterator());
     positions->push_back(instPosInBlock);
-    op = block->getContainingOp();
+    op = block->getParentOp();
     block = op->getBlock();
   }
   std::reverse(positions->begin(), positions->end());
@@ -451,7 +465,7 @@ static Operation *getInstAtPosition(ArrayRef<unsigned> positions,
     }
     if (level == positions.size() - 1)
       return &op;
-    if (auto childAffineForOp = op.dyn_cast<AffineForOp>())
+    if (auto childAffineForOp = dyn_cast<AffineForOp>(op))
       return getInstAtPosition(positions, level + 1,
                                childAffineForOp.getBody());
 
@@ -465,85 +479,293 @@ static Operation *getInstAtPosition(ArrayRef<unsigned> positions,
   return nullptr;
 }
 
-const char *const kSliceFusionBarrierAttrName = "slice_fusion_barrier";
-// Computes memref dependence between 'srcAccess' and 'dstAccess', projects
-// out any dst loop IVs at depth greater than 'dstLoopDepth', and computes slice
-// bounds in 'sliceState' which represent the src IVs in terms of the dst IVs,
-// symbols and constants.
-LogicalResult mlir::getBackwardComputationSliceState(
-    const MemRefAccess &srcAccess, const MemRefAccess &dstAccess,
-    unsigned dstLoopDepth, ComputationSliceState *sliceState) {
-  bool readReadAccesses =
-      srcAccess.opInst->isa<LoadOp>() && dstAccess.opInst->isa<LoadOp>();
-  FlatAffineConstraints dependenceConstraints;
-  if (!checkMemrefAccessDependence(
-          srcAccess, dstAccess, /*loopDepth=*/1, &dependenceConstraints,
-          /*dependenceComponents=*/nullptr, /*allowRAR=*/readReadAccesses)) {
+// Adds loop IV bounds to 'cst' for loop IVs not found in 'ivs'.
+LogicalResult addMissingLoopIVBounds(SmallPtrSet<Value *, 8> &ivs,
+                                     FlatAffineConstraints *cst) {
+  for (unsigned i = 0, e = cst->getNumDimIds(); i < e; ++i) {
+    auto *value = cst->getIdValue(i);
+    if (ivs.count(value) == 0) {
+      assert(isForInductionVar(value));
+      auto loop = getForInductionVarOwner(value);
+      if (failed(cst->addAffineForOpDomain(loop)))
+        return failure();
+    }
+  }
+  return success();
+}
+
+// Returns the innermost common loop depth for the set of operations in 'ops'.
+// TODO(andydavis) Move this to LoopUtils.
+static unsigned
+getInnermostCommonLoopDepth(ArrayRef<Operation *> ops,
+                            SmallVectorImpl<AffineForOp> &surroundingLoops) {
+  unsigned numOps = ops.size();
+  assert(numOps > 0);
+
+  std::vector<SmallVector<AffineForOp, 4>> loops(numOps);
+  unsigned loopDepthLimit = std::numeric_limits<unsigned>::max();
+  for (unsigned i = 0; i < numOps; ++i) {
+    getLoopIVs(*ops[i], &loops[i]);
+    loopDepthLimit =
+        std::min(loopDepthLimit, static_cast<unsigned>(loops[i].size()));
+  }
+
+  unsigned loopDepth = 0;
+  for (unsigned d = 0; d < loopDepthLimit; ++d) {
+    unsigned i;
+    for (i = 1; i < numOps; ++i) {
+      if (loops[i - 1][d] != loops[i][d])
+        return loopDepth;
+    }
+    surroundingLoops.push_back(loops[i - 1][d]);
+    ++loopDepth;
+  }
+  return loopDepth;
+}
+
+/// Computes in 'sliceUnion' the union of all slice bounds computed at
+/// 'loopDepth' between all dependent pairs of ops in 'opsA' and 'opsB'.
+/// Returns 'Success' if union was computed, 'failure' otherwise.
+LogicalResult mlir::computeSliceUnion(ArrayRef<Operation *> opsA,
+                                      ArrayRef<Operation *> opsB,
+                                      unsigned loopDepth,
+                                      unsigned numCommonLoops,
+                                      bool isBackwardSlice,
+                                      ComputationSliceState *sliceUnion) {
+  // Compute the union of slice bounds between all pairs in 'opsA' and
+  // 'opsB' in 'sliceUnionCst'.
+  FlatAffineConstraints sliceUnionCst;
+  assert(sliceUnionCst.getNumDimAndSymbolIds() == 0);
+  std::vector<std::pair<Operation *, Operation *>> dependentOpPairs;
+  for (unsigned i = 0, numOpsA = opsA.size(); i < numOpsA; ++i) {
+    MemRefAccess srcAccess(opsA[i]);
+    for (unsigned j = 0, numOpsB = opsB.size(); j < numOpsB; ++j) {
+      MemRefAccess dstAccess(opsB[j]);
+      if (srcAccess.memref != dstAccess.memref)
+        continue;
+      // Check if 'loopDepth' exceeds nesting depth of src/dst ops.
+      if ((!isBackwardSlice && loopDepth > getNestingDepth(*opsA[i])) ||
+          (isBackwardSlice && loopDepth > getNestingDepth(*opsB[j]))) {
+        LLVM_DEBUG(llvm::dbgs() << "Invalid loop depth\n.");
+        return failure();
+      }
+
+      bool readReadAccesses = isa<AffineLoadOp>(srcAccess.opInst) &&
+                              isa<AffineLoadOp>(dstAccess.opInst);
+      FlatAffineConstraints dependenceConstraints;
+      // Check dependence between 'srcAccess' and 'dstAccess'.
+      DependenceResult result = checkMemrefAccessDependence(
+          srcAccess, dstAccess, /*loopDepth=*/numCommonLoops + 1,
+          &dependenceConstraints, /*dependenceComponents=*/nullptr,
+          /*allowRAR=*/readReadAccesses);
+      if (result.value == DependenceResult::Failure) {
+        LLVM_DEBUG(llvm::dbgs() << "Dependence check failed\n.");
+        return failure();
+      }
+      if (result.value == DependenceResult::NoDependence)
+        continue;
+      dependentOpPairs.push_back({opsA[i], opsB[j]});
+
+      // Compute slice bounds for 'srcAccess' and 'dstAccess'.
+      ComputationSliceState tmpSliceState;
+      mlir::getComputationSliceState(opsA[i], opsB[j], &dependenceConstraints,
+                                     loopDepth, isBackwardSlice,
+                                     &tmpSliceState);
+
+      if (sliceUnionCst.getNumDimAndSymbolIds() == 0) {
+        // Initialize 'sliceUnionCst' with the bounds computed in previous step.
+        if (failed(tmpSliceState.getAsConstraints(&sliceUnionCst))) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "Unable to compute slice bound constraints\n.");
+          return failure();
+        }
+        assert(sliceUnionCst.getNumDimAndSymbolIds() > 0);
+        continue;
+      }
+
+      // Compute constraints for 'tmpSliceState' in 'tmpSliceCst'.
+      FlatAffineConstraints tmpSliceCst;
+      if (failed(tmpSliceState.getAsConstraints(&tmpSliceCst))) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "Unable to compute slice bound constraints\n.");
+        return failure();
+      }
+
+      // Align coordinate spaces of 'sliceUnionCst' and 'tmpSliceCst' if needed.
+      if (!sliceUnionCst.areIdsAlignedWithOther(tmpSliceCst)) {
+
+        // Pre-constraint id alignment: record loop IVs used in each constraint
+        // system.
+        SmallPtrSet<Value *, 8> sliceUnionIVs;
+        for (unsigned k = 0, l = sliceUnionCst.getNumDimIds(); k < l; ++k)
+          sliceUnionIVs.insert(sliceUnionCst.getIdValue(k));
+        SmallPtrSet<Value *, 8> tmpSliceIVs;
+        for (unsigned k = 0, l = tmpSliceCst.getNumDimIds(); k < l; ++k)
+          tmpSliceIVs.insert(tmpSliceCst.getIdValue(k));
+
+        sliceUnionCst.mergeAndAlignIdsWithOther(/*offset=*/0, &tmpSliceCst);
+
+        // Post-constraint id alignment: add loop IV bounds missing after
+        // id alignment to constraint systems. This can occur if one constraint
+        // system uses an loop IV that is not used by the other. The call
+        // to unionBoundingBox below expects constraints for each Loop IV, even
+        // if they are the unsliced full loop bounds added here.
+        if (failed(addMissingLoopIVBounds(sliceUnionIVs, &sliceUnionCst)))
+          return failure();
+        if (failed(addMissingLoopIVBounds(tmpSliceIVs, &tmpSliceCst)))
+          return failure();
+      }
+      // Compute union bounding box of 'sliceUnionCst' and 'tmpSliceCst'.
+      if (failed(sliceUnionCst.unionBoundingBox(tmpSliceCst))) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "Unable to compute union bounding box of slice bounds."
+                      "\n.");
+        return failure();
+      }
+    }
+  }
+
+  // Empty union.
+  if (sliceUnionCst.getNumDimAndSymbolIds() == 0)
+    return failure();
+
+  // Gather loops surrounding ops from loop nest where slice will be inserted.
+  SmallVector<Operation *, 4> ops;
+  for (auto &dep : dependentOpPairs) {
+    ops.push_back(isBackwardSlice ? dep.second : dep.first);
+  }
+  SmallVector<AffineForOp, 4> surroundingLoops;
+  unsigned innermostCommonLoopDepth =
+      getInnermostCommonLoopDepth(ops, surroundingLoops);
+  if (loopDepth > innermostCommonLoopDepth) {
+    LLVM_DEBUG(llvm::dbgs() << "Exceeds max loop depth\n.");
     return failure();
   }
+
+  // Store 'numSliceLoopIVs' before converting dst loop IVs to dims.
+  unsigned numSliceLoopIVs = sliceUnionCst.getNumDimIds();
+
+  // Convert any dst loop IVs which are symbol identifiers to dim identifiers.
+  sliceUnionCst.convertLoopIVSymbolsToDims();
+  sliceUnion->clearBounds();
+  sliceUnion->lbs.resize(numSliceLoopIVs, AffineMap());
+  sliceUnion->ubs.resize(numSliceLoopIVs, AffineMap());
+
+  // Get slice bounds from slice union constraints 'sliceUnionCst'.
+  sliceUnionCst.getSliceBounds(/*offset=*/0, numSliceLoopIVs,
+                               opsA[0]->getContext(), &sliceUnion->lbs,
+                               &sliceUnion->ubs);
+
+  // Add slice bound operands of union.
+  SmallVector<Value *, 4> sliceBoundOperands;
+  sliceUnionCst.getIdValues(numSliceLoopIVs,
+                            sliceUnionCst.getNumDimAndSymbolIds(),
+                            &sliceBoundOperands);
+
+  // Copy src loop IVs from 'sliceUnionCst' to 'sliceUnion'.
+  sliceUnion->ivs.clear();
+  sliceUnionCst.getIdValues(0, numSliceLoopIVs, &sliceUnion->ivs);
+
+  // Set loop nest insertion point to block start at 'loopDepth'.
+  sliceUnion->insertPoint =
+      isBackwardSlice
+          ? surroundingLoops[loopDepth - 1].getBody()->begin()
+          : std::prev(surroundingLoops[loopDepth - 1].getBody()->end());
+
+  // Give each bound its own copy of 'sliceBoundOperands' for subsequent
+  // canonicalization.
+  sliceUnion->lbOperands.resize(numSliceLoopIVs, sliceBoundOperands);
+  sliceUnion->ubOperands.resize(numSliceLoopIVs, sliceBoundOperands);
+  return success();
+}
+
+const char *const kSliceFusionBarrierAttrName = "slice_fusion_barrier";
+// Computes slice bounds by projecting out any loop IVs from
+// 'dependenceConstraints' at depth greater than 'loopDepth', and computes slice
+// bounds in 'sliceState' which represent the one loop nest's IVs in terms of
+// the other loop nest's IVs, symbols and constants (using 'isBackwardsSlice').
+void mlir::getComputationSliceState(
+    Operation *depSourceOp, Operation *depSinkOp,
+    FlatAffineConstraints *dependenceConstraints, unsigned loopDepth,
+    bool isBackwardSlice, ComputationSliceState *sliceState) {
   // Get loop nest surrounding src operation.
   SmallVector<AffineForOp, 4> srcLoopIVs;
-  getLoopIVs(*srcAccess.opInst, &srcLoopIVs);
+  getLoopIVs(*depSourceOp, &srcLoopIVs);
   unsigned numSrcLoopIVs = srcLoopIVs.size();
 
   // Get loop nest surrounding dst operation.
   SmallVector<AffineForOp, 4> dstLoopIVs;
-  getLoopIVs(*dstAccess.opInst, &dstLoopIVs);
+  getLoopIVs(*depSinkOp, &dstLoopIVs);
   unsigned numDstLoopIVs = dstLoopIVs.size();
-  if (dstLoopDepth > numDstLoopIVs) {
-    dstAccess.opInst->emitError("invalid destination loop depth");
-    return failure();
-  }
 
-  // Project out dimensions other than those up to 'dstLoopDepth'.
-  dependenceConstraints.projectOut(numSrcLoopIVs + dstLoopDepth,
-                                   numDstLoopIVs - dstLoopDepth);
+  assert((!isBackwardSlice && loopDepth <= numSrcLoopIVs) ||
+         (isBackwardSlice && loopDepth <= numDstLoopIVs));
 
-  // Add src loop IV values to 'sliceState'.
-  dependenceConstraints.getIdValues(0, numSrcLoopIVs, &sliceState->ivs);
+  // Project out dimensions other than those up to 'loopDepth'.
+  unsigned pos = isBackwardSlice ? numSrcLoopIVs + loopDepth : loopDepth;
+  unsigned num =
+      isBackwardSlice ? numDstLoopIVs - loopDepth : numSrcLoopIVs - loopDepth;
+  dependenceConstraints->projectOut(pos, num);
+
+  // Add slice loop IV values to 'sliceState'.
+  unsigned offset = isBackwardSlice ? 0 : loopDepth;
+  unsigned numSliceLoopIVs = isBackwardSlice ? numSrcLoopIVs : numDstLoopIVs;
+  dependenceConstraints->getIdValues(offset, offset + numSliceLoopIVs,
+                                     &sliceState->ivs);
 
   // Set up lower/upper bound affine maps for the slice.
-  sliceState->lbs.resize(numSrcLoopIVs, AffineMap());
-  sliceState->ubs.resize(numSrcLoopIVs, AffineMap());
+  sliceState->lbs.resize(numSliceLoopIVs, AffineMap());
+  sliceState->ubs.resize(numSliceLoopIVs, AffineMap());
 
-  // Get bounds for src IVs in terms of dst IVs, symbols, and constants.
-  dependenceConstraints.getSliceBounds(numSrcLoopIVs,
-                                       srcAccess.opInst->getContext(),
-                                       &sliceState->lbs, &sliceState->ubs);
+  // Get bounds for slice IVs in terms of other IVs, symbols, and constants.
+  dependenceConstraints->getSliceBounds(offset, numSliceLoopIVs,
+                                        depSourceOp->getContext(),
+                                        &sliceState->lbs, &sliceState->ubs);
 
   // Set up bound operands for the slice's lower and upper bounds.
   SmallVector<Value *, 4> sliceBoundOperands;
-  dependenceConstraints.getIdValues(
-      numSrcLoopIVs, dependenceConstraints.getNumDimAndSymbolIds(),
-      &sliceBoundOperands);
+  unsigned numDimsAndSymbols = dependenceConstraints->getNumDimAndSymbolIds();
+  for (unsigned i = 0; i < numDimsAndSymbols; ++i) {
+    if (i < offset || i >= offset + numSliceLoopIVs) {
+      sliceBoundOperands.push_back(dependenceConstraints->getIdValue(i));
+    }
+  }
+
   // Give each bound its own copy of 'sliceBoundOperands' for subsequent
   // canonicalization.
-  sliceState->lbOperands.resize(numSrcLoopIVs, sliceBoundOperands);
-  sliceState->ubOperands.resize(numSrcLoopIVs, sliceBoundOperands);
+  sliceState->lbOperands.resize(numSliceLoopIVs, sliceBoundOperands);
+  sliceState->ubOperands.resize(numSliceLoopIVs, sliceBoundOperands);
+
+  // Set destination loop nest insertion point to block start at 'dstLoopDepth'.
+  sliceState->insertPoint =
+      isBackwardSlice ? dstLoopIVs[loopDepth - 1].getBody()->begin()
+                      : std::prev(srcLoopIVs[loopDepth - 1].getBody()->end());
 
   llvm::SmallDenseSet<Value *, 8> sequentialLoops;
-  if (readReadAccesses) {
+  if (isa<AffineLoadOp>(depSourceOp) && isa<AffineLoadOp>(depSinkOp)) {
     // For read-read access pairs, clear any slice bounds on sequential loops.
     // Get sequential loops in loop nest rooted at 'srcLoopIVs[0]'.
-    getSequentialLoops(srcLoopIVs[0], &sequentialLoops);
+    getSequentialLoops(isBackwardSlice ? srcLoopIVs[0] : dstLoopIVs[0],
+                       &sequentialLoops);
   }
   // Clear all sliced loop bounds beginning at the first sequential loop, or
   // first loop with a slice fusion barrier attribute..
   // TODO(andydavis, bondhugula) Use MemRef read/write regions instead of
   // using 'kSliceFusionBarrierAttrName'.
-  for (unsigned i = 0; i < numSrcLoopIVs; ++i) {
-    Value *iv = srcLoopIVs[i].getInductionVar();
+  auto getSliceLoop = [&](unsigned i) {
+    return isBackwardSlice ? srcLoopIVs[i] : dstLoopIVs[i];
+  };
+  for (unsigned i = 0; i < numSliceLoopIVs; ++i) {
+    Value *iv = getSliceLoop(i).getInductionVar();
     if (sequentialLoops.count(iv) == 0 &&
-        srcLoopIVs[i].getAttr(kSliceFusionBarrierAttrName) == nullptr)
+        getSliceLoop(i).getAttr(kSliceFusionBarrierAttrName) == nullptr)
       continue;
-    for (unsigned j = i; j < numSrcLoopIVs; ++j) {
+    for (unsigned j = i; j < numSliceLoopIVs; ++j) {
       sliceState->lbs[j] = AffineMap();
       sliceState->ubs[j] = AffineMap();
     }
     break;
   }
-
-  return success();
 }
 
 /// Creates a computation slice of the loop nest surrounding 'srcOpInst',
@@ -585,9 +807,9 @@ mlir::insertBackwardComputationSlice(Operation *srcOpInst, Operation *dstOpInst,
   // Clone src loop nest and insert it a the beginning of the operation block
   // of the loop at 'dstLoopDepth' in 'dstLoopIVs'.
   auto dstAffineForOp = dstLoopIVs[dstLoopDepth - 1];
-  FuncBuilder b(dstAffineForOp.getBody(), dstAffineForOp.getBody()->begin());
+  OpBuilder b(dstAffineForOp.getBody(), dstAffineForOp.getBody()->begin());
   auto sliceLoopNest =
-      b.clone(*srcLoopIVs[0].getOperation())->cast<AffineForOp>();
+      cast<AffineForOp>(b.clone(*srcLoopIVs[0].getOperation()));
 
   Operation *sliceInst =
       getInstAtPosition(positions, /*level=*/0, sliceLoopNest.getBody());
@@ -617,22 +839,22 @@ mlir::insertBackwardComputationSlice(Operation *srcOpInst, Operation *dstOpInst,
 // Constructs  MemRefAccess populating it with the memref, its indices and
 // opinst from 'loadOrStoreOpInst'.
 MemRefAccess::MemRefAccess(Operation *loadOrStoreOpInst) {
-  if (auto loadOp = loadOrStoreOpInst->dyn_cast<LoadOp>()) {
+  if (auto loadOp = dyn_cast<AffineLoadOp>(loadOrStoreOpInst)) {
     memref = loadOp.getMemRef();
     opInst = loadOrStoreOpInst;
     auto loadMemrefType = loadOp.getMemRefType();
     indices.reserve(loadMemrefType.getRank());
-    for (auto *index : loadOp.getIndices()) {
+    for (auto *index : loadOp.getMapOperands()) {
       indices.push_back(index);
     }
   } else {
-    assert(loadOrStoreOpInst->isa<StoreOp>() && "load/store op expected");
-    auto storeOp = loadOrStoreOpInst->dyn_cast<StoreOp>();
+    assert(isa<AffineStoreOp>(loadOrStoreOpInst) && "load/store op expected");
+    auto storeOp = dyn_cast<AffineStoreOp>(loadOrStoreOpInst);
     opInst = loadOrStoreOpInst;
     memref = storeOp.getMemRef();
     auto storeMemrefType = storeOp.getMemRefType();
     indices.reserve(storeMemrefType.getRank());
-    for (auto *index : storeOp.getIndices()) {
+    for (auto *index : storeOp.getMapOperands()) {
       indices.push_back(index);
     }
   }
@@ -642,7 +864,7 @@ unsigned MemRefAccess::getRank() const {
   return memref->getType().cast<MemRefType>().getRank();
 }
 
-bool MemRefAccess::isStore() const { return opInst->isa<StoreOp>(); }
+bool MemRefAccess::isStore() const { return isa<AffineStoreOp>(opInst); }
 
 /// Returns the nesting depth of this statement, i.e., the number of loops
 /// surrounding this statement.
@@ -650,10 +872,28 @@ unsigned mlir::getNestingDepth(Operation &op) {
   Operation *currOp = &op;
   unsigned depth = 0;
   while ((currOp = currOp->getParentOp())) {
-    if (currOp->isa<AffineForOp>())
+    if (isa<AffineForOp>(currOp))
       depth++;
   }
   return depth;
+}
+
+/// Equal if both affine accesses are provably equivalent (at compile
+/// time) when considering the memref, the affine maps and their respective
+/// operands. The equality of access functions + operands is checked by
+/// subtracting fully composed value maps, and then simplifying the difference
+/// using the expression flattener.
+/// TODO: this does not account for aliasing of memrefs.
+bool MemRefAccess::operator==(const MemRefAccess &rhs) const {
+  if (memref != rhs.memref)
+    return false;
+
+  AffineValueMap diff, thisMap, rhsMap;
+  getAccessMap(&thisMap);
+  rhs.getAccessMap(&rhsMap);
+  AffineValueMap::difference(thisMap, rhsMap, &diff);
+  return llvm::all_of(diff.getAffineMap().getResults(),
+                      [](AffineExpr e) { return e == 0; });
 }
 
 /// Returns the number of surrounding loops common to 'loopsA' and 'loopsB',
@@ -680,35 +920,31 @@ static Optional<int64_t> getMemoryFootprintBytes(Block &block,
   SmallDenseMap<Value *, std::unique_ptr<MemRefRegion>, 4> regions;
 
   // Walk this 'affine.for' operation to gather all memory regions.
-  bool error = false;
-  block.walk(start, end, [&](Operation *opInst) {
-    if (!opInst->isa<LoadOp>() && !opInst->isa<StoreOp>()) {
+  auto result = block.walk(start, end, [&](Operation *opInst) -> WalkResult {
+    if (!isa<AffineLoadOp>(opInst) && !isa<AffineStoreOp>(opInst)) {
       // Neither load nor a store op.
-      return;
+      return WalkResult::advance();
     }
 
     // Compute the memref region symbolic in any IVs enclosing this block.
-    auto region = llvm::make_unique<MemRefRegion>(opInst->getLoc());
+    auto region = std::make_unique<MemRefRegion>(opInst->getLoc());
     if (failed(
             region->compute(opInst,
                             /*loopDepth=*/getNestingDepth(*block.begin())))) {
-      opInst->emitError("Error obtaining memory region\n");
-      error = true;
-      return;
+      return opInst->emitError("error obtaining memory region\n");
     }
+
     auto it = regions.find(region->memref);
     if (it == regions.end()) {
       regions[region->memref] = std::move(region);
     } else if (failed(it->second->unionBoundingBox(*region))) {
-      opInst->emitWarning(
+      return opInst->emitWarning(
           "getMemoryFootprintBytes: unable to perform a union on a memory "
           "region");
-      error = true;
-      return;
     }
+    return WalkResult::advance();
   });
-
-  if (error)
+  if (result.wasInterrupted())
     return None;
 
   int64_t totalSizeInBytes = 0;
@@ -734,7 +970,7 @@ Optional<int64_t> mlir::getMemoryFootprintBytes(AffineForOp forOp,
 void mlir::getSequentialLoops(
     AffineForOp forOp, llvm::SmallDenseSet<Value *, 8> *sequentialLoops) {
   forOp.getOperation()->walk([&](Operation *op) {
-    if (auto innerFor = op->dyn_cast<AffineForOp>())
+    if (auto innerFor = dyn_cast<AffineForOp>(op))
       if (!isLoopParallel(innerFor))
         sequentialLoops->insert(innerFor.getInductionVar());
   });
@@ -744,10 +980,19 @@ void mlir::getSequentialLoops(
 bool mlir::isLoopParallel(AffineForOp forOp) {
   // Collect all load and store ops in loop nest rooted at 'forOp'.
   SmallVector<Operation *, 8> loadAndStoreOpInsts;
-  forOp.getOperation()->walk([&](Operation *opInst) {
-    if (opInst->isa<LoadOp>() || opInst->isa<StoreOp>())
+  auto walkResult = forOp.walk([&](Operation *opInst) {
+    if (isa<AffineLoadOp>(opInst) || isa<AffineStoreOp>(opInst))
       loadAndStoreOpInsts.push_back(opInst);
+    else if (!isa<AffineForOp>(opInst) && !isa<AffineTerminatorOp>(opInst) &&
+             !isa<AffineIfOp>(opInst) && !opInst->hasNoSideEffect())
+      return WalkResult::interrupt();
+
+    return WalkResult::advance();
   });
+
+  // Stop early if the loop has unknown ops with side effects.
+  if (walkResult.wasInterrupted())
+    return false;
 
   // Dep check depth would be number of enclosing loops + 1.
   unsigned depth = getNestingDepth(*forOp.getOperation()) + 1;
@@ -758,9 +1003,10 @@ bool mlir::isLoopParallel(AffineForOp forOp) {
     for (auto *dstOpInst : loadAndStoreOpInsts) {
       MemRefAccess dstAccess(dstOpInst);
       FlatAffineConstraints dependenceConstraints;
-      if (checkMemrefAccessDependence(srcAccess, dstAccess, depth,
-                                      &dependenceConstraints,
-                                      /*dependenceComponents=*/nullptr))
+      DependenceResult result = checkMemrefAccessDependence(
+          srcAccess, dstAccess, depth, &dependenceConstraints,
+          /*dependenceComponents=*/nullptr);
+      if (result.value != DependenceResult::NoDependence)
         return false;
     }
   }

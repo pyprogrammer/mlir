@@ -22,70 +22,195 @@
 #ifndef MLIR_IR_MODULE_H
 #define MLIR_IR_MODULE_H
 
-#include "mlir/IR/Function.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/ilist.h"
+#include "mlir/IR/SymbolTable.h"
 
 namespace mlir {
+class ModuleTerminatorOp;
 
-class AffineMap;
+//===----------------------------------------------------------------------===//
+// Module Operation.
+//===----------------------------------------------------------------------===//
 
-class Module {
+/// ModuleOp represents a module, or an operation containing one region with a
+/// single block containing opaque operations. The region of a module is not
+/// allowed to implicitly capture global values, and all external references
+/// must use symbolic references via attributes(e.g. via a string name).
+class ModuleOp
+    : public Op<
+          ModuleOp, OpTrait::ZeroOperands, OpTrait::ZeroResult,
+          OpTrait::IsIsolatedFromAbove, OpTrait::SymbolTable,
+          OpTrait::SingleBlockImplicitTerminator<ModuleTerminatorOp>::Impl> {
 public:
-  explicit Module(MLIRContext *context);
+  using Op::Op;
+  using Op::print;
 
-  MLIRContext *getContext() { return context; }
+  static StringRef getOperationName() { return "module"; }
 
-  /// This is the list of functions in the module.
-  using FunctionListType = llvm::iplist<Function>;
-  FunctionListType &getFunctions() { return functions; }
+  static void build(Builder *builder, OperationState &result);
 
-  // Iteration over the functions in the module.
-  using iterator = FunctionListType::iterator;
-  using reverse_iterator = FunctionListType::reverse_iterator;
+  /// Construct a module from the given location.
+  static ModuleOp create(Location loc);
 
-  iterator begin() { return functions.begin(); }
-  iterator end() { return functions.end(); }
-  reverse_iterator rbegin() { return functions.rbegin(); }
-  reverse_iterator rend() { return functions.rend(); }
-
-  // Interfaces for working with the symbol table.
-
-  /// Look up a function with the specified name, returning null if no such
-  /// name exists.  Function names never include the @ on them.
-  Function *getNamedFunction(StringRef name);
-
-  /// Look up a function with the specified name, returning null if no such
-  /// name exists.  Function names never include the @ on them.
-  Function *getNamedFunction(Identifier name);
-
-  /// Perform (potentially expensive) checks of invariants, used to detect
-  /// compiler bugs.  On error, this reports the error through the MLIRContext
-  /// and returns failure.
+  /// Operation hooks.
+  static ParseResult parse(OpAsmParser &parser, OperationState &result);
+  void print(OpAsmPrinter &p);
   LogicalResult verify();
 
+  /// Return body of this module.
+  Region &getBodyRegion();
+  Block *getBody();
+
+  /// Print the this module in the custom top-level form.
   void print(raw_ostream &os);
   void dump();
 
-private:
-  friend struct llvm::ilist_traits<Function>;
+  //===--------------------------------------------------------------------===//
+  // Body Management.
+  //===--------------------------------------------------------------------===//
 
-  /// getSublistAccess() - Returns pointer to member of function list
-  static FunctionListType Module::*getSublistAccess(Function *) {
-    return &Module::functions;
+  /// Iteration over the operations in the module.
+  using iterator = Block::iterator;
+
+  iterator begin() { return getBody()->begin(); }
+  iterator end() { return getBody()->end(); }
+  Operation &front() { return *begin(); }
+
+  /// This returns a range of operations of the given type 'T' held within the
+  /// module.
+  template <typename T> llvm::iterator_range<Block::op_iterator<T>> getOps() {
+    return getBody()->getOps<T>();
   }
 
-  MLIRContext *context;
+  /// Insert the operation into the back of the body, before the terminator.
+  void push_back(Operation *op) {
+    insert(Block::iterator(getBody()->getTerminator()), op);
+  }
 
-  /// This is a mapping from a name to the function with that name.
-  llvm::DenseMap<Identifier, Function *> symbolTable;
-
-  /// This is used when name conflicts are detected.
-  unsigned uniquingCounter = 0;
-
-  /// This is the actual list of functions the module contains.
-  FunctionListType functions;
+  /// Insert the operation at the given insertion point. Note: The operation is
+  /// never inserted after the terminator, even if the insertion point is end().
+  void insert(Operation *insertPt, Operation *op) {
+    insert(Block::iterator(insertPt), op);
+  }
+  void insert(Block::iterator insertPt, Operation *op) {
+    auto *body = getBody();
+    if (insertPt == body->end())
+      insertPt = Block::iterator(body->getTerminator());
+    body->getOperations().insert(insertPt, op);
+  }
 };
+
+/// The ModuleTerminatorOp is a special terminator operation for the body of a
+/// ModuleOp, it has no semantic meaning beyond keeping the body of a ModuleOp
+/// well-formed.
+///
+/// This operation does _not_ have a custom syntax. However, ModuleOp will omit
+/// the terminator in their custom syntax for brevity.
+class ModuleTerminatorOp
+    : public Op<ModuleTerminatorOp, OpTrait::ZeroOperands, OpTrait::ZeroResult,
+                OpTrait::HasParent<ModuleOp>::Impl, OpTrait::IsTerminator> {
+public:
+  using Op::Op;
+  static StringRef getOperationName() { return "module_terminator"; }
+  static void build(Builder *, OperationState &) {}
+};
+
+//===----------------------------------------------------------------------===//
+// Module Manager.
+//===----------------------------------------------------------------------===//
+
+/// A class used to manage the symbols held by a module. This class handles
+/// ensures that symbols inserted into a module have a unique name, and provides
+/// efficent named lookup to held symbols.
+class ModuleManager {
+public:
+  ModuleManager(ModuleOp module) : module(module), symbolTable(module) {}
+
+  /// Look up a symbol with the specified name, returning null if no such
+  /// name exists. Names must never include the @ on them.
+  template <typename T, typename NameTy> T lookupSymbol(NameTy &&name) const {
+    return symbolTable.lookup<T>(name);
+  }
+
+  /// Insert a new symbol into the module, auto-renaming it as necessary.
+  void insert(Operation *op) {
+    symbolTable.insert(op);
+    module.push_back(op);
+  }
+  void insert(Block::iterator insertPt, Operation *op) {
+    symbolTable.insert(op);
+    module.insert(insertPt, op);
+  }
+
+  /// Remove the given symbol from the module symbol table and then erase it.
+  void erase(Operation *op) {
+    symbolTable.erase(op);
+    op->erase();
+  }
+
+  /// Return the internally held module.
+  ModuleOp getModule() const { return module; }
+
+  /// Return the context of the internal module.
+  MLIRContext *getContext() { return module.getContext(); }
+
+private:
+  ModuleOp module;
+  SymbolTable symbolTable;
+};
+
+/// This class acts as an owning reference to a module, and will automatically
+/// destroy the held module if valid.
+class OwningModuleRef {
+public:
+  OwningModuleRef(std::nullptr_t = nullptr) {}
+  OwningModuleRef(ModuleOp module) : module(module) {}
+  OwningModuleRef(OwningModuleRef &&other) : module(other.release()) {}
+  ~OwningModuleRef() {
+    if (module)
+      module.erase();
+  }
+
+  // Assign from another module reference.
+  OwningModuleRef &operator=(OwningModuleRef &&other) {
+    if (module)
+      module.erase();
+    module = other.release();
+    return *this;
+  }
+
+  /// Allow accessing the internal module.
+  ModuleOp get() const { return module; }
+  ModuleOp operator*() const { return module; }
+  ModuleOp *operator->() { return &module; }
+  explicit operator bool() const { return module; }
+
+  /// Release the referenced module.
+  ModuleOp release() {
+    ModuleOp released;
+    std::swap(released, module);
+    return released;
+  }
+
+private:
+  ModuleOp module;
+};
+
 } // end namespace mlir
 
-#endif  // MLIR_IR_FUNCTION_H
+namespace llvm {
+
+/// Allow stealing the low bits of ModuleOp.
+template <> struct PointerLikeTypeTraits<mlir::ModuleOp> {
+public:
+  static inline void *getAsVoidPointer(mlir::ModuleOp I) {
+    return const_cast<void *>(I.getAsOpaquePointer());
+  }
+  static inline mlir::ModuleOp getFromVoidPointer(void *P) {
+    return mlir::ModuleOp::getFromOpaquePointer(P);
+  }
+  enum { NumLowBitsAvailable = 3 };
+};
+
+} // end namespace llvm
+
+#endif // MLIR_IR_MODULE_H

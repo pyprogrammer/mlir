@@ -1,4 +1,4 @@
-//===- MemRefBoundCheck.cpp - MLIR Affine Structures Class-----*- C++ -*-===//
+//===- MemRefBoundCheck.cpp - MLIR Affine Structures Class ----------------===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -24,9 +24,10 @@
 #include "mlir/Analysis/AffineStructures.h"
 #include "mlir/Analysis/Passes.h"
 #include "mlir/Analysis/Utils.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/StandardOps/Ops.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "memref-bound-check"
@@ -42,15 +43,15 @@ struct MemRefBoundCheck : public FunctionPass<MemRefBoundCheck> {
 
 } // end anonymous namespace
 
-FunctionPassBase *mlir::createMemRefBoundCheckPass() {
-  return new MemRefBoundCheck();
+std::unique_ptr<OpPassBase<FuncOp>> mlir::createMemRefBoundCheckPass() {
+  return std::make_unique<MemRefBoundCheck>();
 }
 
 void MemRefBoundCheck::runOnFunction() {
   getFunction().walk([](Operation *opInst) {
-    if (auto loadOp = opInst->dyn_cast<LoadOp>()) {
+    if (auto loadOp = dyn_cast<AffineLoadOp>(opInst)) {
       boundCheckLoadOrStoreOp(loadOp);
-    } else if (auto storeOp = opInst->dyn_cast<StoreOp>()) {
+    } else if (auto storeOp = dyn_cast<AffineStoreOp>(opInst)) {
       boundCheckLoadOrStoreOp(storeOp);
     }
     // TODO(bondhugula): do this for DMA ops as well.

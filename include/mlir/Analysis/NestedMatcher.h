@@ -19,6 +19,7 @@
 #define MLIR_ANALYSIS_MLFUNCTIONMATCHER_H_
 
 #include "mlir/IR/Function.h"
+#include "mlir/IR/Operation.h"
 #include "llvm/Support/Allocator.h"
 
 namespace mlir {
@@ -63,8 +64,8 @@ struct NestedMatch {
   ArrayRef<NestedMatch> getMatchedChildren() { return matchedChildren; }
 
 private:
-  friend class NestedPattern;
-  friend class NestedPatternContext;
+  friend struct NestedPattern;
+  friend struct NestedPatternContext;
 
   /// Underlying global bump allocator managed by a NestedPatternContext.
   static llvm::BumpPtrAllocator *&allocator();
@@ -95,7 +96,7 @@ private:
 /// a plain walk over operations to match flat patterns but the current
 /// implementation is competitive nonetheless.
 using FilterFunctionType = std::function<bool(Operation &)>;
-static bool defaultFilterFunction(Operation &) { return true; }
+inline bool defaultFilterFunction(Operation &) { return true; }
 struct NestedPattern {
   NestedPattern(ArrayRef<NestedPattern> nested,
                 FilterFunctionType filter = defaultFilterFunction);
@@ -103,8 +104,8 @@ struct NestedPattern {
   NestedPattern &operator=(const NestedPattern &) = default;
 
   /// Returns all the top-level matches in `func`.
-  void match(Function *func, SmallVectorImpl<NestedMatch> *matches) {
-    func->walk([&](Operation *op) { matchOne(op, matches); });
+  void match(FuncOp func, SmallVectorImpl<NestedMatch> *matches) {
+    func.walk([&](Operation *op) { matchOne(op, matches); });
   }
 
   /// Returns all the top-level matches in `op`.
@@ -116,8 +117,8 @@ struct NestedPattern {
   unsigned getDepth() const;
 
 private:
-  friend class NestedPatternContext;
-  friend class NestedMatch;
+  friend struct NestedPatternContext;
+  friend struct NestedMatch;
   friend struct State;
 
   /// Underlying global bump allocator managed by a NestedPatternContext.

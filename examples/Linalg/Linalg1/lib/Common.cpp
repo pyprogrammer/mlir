@@ -23,12 +23,11 @@
 #include "linalg1/Common.h"
 #include "linalg1/Ops.h"
 #include "linalg1/Types.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
 #include "mlir/EDSC/Intrinsics.h"
-#include "mlir/StandardOps/Ops.h"
 
 using llvm::ArrayRef;
 using mlir::ConstantIndexOp;
-using mlir::edsc::CapturableHandle;
 using mlir::edsc::ValueHandle;
 using mlir::edsc::intrinsics::alloc;
 using mlir::edsc::intrinsics::ret;
@@ -40,15 +39,15 @@ linalg::common::LoopNestRangeBuilder::LoopNestRangeBuilder(
   assert(ivs.size() == indexings.size());
   for (unsigned i = 0, e = indexings.size(); i < e; ++i) {
     auto rangeOp =
-        indexings[i].getValue()->getDefiningOp()->dyn_cast<RangeOp>();
+        llvm::dyn_cast<RangeOp>(indexings[i].getValue()->getDefiningOp());
     if (!rangeOp) {
       continue;
     }
     auto lb = rangeOp.getMin();
     auto ub = rangeOp.getMax();
     // This must be a constexpr index until we relax the affine.for constraint
-    auto step =
-        rangeOp.getStep()->getDefiningOp()->cast<ConstantIndexOp>().getValue();
+    auto step = llvm::cast<ConstantIndexOp>(rangeOp.getStep()->getDefiningOp())
+                    .getValue();
     loops.emplace_back(ivs[i], ValueHandle(lb), ValueHandle(ub), step);
   }
 }
@@ -59,7 +58,9 @@ linalg::common::LoopNestRangeBuilder::LoopNestRangeBuilder(
                                     indexings.begin(), indexings.end())) {}
 
 ValueHandle linalg::common::LoopNestRangeBuilder::operator()(
-    llvm::ArrayRef<CapturableHandle> stmts) {
+    std::function<void(void)> fun) {
+  if (fun)
+    fun();
   for (auto &lit : llvm::reverse(loops)) {
     lit({});
   }

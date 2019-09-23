@@ -43,8 +43,8 @@
 //===----------------------------------------------------------------------===//
 #include "mlir/Transforms/Passes.h"
 
-#include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/LoopAnalysis.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BlockAndValueMapping.h"
@@ -56,7 +56,7 @@
 
 using namespace mlir;
 
-#define DEBUG_TYPE "loop-unroll-jam"
+#define DEBUG_TYPE "affine-loop-unroll-jam"
 
 static llvm::cl::OptionCategory clOptionsCategory(DEBUG_TYPE " options");
 
@@ -82,8 +82,9 @@ struct LoopUnrollAndJam : public FunctionPass<LoopUnrollAndJam> {
 };
 } // end anonymous namespace
 
-FunctionPassBase *mlir::createLoopUnrollAndJamPass(int unrollJamFactor) {
-  return new LoopUnrollAndJam(
+std::unique_ptr<OpPassBase<FuncOp>>
+mlir::createLoopUnrollAndJamPass(int unrollJamFactor) {
+  return std::make_unique<LoopUnrollAndJam>(
       unrollJamFactor == -1 ? None : Optional<unsigned>(unrollJamFactor));
 }
 
@@ -92,7 +93,7 @@ void LoopUnrollAndJam::runOnFunction() {
   // unroll-and-jammed by this pass. However, runOnAffineForOp can be called on
   // any for operation.
   auto &entryBlock = getFunction().front();
-  if (auto forOp = entryBlock.front().dyn_cast<AffineForOp>())
+  if (auto forOp = dyn_cast<AffineForOp>(entryBlock.front()))
     runOnAffineForOp(forOp);
 }
 
@@ -139,12 +140,12 @@ LogicalResult mlir::loopUnrollJamByFactor(AffineForOp forOp,
     void walk(Block &block) {
       for (auto it = block.begin(), e = std::prev(block.end()); it != e;) {
         auto subBlockStart = it;
-        while (it != e && !it->isa<AffineForOp>())
+        while (it != e && !isa<AffineForOp>(&*it))
           ++it;
         if (it != subBlockStart)
           subBlocks.push_back({subBlockStart, std::prev(it)});
         // Process all for insts that appear next.
-        while (it != e && it->isa<AffineForOp>())
+        while (it != e && isa<AffineForOp>(&*it))
           walk(&*it++);
       }
     }
@@ -185,15 +186,14 @@ LogicalResult mlir::loopUnrollJamByFactor(AffineForOp forOp,
   // unrollJamFactor.
   if (getLargestDivisorOfTripCount(forOp) % unrollJamFactor != 0) {
     // Insert the cleanup loop right after 'forOp'.
-    FuncBuilder builder(forInst->getBlock(),
-                        std::next(Block::iterator(forInst)));
-    auto cleanupAffineForOp = builder.clone(*forInst)->cast<AffineForOp>();
+    OpBuilder builder(forInst->getBlock(), std::next(Block::iterator(forInst)));
+    auto cleanupAffineForOp = cast<AffineForOp>(builder.clone(*forInst));
     // Adjust the lower bound of the cleanup loop; its upper bound is the same
     // as the original loop's upper bound.
     AffineMap cleanupMap;
     SmallVector<Value *, 4> cleanupOperands;
     getCleanupLoopLowerBound(forOp, unrollJamFactor, &cleanupMap,
-                             &cleanupOperands, &builder);
+                             &cleanupOperands, builder);
     cleanupAffineForOp.setLowerBound(cleanupOperands, cleanupMap);
 
     // Promote the cleanup loop if it has turned into a single iteration loop.
@@ -209,21 +209,21 @@ LogicalResult mlir::loopUnrollJamByFactor(AffineForOp forOp,
   forOp.setStep(step * unrollJamFactor);
 
   auto *forOpIV = forOp.getInductionVar();
-  for (auto &subBlock : subBlocks) {
-    // Builder to insert unroll-jammed bodies. Insert right at the end of
-    // sub-block.
-    FuncBuilder builder(subBlock.first->getBlock(), std::next(subBlock.second));
-
-    // Unroll and jam (appends unrollJamFactor-1 additional copies).
-    for (unsigned i = 1; i < unrollJamFactor; i++) {
-      BlockAndValueMapping operandMapping;
+  // Unroll and jam (appends unrollJamFactor-1 additional copies).
+  for (unsigned i = 1; i < unrollJamFactor; i++) {
+    // Operand map persists across all sub-blocks.
+    BlockAndValueMapping operandMapping;
+    for (auto &subBlock : subBlocks) {
+      // Builder to insert unroll-jammed bodies. Insert right at the end of
+      // sub-block.
+      OpBuilder builder(subBlock.first->getBlock(), std::next(subBlock.second));
 
       // If the induction variable is used, create a remapping to the value for
       // this unrolled instance.
       if (!forOpIV->use_empty()) {
         // iv' = iv + i, i = 1 to unrollJamFactor-1.
         auto d0 = builder.getAffineDimExpr(0);
-        auto bumpMap = builder.getAffineMap(1, 0, {d0 + i * step}, {});
+        auto bumpMap = builder.getAffineMap(1, 0, {d0 + i * step});
         auto ivUnroll =
             builder.create<AffineApplyOp>(forInst->getLoc(), bumpMap, forOpIV);
         operandMapping.map(forOpIV, ivUnroll);
@@ -240,5 +240,5 @@ LogicalResult mlir::loopUnrollJamByFactor(AffineForOp forOp,
   return success();
 }
 
-static PassRegistration<LoopUnrollAndJam> pass("loop-unroll-jam",
+static PassRegistration<LoopUnrollAndJam> pass("affine-loop-unroll-jam",
                                                "Unroll and jam loops");

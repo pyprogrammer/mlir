@@ -30,8 +30,7 @@ template <typename T> class Expected;
 }
 
 namespace mlir {
-
-class Function;
+class FuncOp;
 
 /// Simple memref descriptor class compatible with the ABI of functions emitted
 /// by MLIR to LLVM IR conversion for statically-shaped memrefs of float type.
@@ -44,7 +43,7 @@ struct StaticFloatMemRef {
 /// each of the arguments, initialize the storage with `initialValue`, and
 /// return a list of type-erased descriptor pointers.
 llvm::Expected<SmallVector<void *, 8>>
-allocateMemRefArguments(Function *func, float initialValue = 0.0);
+allocateMemRefArguments(FuncOp func, float initialValue = 0.0);
 
 /// Free a list of type-erased descriptors to statically-shaped memrefs with
 /// element type f32.

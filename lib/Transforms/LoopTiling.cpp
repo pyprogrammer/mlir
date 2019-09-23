@@ -19,11 +19,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/AffineAnalysis.h"
 #include "mlir/Analysis/AffineStructures.h"
 #include "mlir/Analysis/LoopAnalysis.h"
 #include "mlir/Analysis/Utils.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/LoopUtils.h"
@@ -31,12 +31,9 @@
 #include "mlir/Transforms/Utils.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include <iomanip>
-#include <sstream>
-
 using namespace mlir;
 
-#define DEBUG_TYPE "loop-tile"
+#define DEBUG_TYPE "affine-loop-tile"
 
 static llvm::cl::OptionCategory clOptionsCategory(DEBUG_TYPE " options");
 
@@ -84,8 +81,9 @@ struct LoopTiling : public FunctionPass<LoopTiling> {
 
 /// Creates a pass to perform loop tiling on all suitable loop nests of a
 /// Function.
-FunctionPassBase *mlir::createLoopTilingPass(uint64_t cacheSizeBytes) {
-  return new LoopTiling(cacheSizeBytes);
+std::unique_ptr<OpPassBase<FuncOp>>
+mlir::createLoopTilingPass(uint64_t cacheSizeBytes) {
+  return std::make_unique<LoopTiling>(cacheSizeBytes);
 }
 
 // Move the loop body of AffineForOp 'src' from 'src' into the specified
@@ -115,7 +113,7 @@ constructTiledIndexSetHyperRect(MutableArrayRef<AffineForOp> origLoops,
   assert(!origLoops.empty());
   assert(origLoops.size() == tileSizes.size());
 
-  FuncBuilder b(origLoops[0].getOperation());
+  OpBuilder b(origLoops[0].getOperation());
   unsigned width = origLoops.size();
 
   // Bounds for tile space loops.
@@ -171,12 +169,12 @@ constructTiledIndexSetHyperRect(MutableArrayRef<AffineForOp> origLoops,
       boundExprs.append(origUbMap.getResults().begin(),
                         origUbMap.getResults().end());
       auto ubMap = b.getAffineMap(origUbMap.getNumDims() + 1,
-                                  origUbMap.getNumSymbols(), boundExprs, {});
+                                  origUbMap.getNumSymbols(), boundExprs);
       newLoops[width + i].setUpperBound(/*operands=*/ubOperands, ubMap);
     } else {
       // No need of the min expression.
       auto dim = b.getAffineDimExpr(0);
-      auto ubMap = b.getAffineMap(1, 0, dim + tileSizes[i], {});
+      auto ubMap = b.getAffineMap(1, 0, dim + tileSizes[i]);
       newLoops[width + i].setUpperBound(newLoops[i].getInductionVar(), ubMap);
     }
   }
@@ -210,7 +208,7 @@ LogicalResult mlir::tileCodeGen(MutableArrayRef<AffineForOp> band,
 
   // Add intra-tile (or point) loops.
   for (unsigned i = 0; i < width; i++) {
-    FuncBuilder b(topLoop);
+    OpBuilder b(topLoop);
     // Loop bounds will be set later.
     auto pointLoop = b.create<AffineForOp>(loc, 0, 0);
     pointLoop.getBody()->getOperations().splice(
@@ -224,7 +222,7 @@ LogicalResult mlir::tileCodeGen(MutableArrayRef<AffineForOp> band,
 
   // Add tile space loops;
   for (unsigned i = width; i < 2 * width; i++) {
-    FuncBuilder b(topLoop);
+    OpBuilder b(topLoop);
     // Loop bounds will be set later.
     auto tileSpaceLoop = b.create<AffineForOp>(loc, 0, 0);
     tileSpaceLoop.getBody()->getOperations().splice(
@@ -264,7 +262,7 @@ LogicalResult mlir::tileCodeGen(MutableArrayRef<AffineForOp> band,
 // Identify valid and profitable bands of loops to tile. This is currently just
 // a temporary placeholder to test the mechanics of tiled code generation.
 // Returns all maximal outermost perfect loop nests to tile.
-static void getTileableBands(Function &f,
+static void getTileableBands(FuncOp f,
                              std::vector<SmallVector<AffineForOp, 6>> *bands) {
   // Get maximal perfect nest of 'affine.for' insts starting from root
   // (inclusive).
@@ -276,7 +274,7 @@ static void getTileableBands(Function &f,
 
   for (auto &block : f)
     for (auto &op : block)
-      if (auto forOp = op.dyn_cast<AffineForOp>())
+      if (auto forOp = dyn_cast<AffineForOp>(op))
         getMaximalPerfectLoopNest(forOp);
 }
 
@@ -293,7 +291,7 @@ static void adjustToDivisorsOfTripCounts(ArrayRef<AffineForOp> band,
     // Adjust the tile size to largest factor of the trip count less than
     // tSize.
     uint64_t constTripCount = mayConst.getValue();
-    if (tSizeAdjusted > constTripCount / 2)
+    if (constTripCount > 1 && tSizeAdjusted > constTripCount / 2)
       tSizeAdjusted = constTripCount / 2;
     while (constTripCount % tSizeAdjusted != 0)
       tSizeAdjusted--;
@@ -397,13 +395,10 @@ void LoopTiling::runOnFunction() {
     SmallVector<unsigned, 6> tileSizes;
     getTileSizes(band, &tileSizes);
     if (llvm::DebugFlag) {
-      std::stringstream msg;
-      msg << "using tile sizes [";
+      auto diag = band[0].emitRemark("using tile sizes [");
       for (auto tSize : tileSizes)
-        msg << tSize << " ";
-      msg << "]\n";
-      auto rootForOp = band[0];
-      rootForOp.emitNote(msg.str());
+        diag << tSize << " ";
+      diag << "]\n";
     }
     if (failed(tileCodeGen(band, tileSizes)))
       return signalPassFailure();
@@ -413,4 +408,4 @@ void LoopTiling::runOnFunction() {
 constexpr unsigned LoopTiling::kDefaultTileSize;
 constexpr uint64_t LoopTiling::kDefaultCacheMemCapacity;
 
-static PassRegistration<LoopTiling> pass("loop-tile", "Tile loop nests");
+static PassRegistration<LoopTiling> pass("affine-loop-tile", "Tile loop nests");

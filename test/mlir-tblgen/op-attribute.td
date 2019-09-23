@@ -2,6 +2,12 @@
 
 include "mlir/IR/OpBase.td"
 
+def Test_Dialect : Dialect {
+  let name = "test";
+}
+class NS_Op<string mnemonic, list<OpTrait> traits> :
+    Op<Test_Dialect, mnemonic, traits>;
+
 def SomeAttr : Attr<CPred<"some-condition">, "some attribute kind"> {
   let storageType = "some-attr-kind";
   let returnType = "some-return-type";
@@ -12,7 +18,7 @@ def SomeAttr : Attr<CPred<"some-condition">, "some attribute kind"> {
 // Test required, optional, default-valued attributes
 // ---
 
-def AOp : Op<"a_op", []> {
+def AOp : NS_Op<"a_op", []> {
   let arguments = (ins
       SomeAttr:$aAttr,
       DefaultValuedAttr<SomeAttr, "4.2">:$bAttr,
@@ -26,7 +32,7 @@ def AOp : Op<"a_op", []> {
 // ---
 
 // CHECK:      some-return-type AOp::aAttr() {
-// CHECK-NEXT:   auto attr = this->getAttr("aAttr").dyn_cast_or_null<some-attr-kind>();
+// CHECK-NEXT:   auto attr = this->getAttr("aAttr").cast<some-attr-kind>();
 // CHECK-NEXT:   return attr.some-convert-from-storage();
 
 // CHECK:      some-return-type AOp::bAttr() {
@@ -43,15 +49,15 @@ def AOp : Op<"a_op", []> {
 // ---
 
 // CHECK:      void AOp::build(
-// CHECK:        tblgen_state->addAttribute("aAttr", aAttr);
-// CHECK:        tblgen_state->addAttribute("bAttr", bAttr);
+// CHECK:        tblgen_state.addAttribute("aAttr", aAttr);
+// CHECK:        tblgen_state.addAttribute("bAttr", bAttr);
 // CHECK:        if (cAttr) {
-// CHECK-NEXT:     tblgen_state->addAttribute("cAttr", cAttr);
+// CHECK-NEXT:     tblgen_state.addAttribute("cAttr", cAttr);
 
 // CHECK:      void AOp::build(
 // CHECK-SAME:   ArrayRef<NamedAttribute> attributes
 // CHECK:        for (const auto& pair : attributes)
-// CHECK-NEXT:     tblgen_state->addAttribute(pair.first, pair.second);
+// CHECK-NEXT:     tblgen_state.addAttribute(pair.first, pair.second);
 
 // Test verify method
 // ---
@@ -69,10 +75,7 @@ def AOp : Op<"a_op", []> {
  
 def SomeTypeAttr : TypeAttrBase<"SomeType", "some type attribute">;
 
-// Test common attribute kinds' constraints
-// ---
-
-def BOp : Op<"b_op", []> {
+def BOp : NS_Op<"b_op", []> {
   let arguments = (ins
     AnyAttr:$any_attr,
     BoolAttr:$bool_attr,
@@ -82,12 +85,33 @@ def BOp : Op<"b_op", []> {
     F64Attr:$f64_attr,
     StrAttr:$str_attr,
     ElementsAttr:$elements_attr,
-    FunctionAttr:$function_attr,
+    SymbolRefAttr:$function_attr,
     SomeTypeAttr:$type_attr,
     ArrayAttr:$array_attr,
-    TypedArrayAttrBase<SomeAttr, "SomeAttr array">:$some_attr_array
+    TypedArrayAttrBase<SomeAttr, "SomeAttr array">:$some_attr_array,
+    TypeAttr:$type_attr
   );
 }
+
+// Test common attribute kind getters' return types
+// ---
+
+// CHECK: Attribute BOp::any_attr()
+// CHECK: bool BOp::bool_attr()
+// CHECK: APInt BOp::i32_attr()
+// CHECK: APInt BOp::i64_attr()
+// CHECK: APFloat BOp::f32_attr()
+// CHECK: APFloat BOp::f64_attr()
+// CHECK: StringRef BOp::str_attr()
+// CHECK: ElementsAttr BOp::elements_attr()
+// CHECK: StringRef BOp::function_attr()
+// CHECK: SomeType BOp::type_attr()
+// CHECK: ArrayAttr BOp::array_attr()
+// CHECK: ArrayAttr BOp::some_attr_array()
+// CHECK: Type BOp::type_attr()
+
+// Test common attribute kinds' constraints
+// ---
 
 // CHECK-LABEL: BOp::verify
 // CHECK: if (!((true)))
@@ -98,15 +122,16 @@ def BOp : Op<"b_op", []> {
 // CHECK: if (!(((tblgen_f64_attr.isa<FloatAttr>())) && ((tblgen_f64_attr.cast<FloatAttr>().getType().isF64()))))
 // CHECK: if (!((tblgen_str_attr.isa<StringAttr>())))
 // CHECK: if (!((tblgen_elements_attr.isa<ElementsAttr>())))
-// CHECK: if (!((tblgen_function_attr.isa<FunctionAttr>())))
+// CHECK: if (!((tblgen_function_attr.isa<SymbolRefAttr>())))
 // CHECK: if (!(((tblgen_type_attr.isa<TypeAttr>())) && ((tblgen_type_attr.cast<TypeAttr>().getValue().isa<SomeType>()))))
 // CHECK: if (!((tblgen_array_attr.isa<ArrayAttr>())))
 // CHECK: if (!(((tblgen_some_attr_array.isa<ArrayAttr>())) && (llvm::all_of(tblgen_some_attr_array.cast<ArrayAttr>(), [](Attribute attr) { return (some-condition); }))))
+// CHECK: if (!(((tblgen_type_attr.isa<TypeAttr>())) && ((tblgen_type_attr.cast<TypeAttr>().getValue().isa<Type>()))))
 
 // Test building constant values for array attribute kinds
 // ---
 
-def COp : Op<"c_op", []> {
+def COp : NS_Op<"c_op", []> {
   let arguments = (ins
     DefaultValuedAttr<I32ArrayAttr, "{1, 2}">:$i32_array_attr,
     DefaultValuedAttr<I64ArrayAttr, "{3, 4}">:$i64_array_attr,
@@ -126,13 +151,26 @@ def COp : Op<"c_op", []> {
 // Test mixing operands and attributes in arbitrary order
 // ---
 
-def MixOperandsAndAttrs : Op<"mix_operands_and_attrs", []> {
+def MixOperandsAndAttrs : NS_Op<"mix_operands_and_attrs", []> {
   let arguments = (ins F32Attr:$attr, F32:$operand, F32Attr:$otherAttr, F32:$otherArg);
 }
 
 // CHECK-LABEL: MixOperandsAndAttrs definitions
 // CHECK-DAG: Value *MixOperandsAndAttrs::operand()
 // CHECK-DAG: Value *MixOperandsAndAttrs::otherArg()
-// CHECK-DAG: void MixOperandsAndAttrs::build(Builder *, OperationState *tblgen_state, FloatAttr attr, Value *operand, FloatAttr otherAttr, Value *otherArg)
+// CHECK-DAG: void MixOperandsAndAttrs::build(Builder *, OperationState &tblgen_state, FloatAttr attr, Value *operand, FloatAttr otherAttr, Value *otherArg)
 // CHECK-DAG: APFloat MixOperandsAndAttrs::attr()
 // CHECK-DAG: APFloat MixOperandsAndAttrs::otherAttr()
+
+// Test unit attributes.
+// ---
+
+def UnitAttrOp : NS_Op<"unit_attr_op", []> {
+  let arguments = (ins UnitAttr:$attr);
+}
+
+// CHECK-LABEL: UnitAttrOp definitions
+// CHECK: bool UnitAttrOp::attr() {
+// CHECK:   return {{.*}} != nullptr
+
+// CHECK: build(Builder *, OperationState &tblgen_state, /*optional*/UnitAttr attr)

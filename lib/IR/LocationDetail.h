@@ -15,7 +15,7 @@
 // limitations under the License.
 // =============================================================================
 //
-// This holds implementation details of Location.
+// This holds implementation details of the location attributes.
 //
 //===----------------------------------------------------------------------===//
 #ifndef MLIR_IR_LOCATIONDETAIL_H_
@@ -29,56 +29,79 @@
 
 namespace mlir {
 
-class MLIRContext;
-
 namespace detail {
 
-/// Base storage class appearing in a Location.
-struct alignas(8) LocationStorage {
-  LocationStorage(Location::Kind kind) : kind(kind) {}
-
-  /// Classification of the subclass, used for type checking.
-  Location::Kind kind : 8;
-};
-
-struct UnknownLocationStorage : public LocationStorage {
-  UnknownLocationStorage() : LocationStorage(Location::Kind::Unknown) {}
-};
-
-struct FileLineColLocationStorage : public LocationStorage {
-  FileLineColLocationStorage(UniquedFilename filename, unsigned line,
-                             unsigned column)
-      : LocationStorage(Location::Kind::FileLineCol), filename(filename),
-        line(line), column(column) {}
-
-  const UniquedFilename filename;
-  const unsigned line, column;
-};
-
-struct NameLocationStorage : public LocationStorage {
-  NameLocationStorage(Identifier name)
-      : LocationStorage(Location::Kind::Name), name(name) {}
-
-  const Identifier name;
-};
-
-struct CallSiteLocationStorage : public LocationStorage {
+struct CallSiteLocationStorage : public AttributeStorage {
   CallSiteLocationStorage(Location callee, Location caller)
-      : LocationStorage(Location::Kind::CallSite), callee(callee),
-        caller(caller) {}
+      : callee(callee), caller(caller) {}
 
-  const Location callee, caller;
+  /// The hash key used for uniquing.
+  using KeyTy = std::pair<Location, Location>;
+  bool operator==(const KeyTy &key) const {
+    return key == KeyTy(callee, caller);
+  }
+
+  /// Construct a new storage instance.
+  static CallSiteLocationStorage *
+  construct(AttributeStorageAllocator &allocator, const KeyTy &key) {
+    return new (allocator.allocate<CallSiteLocationStorage>())
+        CallSiteLocationStorage(key.first, key.second);
+  }
+
+  Location callee, caller;
+};
+
+struct FileLineColLocationStorage : public AttributeStorage {
+  FileLineColLocationStorage(Identifier filename, unsigned line,
+                             unsigned column)
+      : filename(filename), line(line), column(column) {}
+
+  /// The hash key used for uniquing.
+  using KeyTy = std::tuple<Identifier, unsigned, unsigned>;
+  bool operator==(const KeyTy &key) const {
+    return key == KeyTy(filename, line, column);
+  }
+
+  /// Construct a new storage instance.
+  static FileLineColLocationStorage *
+  construct(AttributeStorageAllocator &allocator, const KeyTy &key) {
+    return new (allocator.allocate<FileLineColLocationStorage>())
+        FileLineColLocationStorage(std::get<0>(key), std::get<1>(key),
+                                   std::get<2>(key));
+  }
+
+  Identifier filename;
+  unsigned line, column;
 };
 
 struct FusedLocationStorage final
-    : public LocationStorage,
+    : public AttributeStorage,
       public llvm::TrailingObjects<FusedLocationStorage, Location> {
   FusedLocationStorage(unsigned numLocs, Attribute metadata)
-      : LocationStorage(Location::Kind::FusedLocation), numLocs(numLocs),
-        metadata(metadata) {}
+      : numLocs(numLocs), metadata(metadata) {}
 
   ArrayRef<Location> getLocations() const {
     return ArrayRef<Location>(getTrailingObjects<Location>(), numLocs);
+  }
+
+  /// The hash key used for uniquing.
+  using KeyTy = std::pair<ArrayRef<Location>, Attribute>;
+  bool operator==(const KeyTy &key) const {
+    return key == KeyTy(getLocations(), metadata);
+  }
+
+  /// Construct a new storage instance.
+  static FusedLocationStorage *construct(AttributeStorageAllocator &allocator,
+                                         const KeyTy &key) {
+    ArrayRef<Location> locs = key.first;
+
+    auto byteSize = totalSizeToAlloc<Location>(locs.size());
+    auto rawMem = allocator.allocate(byteSize, alignof(FusedLocationStorage));
+    auto result = new (rawMem) FusedLocationStorage(locs.size(), key.second);
+
+    std::uninitialized_copy(locs.begin(), locs.end(),
+                            result->getTrailingObjects<Location>());
+    return result;
   }
 
   // This stuff is used by the TrailingObjects template.
@@ -92,6 +115,26 @@ struct FusedLocationStorage final
   Attribute metadata;
 };
 
+struct NameLocationStorage : public AttributeStorage {
+  NameLocationStorage(Identifier name, Location child)
+      : name(name), child(child) {}
+
+  /// The hash key used for uniquing.
+  using KeyTy = std::pair<Identifier, Location>;
+  bool operator==(const KeyTy &key) const { return key == KeyTy(name, child); }
+
+  /// Construct a new storage instance.
+  static NameLocationStorage *construct(AttributeStorageAllocator &allocator,
+                                        const KeyTy &key) {
+    return new (allocator.allocate<NameLocationStorage>())
+        NameLocationStorage(key.first, key.second);
+  }
+
+  Identifier name;
+  Location child;
+};
+
 } // end namespace detail
 } // end namespace mlir
+
 #endif // MLIR_IR_LOCATIONDETAIL_H_

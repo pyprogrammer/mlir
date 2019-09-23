@@ -19,10 +19,9 @@
 #define MLIR_IR_STANDARDTYPES_H
 
 #include "mlir/IR/Types.h"
-#include "mlir/Support/LLVM.h"
 
 namespace llvm {
-class fltSemantics;
+struct fltSemantics;
 } // namespace llvm
 
 namespace mlir {
@@ -36,7 +35,7 @@ class MLIRContext;
 namespace detail {
 
 struct IntegerTypeStorage;
-struct VectorOrTensorTypeStorage;
+struct ShapedTypeStorage;
 struct VectorTypeStorage;
 struct RankedTensorTypeStorage;
 struct UnrankedTensorTypeStorage;
@@ -67,16 +66,10 @@ enum Kind {
   MemRef,
   Complex,
   Tuple,
+  None,
 };
 
 } // namespace StandardTypes
-
-inline bool Type::isBF16() const { return getKind() == StandardTypes::BF16; }
-inline bool Type::isF16() const { return getKind() == StandardTypes::F16; }
-inline bool Type::isF32() const { return getKind() == StandardTypes::F32; }
-inline bool Type::isF64() const { return getKind() == StandardTypes::F64; }
-
-inline bool Type::isIndex() const { return getKind() == StandardTypes::Index; }
 
 /// Index is a special integer-like type with unknown platform-dependent bit
 /// width.
@@ -84,10 +77,8 @@ class IndexType : public Type::TypeBase<IndexType, Type> {
 public:
   using Base::Base;
 
-  /// Crete an IndexType instance, unique in the given context.
-  static IndexType get(MLIRContext *context) {
-    return Base::get(context, StandardTypes::Index);
-  }
+  /// Get an instance of the IndexType.
+  static IndexType get(MLIRContext *context);
 
   /// Support method to enable LLVM-style type casting.
   static bool kindof(unsigned kind) { return kind == StandardTypes::Index; }
@@ -125,33 +116,11 @@ public:
   static constexpr unsigned kMaxWidth = 4096;
 };
 
-/// Return true if this is an integer type with the specified width.
-inline bool Type::isInteger(unsigned width) const {
-  if (auto intTy = dyn_cast<IntegerType>())
-    return intTy.getWidth() == width;
-  return false;
-}
-
-inline bool Type::isIntOrIndex() const {
-  return isa<IndexType>() || isa<IntegerType>();
-}
-
-inline bool Type::isIntOrIndexOrFloat() const {
-  return isa<IndexType>() || isa<IntegerType>() || isa<FloatType>();
-}
-
-inline bool Type::isIntOrFloat() const {
-  return isa<IntegerType>() || isa<FloatType>();
-}
-
 class FloatType : public Type::TypeBase<FloatType, Type> {
 public:
   using Base::Base;
 
-  static FloatType get(StandardTypes::Kind kind, MLIRContext *context) {
-    assert(kindof(kind) && "Not a FP kind.");
-    return Base::get(context, kind);
-  }
+  static FloatType get(StandardTypes::Kind kind, MLIRContext *context);
 
   // Convenience factories.
   static FloatType getBF16(MLIRContext *ctx) {
@@ -174,68 +143,78 @@ public:
   }
 
   /// Return the bitwidth of this float type.
-  unsigned getWidth() const;
+  unsigned getWidth();
 
   /// Return the floating semantics of this float type.
-  const llvm::fltSemantics &getFloatSemantics() const;
+  const llvm::fltSemantics &getFloatSemantics();
 };
 
-/// This is a common base class between Vector, UnrankedTensor, and RankedTensor
-/// types, because many operations work on values of these aggregate types.
-class VectorOrTensorType : public Type {
+/// This is a common base class between Vector, UnrankedTensor, RankedTensor,
+/// and MemRef types because they share behavior and semantics around shape,
+/// rank, and fixed element type. Any type with these semantics should inherit
+/// from ShapedType.
+class ShapedType : public Type {
 public:
-  using ImplType = detail::VectorOrTensorTypeStorage;
+  using ImplType = detail::ShapedTypeStorage;
   using Type::Type;
 
   /// Return the element type.
   Type getElementType() const;
 
-  /// If an element type is an integer or a float, return its width.  Abort
-  /// otherwise.
+  /// If an element type is an integer or a float, return its width. Otherwise,
+  /// abort.
   unsigned getElementTypeBitWidth() const;
 
-  /// If this is ranked tensor or vector type, return the number of elements. If
-  /// it is an unranked tensor, abort.
-  unsigned getNumElements() const;
+  /// If it has static shape, return the number of elements. Otherwise, abort.
+  int64_t getNumElements() const;
 
-  /// If this is ranked tensor or vector type, return the rank. If it is an
-  /// unranked tensor, return -1.
+  /// If this is a ranked type, return the rank. Otherwise, abort.
   int64_t getRank() const;
 
-  /// If this is ranked tensor or vector type, return the shape. If it is an
-  /// unranked tensor, abort.
+  /// Whether or not this is a ranked type. Memrefs, vectors and ranked tensors
+  /// have a rank, while unranked tensors do not.
+  bool hasRank() const;
+
+  /// If this is a ranked type, return the shape. Otherwise, abort.
   ArrayRef<int64_t> getShape() const;
 
-  /// If this is unranked tensor or any dimension has unknown size (<0),
-  /// it doesn't have static shape. If all dimensions have known size (>= 0),
-  /// it has static shape.
+  /// If this is unranked type or any dimension has unknown size (<0), it
+  /// doesn't have static shape. If all dimensions have known size (>= 0), it
+  /// has static shape.
   bool hasStaticShape() const;
 
-  /// If this is ranked tensor or vector type, return the size of the specified
-  /// dimension. It aborts if the tensor is unranked (this can be checked by
-  /// the getRank call method).
-  int64_t getDimSize(unsigned i) const;
+  /// If this is a ranked type, return the number of dimensions with dynamic
+  /// size. Otherwise, abort.
+  int64_t getNumDynamicDims() const;
+
+  /// If this is ranked type, return the size of the specified dimension.
+  /// Otherwise, abort.
+  int64_t getDimSize(int64_t i) const;
 
   /// Get the total amount of bits occupied by a value of this type.  This does
   /// not take into account any memory layout or widening constraints, e.g. a
   /// vector<3xi57> is reported to occupy 3x57=171 bit, even though in practice
   /// it will likely be stored as in a 4xi64 vector register.  Fail an assertion
-  /// if the size cannot be computed statically, i.e. if the tensor has a
-  /// dynamic shape or if its elemental type does not have a known bit width.
+  /// if the size cannot be computed statically, i.e. if the type has a dynamic
+  /// shape or if its elemental type does not have a known bit width.
   int64_t getSizeInBits() const;
 
   /// Methods for support type inquiry through isa, cast, and dyn_cast.
-  static bool kindof(unsigned kind) {
-    return kind == StandardTypes::Vector ||
-           kind == StandardTypes::RankedTensor ||
-           kind == StandardTypes::UnrankedTensor;
+  static bool classof(Type type) {
+    return type.getKind() == StandardTypes::Vector ||
+           type.getKind() == StandardTypes::RankedTensor ||
+           type.getKind() == StandardTypes::UnrankedTensor ||
+           type.getKind() == StandardTypes::MemRef;
   }
+
+  /// Whether the given dimension size indicates a dynamic dimension.
+  static constexpr bool isDynamic(int64_t dSize) { return dSize < 0; }
 };
 
 /// Vector types represent multi-dimensional SIMD vectors, and have a fixed
 /// known constant shape with one or more dimension.
-class VectorType : public Type::TypeBase<VectorType, VectorOrTensorType,
-                                         detail::VectorTypeStorage> {
+class VectorType
+    : public Type::TypeBase<VectorType, ShapedType, detail::VectorTypeStorage> {
 public:
   using Base::Base;
 
@@ -268,9 +247,9 @@ public:
 
 /// Tensor types represent multi-dimensional arrays, and have two variants:
 /// RankedTensorType and UnrankedTensorType.
-class TensorType : public VectorOrTensorType {
+class TensorType : public ShapedType {
 public:
-  using VectorOrTensorType::VectorOrTensorType;
+  using ShapedType::ShapedType;
 
   /// Return true if the specified element type is ok in a tensor.
   static bool isValidElementType(Type type) {
@@ -283,9 +262,9 @@ public:
   }
 
   /// Methods for support type inquiry through isa, cast, and dyn_cast.
-  static bool kindof(unsigned kind) {
-    return kind == StandardTypes::RankedTensor ||
-           kind == StandardTypes::UnrankedTensor;
+  static bool classof(Type type) {
+    return type.getKind() == StandardTypes::RankedTensor ||
+           type.getKind() == StandardTypes::UnrankedTensor;
   }
 };
 
@@ -353,11 +332,11 @@ public:
 };
 
 /// MemRef types represent a region of memory that have a shape with a fixed
-/// number of dimensions. Each shape element can be a positive integer or
+/// number of dimensions. Each shape element can be a non-negative integer or
 /// unknown (represented by any negative integer). MemRef types also have an
 /// affine map composition, represented as an array AffineMap pointers.
 class MemRefType
-    : public Type::TypeBase<MemRefType, Type, detail::MemRefTypeStorage> {
+    : public Type::TypeBase<MemRefType, ShapedType, detail::MemRefTypeStorage> {
 public:
   using Base::Base;
 
@@ -367,12 +346,7 @@ public:
   /// construction failures.
   static MemRefType get(ArrayRef<int64_t> shape, Type elementType,
                         ArrayRef<AffineMap> affineMapComposition = {},
-                        unsigned memorySpace = 0) {
-    auto result = getImpl(shape, elementType, affineMapComposition, memorySpace,
-                          /*location=*/llvm::None);
-    assert(result && "Failed to construct instance of MemRefType.");
-    return result;
-  }
+                        unsigned memorySpace = 0);
 
   /// Get or create a new MemRefType based on shape, element type, affine
   /// map composition, and memory space declared at the given location.
@@ -382,21 +356,9 @@ public:
   /// the error stream) and returns nullptr.
   static MemRefType getChecked(ArrayRef<int64_t> shape, Type elementType,
                                ArrayRef<AffineMap> affineMapComposition,
-                               unsigned memorySpace, Location location) {
-    return getImpl(shape, elementType, affineMapComposition, memorySpace,
-                   location);
-  }
+                               unsigned memorySpace, Location location);
 
-  unsigned getRank() const { return getShape().size(); }
-
-  /// Returns an array of memref shape dimension sizes.
   ArrayRef<int64_t> getShape() const;
-
-  /// Return the size of the specified dimension, or -1 if unspecified.
-  int64_t getDimSize(unsigned i) const { return getShape()[i]; }
-
-  /// Returns the elemental type for this memref shape.
-  Type getElementType() const;
 
   /// Returns an array of affine map pointers representing the memref affine
   /// map composition.
@@ -405,12 +367,31 @@ public:
   /// Returns the memory space in which data referred to by this memref resides.
   unsigned getMemorySpace() const;
 
-  /// Returns the number of dimensions with dynamic size.
-  unsigned getNumDynamicDims() const;
-
-  /// If any dimension of the shape has unknown size (<0), it doesn't have
-  /// static shape.
-  bool hasStaticShape() const { return getNumDynamicDims() == 0; }
+  /// Returns the strides of the MemRef if the layout map is in strided form.
+  /// MemRefs with layout maps in strided form include:
+  ///   1. empty or identity layout map, in which case the stride information is
+  ///      the canonical form computed from sizes;
+  ///   2. single affine map layout of the form `K + k0 * d0 + ... kn * dn`,
+  ///      where K and ki's are constants or symbols.
+  ///
+  /// A stride specification is a list of integer values that are either static
+  /// or dynamic (encoded with kDynamicStride). Strides encode the distance in
+  /// the number of elements between successive entries along a particular
+  /// dimension.
+  /// For example, `memref<42x16xf32, (64 * d0 + d1)>` specifies a view into a
+  /// non-contiguous memory region of `42` by `16` `f32` elements in which the
+  /// distance between two consecutive elements along the outer dimension is `1`
+  /// and the distance between two consecutive elements along the inner
+  /// dimension is `64`.
+  ///
+  /// If a simple strided form cannot be extracted from the composition of the
+  /// layout map, returns llvm::None.
+  ///
+  /// The convention is that the strides for dimensions d0, .. dn appear in
+  /// order followed by the constant offset, to make indexing intuitive into the
+  /// result.
+  static constexpr int64_t kDynamicStride = std::numeric_limits<int64_t>::min();
+  LogicalResult getStrides(SmallVectorImpl<int64_t> &strides) const;
 
   static bool kindof(unsigned kind) { return kind == StandardTypes::MemRef; }
 
@@ -421,6 +402,7 @@ private:
   static MemRefType getImpl(ArrayRef<int64_t> shape, Type elementType,
                             ArrayRef<AffineMap> affineMapComposition,
                             unsigned memorySpace, Optional<Location> location);
+  using Base::getImpl;
 };
 
 /// The 'complex' type represents a complex number with a parameterized element
@@ -475,8 +457,14 @@ public:
   /// Return the elements types for this tuple.
   ArrayRef<Type> getTypes() const;
 
+  /// Accumulate the types contained in this tuple and tuples nested within it.
+  /// Note that this only flattens nested tuples, not any other container type,
+  /// e.g. a tuple<i32, tensor<i32>, tuple<f32, tuple<i64>>> is flattened to
+  /// (i32, tensor<i32>, f32, i64)
+  void getFlattenedTypes(SmallVectorImpl<Type> &types);
+
   /// Return the number of held types.
-  unsigned size() const;
+  size_t size() const;
 
   /// Iterate over the held elements.
   using iterator = ArrayRef<Type>::iterator;
@@ -484,7 +472,7 @@ public:
   iterator end() const { return getTypes().end(); }
 
   /// Return the element type at index 'index'.
-  Type getType(unsigned index) const {
+  Type getType(size_t index) const {
     assert(index < size() && "invalid index for tuple type");
     return getTypes()[index];
   }
@@ -492,6 +480,17 @@ public:
   static bool kindof(unsigned kind) { return kind == StandardTypes::Tuple; }
 };
 
+/// NoneType is a unit type, i.e. a type with exactly one possible value, where
+/// its value does not have a defined dynamic representation.
+class NoneType : public Type::TypeBase<NoneType, Type> {
+public:
+  using Base::Base;
+
+  /// Get an instance of the NoneType.
+  static NoneType get(MLIRContext *context);
+
+  static bool kindof(unsigned kind) { return kind == StandardTypes::None; }
+};
 } // end namespace mlir
 
 #endif // MLIR_IR_STANDARDTYPES_H

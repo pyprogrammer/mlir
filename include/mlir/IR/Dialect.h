@@ -25,8 +25,8 @@
 #include "mlir/IR/OperationSupport.h"
 
 namespace mlir {
-class AffineMap;
-class IntegerSet;
+class DialectInterface;
+class OpBuilder;
 class Type;
 
 using DialectConstantDecodeHook =
@@ -45,6 +45,12 @@ using DialectExtractElementHook =
 ///
 class Dialect {
 public:
+  virtual ~Dialect();
+
+  /// Utility function that returns if the given string is a valid dialect
+  /// namespace.
+  static bool isValidNamespace(StringRef str);
+
   MLIRContext *getContext() const { return context; }
 
   StringRef getNamespace() const { return name; }
@@ -52,7 +58,16 @@ public:
   /// Returns true if this dialect allows for unregistered operations, i.e.
   /// operations prefixed with the dialect namespace but not registered with
   /// addOperation.
-  bool allowsUnknownOperations() const { return allowUnknownOps; }
+  bool allowsUnknownOperations() const { return unknownOpsAllowed; }
+
+  /// Return true if this dialect allows for unregistered types, i.e., types
+  /// prefixed with the dialect namespace but not registered with addType.
+  /// These are represented with OpaqueType.
+  bool allowsUnknownTypes() const { return unknownTypesAllowed; }
+
+  //===--------------------------------------------------------------------===//
+  // Constant Hooks
+  //===--------------------------------------------------------------------===//
 
   /// Registered fallback constant fold hook for the dialect. Like the constant
   /// fold hook of each operation, it attempts to constant fold the operation
@@ -82,42 +97,54 @@ public:
         return Attribute();
       };
 
+  /// Registered hook to materialize a single constant operation from a given
+  /// attribute value with the desired resultant type. This method should use
+  /// the provided builder to create the operation without changing the
+  /// insertion position. The generated operation is expected to be constant
+  /// like, i.e. single result, zero operands, non side-effecting, etc. On
+  /// success, this hook should return the value generated to represent the
+  /// constant value. Otherwise, it should return null on failure.
+  virtual Operation *materializeConstant(OpBuilder &builder, Attribute value,
+                                         Type type, Location loc) {
+    return nullptr;
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Parsing Hooks
+  //===--------------------------------------------------------------------===//
+
+  /// Parse an attribute registered to this dialect. If 'type' is nonnull, it
+  /// refers to the expected type of the attribute.
+  virtual Attribute parseAttribute(StringRef attrData, Type type,
+                                   Location loc) const;
+
+  /// Print an attribute registered to this dialect. Note: The type of the
+  /// attribute need not be printed by this method as it is always printed by
+  /// the caller.
+  virtual void printAttribute(Attribute, raw_ostream &) const {
+    llvm_unreachable("dialect has no registered attribute printing hook");
+  }
+
   /// Parse a type registered to this dialect.
   virtual Type parseType(StringRef tyData, Location loc) const;
 
   /// Print a type registered to this dialect.
-  /// Note: The data printed for the provided type must not include any '"'
-  /// characters.
   virtual void printType(Type, raw_ostream &) const {
-    assert(0 && "dialect has no registered type printing hook");
+    llvm_unreachable("dialect has no registered type printing hook");
   }
 
-  /// Registered hooks for getting identifier aliases for symbols. The
-  /// identifier is used in place of the symbol when printing textual IR.
-  ///
-  /// Hook for defining AffineMap aliases.
-  virtual void getAffineMapAliases(
-      SmallVectorImpl<std::pair<StringRef, AffineMap>> &aliases) {}
-  /// Hook for defining IntegerSet aliases.
-  virtual void getIntegerSetAliases(
-      SmallVectorImpl<std::pair<StringRef, IntegerSet>> &aliases) {}
-  /// Hook for defining Type aliases.
-  virtual void
-  getTypeAliases(SmallVectorImpl<std::pair<StringRef, Type>> &aliases) {}
-
-  /// Verify an attribute from this dialect on the given function. Returns
-  /// failure if the verification failed, success otherwise.
-  virtual LogicalResult verifyFunctionAttribute(Function *, NamedAttribute) {
-    return success();
-  }
+  //===--------------------------------------------------------------------===//
+  // Verification Hooks
+  //===--------------------------------------------------------------------===//
 
   /// Verify an attribute from this dialect on the argument at 'argIndex' for
-  /// the given function. Returns failure if the verification failed, success
-  /// otherwise.
-  virtual LogicalResult
-  verifyFunctionArgAttribute(Function *, unsigned argIndex, NamedAttribute) {
-    return success();
-  }
+  /// the region at 'regionIndex' on the given operation. Returns failure if
+  /// the verification failed, success otherwise. This hook may optionally be
+  /// invoked from any operation containing a region.
+  virtual LogicalResult verifyRegionArgAttribute(Operation *,
+                                                 unsigned regionIndex,
+                                                 unsigned argIndex,
+                                                 NamedAttribute);
 
   /// Verify an attribute from this dialect on the given operation. Returns
   /// failure if the verification failed, success otherwise.
@@ -125,11 +152,20 @@ public:
     return success();
   }
 
-  virtual ~Dialect();
+  //===--------------------------------------------------------------------===//
+  // Interfaces
+  //===--------------------------------------------------------------------===//
 
-  /// Utility function that returns if the given string is a valid dialect
-  /// namespace.
-  static bool isValidNamespace(StringRef str);
+  /// Lookup an interface for the given ID if one is registered, otherwise
+  /// nullptr.
+  const DialectInterface *getRegisteredInterface(ClassID *interfaceID) {
+    auto it = registeredInterfaces.find(interfaceID);
+    return it != registeredInterfaces.end() ? it->getSecond().get() : nullptr;
+  }
+  template <typename InterfaceT> const InterfaceT *getRegisteredInterface() {
+    return static_cast<const InterfaceT *>(
+        getRegisteredInterface(InterfaceT::getInterfaceID()));
+  }
 
 protected:
   /// The constructor takes a unique namespace for this dialect as well as the
@@ -170,33 +206,53 @@ protected:
 
   /// This method is used by derived classes to add their types to the set.
   template <typename... Args> void addTypes() {
-    VariadicTypeAdder<Args...>::addToSet(*this);
+    VariadicSymbolAdder<Args...>::addToSet(*this);
+  }
+
+  /// This method is used by derived classes to add their attributes to the set.
+  template <typename... Args> void addAttributes() {
+    VariadicSymbolAdder<Args...>::addToSet(*this);
   }
 
   // It would be nice to define this as variadic functions instead of a nested
   // variadic type, but we can't do that: function template partial
   // specialization is not allowed, and we can't define an overload set
   // because we don't have any arguments of the types we are pushing around.
-  template <typename First, typename... Rest> struct VariadicTypeAdder {
+  template <typename First, typename... Rest> struct VariadicSymbolAdder {
     static void addToSet(Dialect &dialect) {
-      VariadicTypeAdder<First>::addToSet(dialect);
-      VariadicTypeAdder<Rest...>::addToSet(dialect);
+      VariadicSymbolAdder<First>::addToSet(dialect);
+      VariadicSymbolAdder<Rest...>::addToSet(dialect);
     }
   };
 
-  template <typename First> struct VariadicTypeAdder<First> {
+  template <typename First> struct VariadicSymbolAdder<First> {
     static void addToSet(Dialect &dialect) {
-      dialect.addType(First::getTypeID());
+      dialect.addSymbol(First::getClassID());
     }
   };
 
-  // Register a type with its given unqiue type identifer.
-  void addType(const TypeID *const typeID);
+  /// Enable support for unregistered operations.
+  void allowUnknownOperations(bool allow = true) { unknownOpsAllowed = allow; }
 
-  // Enable support for unregistered operations.
-  void allowUnknownOperations(bool allow = true) { allowUnknownOps = allow; }
+  /// Enable support for unregistered types.
+  void allowUnknownTypes(bool allow = true) { unknownTypesAllowed = allow; }
+
+  /// Register a dialect interface with this dialect instance.
+  void addInterface(std::unique_ptr<DialectInterface> interface);
+
+  /// Register a set of dialect interfaces with this dialect instance.
+  template <typename T, typename T2, typename... Tys> void addInterfaces() {
+    addInterfaces<T>();
+    addInterfaces<T2, Tys...>();
+  }
+  template <typename T> void addInterfaces() {
+    addInterface(std::make_unique<T>(this));
+  }
 
 private:
+  // Register a symbol(e.g. type) with its given unique class identifier.
+  void addSymbol(const ClassID *const classID);
+
   Dialect(const Dialect &) = delete;
   void operator=(Dialect &) = delete;
 
@@ -210,10 +266,18 @@ private:
   /// This is the context that owns this Dialect object.
   MLIRContext *context;
 
-  /// Flag that toggles if this dialect supports unregistered operations, i.e.
-  /// operations prefixed with the dialect namespace but not registered with
-  /// addOperation.
-  bool allowUnknownOps;
+  /// Flag that specifies whether this dialect supports unregistered operations,
+  /// i.e. operations prefixed with the dialect namespace but not registered
+  /// with addOperation.
+  bool unknownOpsAllowed = false;
+
+  /// Flag that specifies whether this dialect allows unregistered types, i.e.
+  /// types prefixed with the dialect namespace but not registered with addType.
+  /// These types are represented with OpaqueType.
+  bool unknownTypesAllowed = false;
+
+  /// A collection of registered dialect interfaces.
+  DenseMap<ClassID *, std::unique_ptr<DialectInterface>> registeredInterfaces;
 };
 
 using DialectAllocatorFunction = std::function<void(MLIRContext *)>;

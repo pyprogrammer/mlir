@@ -29,23 +29,43 @@ class StringRef;
 } // end namespace llvm
 
 namespace mlir {
-class Module;
+class Location;
 class MLIRContext;
+class OwningModuleRef;
+class Type;
 
 /// This parses the file specified by the indicated SourceMgr and returns an
 /// MLIR module if it was valid.  If not, the error message is emitted through
 /// the error handler registered in the context, and a null pointer is returned.
-Module *parseSourceFile(const llvm::SourceMgr &sourceMgr, MLIRContext *context);
+OwningModuleRef parseSourceFile(const llvm::SourceMgr &sourceMgr,
+                                MLIRContext *context);
 
 /// This parses the file specified by the indicated filename and returns an
 /// MLIR module if it was valid.  If not, the error message is emitted through
 /// the error handler registered in the context, and a null pointer is returned.
-Module *parseSourceFile(llvm::StringRef filename, MLIRContext *context);
+OwningModuleRef parseSourceFile(llvm::StringRef filename, MLIRContext *context);
+
+/// This parses the file specified by the indicated filename using the provided
+/// SourceMgr and returns an MLIR module if it was valid.  If not, the error
+/// message is emitted through the error handler registered in the context, and
+/// a null pointer is returned.
+OwningModuleRef parseSourceFile(llvm::StringRef filename,
+                                llvm::SourceMgr &sourceMgr,
+                                MLIRContext *context);
 
 /// This parses the module string to a MLIR module if it was valid.  If not, the
-/// error message is emitted through / the error handler registered in the
+/// error message is emitted through the error handler registered in the
 /// context, and a null pointer is returned.
-Module *parseSourceString(llvm::StringRef moduleStr, MLIRContext *context);
+OwningModuleRef parseSourceString(llvm::StringRef moduleStr,
+                                  MLIRContext *context);
+
+/// This parses a single MLIR type to an MLIR context if it was valid.  If not,
+/// an error message is emitted through a new SourceMgrDiagnosticHandler
+/// constructed from a new SourceMgr with a single a MemoryBuffer wrapping
+/// `typeStr`. If the passed `typeStr` has additional tokens that were not part
+/// of the type, an error is emitted.
+// TODO(ntv) Improve diagnostic reporting.
+Type parseType(llvm::StringRef typeStr, MLIRContext *context);
 
 } // end namespace mlir
 

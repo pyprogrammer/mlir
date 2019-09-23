@@ -1,4 +1,4 @@
-//===- Dominance.h - Dominator analysis for CFG Functions -------*- C++ -*-===//
+//===- Dominance.h - Dominator analysis for CFGs ----------------*- C++ -*-===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -18,7 +18,7 @@
 #ifndef MLIR_ANALYSIS_DOMINANCE_H
 #define MLIR_ANALYSIS_DOMINANCE_H
 
-#include "mlir/IR/FunctionGraphTraits.h"
+#include "mlir/IR/RegionGraphTraits.h"
 #include "llvm/Support/GenericDomTree.h"
 
 extern template class llvm::DominatorTreeBase<mlir::Block, false>;
@@ -26,22 +26,22 @@ extern template class llvm::DominatorTreeBase<mlir::Block, true>;
 
 namespace mlir {
 using DominanceInfoNode = llvm::DomTreeNodeBase<Block>;
-class Function;
+class Operation;
 
 namespace detail {
 template <bool IsPostDom> class DominanceInfoBase {
   using base = llvm::DominatorTreeBase<Block, IsPostDom>;
 
 public:
-  DominanceInfoBase(Function *function) { recalculate(function); }
+  DominanceInfoBase(Operation *op) { recalculate(op); }
   DominanceInfoBase(DominanceInfoBase &&) = default;
   DominanceInfoBase &operator=(DominanceInfoBase &&) = default;
 
   DominanceInfoBase(const DominanceInfoBase &) = delete;
   DominanceInfoBase &operator=(const DominanceInfoBase &) = delete;
 
-  /// Recalculate the dominance info for the provided function.
-  void recalculate(Function *function);
+  /// Recalculate the dominance info.
+  void recalculate(Operation *op);
 
   /// Get the root dominance node of the given region.
   DominanceInfoNode *getRootNode(Region *region) {

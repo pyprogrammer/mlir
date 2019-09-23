@@ -1,4 +1,4 @@
-//===- Argument.cpp - Argument definitions ----------------------*- C++ -*-===//
+//===- Argument.cpp - Argument definitions --------------------------------===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -22,4 +22,8 @@ using namespace mlir;
 
 bool tblgen::NamedTypeConstraint::hasPredicate() const {
   return !constraint.getPredicate().isNull();
+}
+
+bool tblgen::NamedTypeConstraint::isVariadic() const {
+  return constraint.isVariadic();
 }

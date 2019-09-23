@@ -18,15 +18,13 @@
 #ifndef MLIR_IR_TYPES_H
 #define MLIR_IR_TYPES_H
 
-#include "mlir/IR/Location.h"
 #include "mlir/IR/TypeSupport.h"
-#include "mlir/Support/LLVM.h"
-#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMapInfo.h"
 
 namespace mlir {
 class FloatType;
+class Identifier;
 class IndexType;
 class IntegerType;
 class MLIRContext;
@@ -80,8 +78,9 @@ struct OpaqueTypeStorage;
 ///      instance of the type within its kind.
 ///      * The key type must be constructible from the values passed into the
 ///        detail::TypeUniquer::get call after the type kind.
-///      * The key type must have a llvm::DenseMapInfo specialization for
-///        hashing.
+///      * If the KeyTy does not have an llvm::DenseMapInfo specialization, the
+///        storage class must define a hashing method:
+///         'static unsigned hashKey(const KeyTy &)'
 ///
 ///    - Provide a method, 'bool operator==(const KeyTy &) const', to
 ///      compare the storage instance against an instance of the key type.
@@ -105,96 +104,42 @@ public:
     LAST_BUILTIN_TYPE = Opaque,
 
   // Reserve type kinds for dialect specific type system extensions.
-#define DEFINE_TYPE_KIND_RANGE(Dialect)                                        \
+#define DEFINE_SYM_KIND_RANGE(Dialect)                                         \
   FIRST_##Dialect##_TYPE, LAST_##Dialect##_TYPE = FIRST_##Dialect##_TYPE + 0xff,
-#include "DialectTypeRegistry.def"
+#include "DialectSymbolRegistry.def"
   };
 
-  /// Utility class for implementing types. Clients are not expected to interact
-  /// with this class directly. The template arguments to this class are defined
-  /// as follows:
-  ///   - ConcreteType
-  ///     * The top level derived class type.
-  ///
-  ///   - BaseType
-  ///     * The base type class that this utility should derive from, e.g Type,
-  ///       TensorType, TensorOrVectorType.
-  ///
-  ///   - StorageType
-  ///     * The type storage object containing the necessary instance
-  ///       information for the ConcreteType.
+  /// Utility class for implementing types.
   template <typename ConcreteType, typename BaseType,
             typename StorageType = DefaultTypeStorage>
-  class TypeBase : public BaseType {
-  public:
-    using BaseType::BaseType;
-
-    /// Utility declarations for the concrete type class.
-    using Base = TypeBase<ConcreteType, BaseType, StorageType>;
-    using ImplType = StorageType;
-
-    /// Return a unique identifier for the concrete type.
-    static TypeID *getTypeID() { return TypeID::getID<ConcreteType>(); }
-
-  protected:
-    /// Get or create a new ConcreteType instance within the context. This
-    /// function is guaranteed to return a non null type and will assert if the
-    /// arguments provided are invalid.
-    template <typename... Args>
-    static ConcreteType get(MLIRContext *context, unsigned kind, Args... args) {
-      // Ensure that the invariants are correct for type construction.
-      assert(succeeded(ConcreteType::verifyConstructionInvariants(
-          llvm::None, context, args...)));
-      return detail::TypeUniquer::get<ConcreteType>(context, kind, args...);
-    }
-
-    /// Get or create a new ConcreteType instance within the context, defined at
-    /// the given, potentially unknown, location. If the arguments provided are
-    /// invalid then emit errors and return a null type.
-    template <typename... Args>
-    static ConcreteType getChecked(Location loc, MLIRContext *context,
-                                   unsigned kind, Args... args) {
-      // If the construction invariants fail then we return a null type.
-      if (failed(ConcreteType::verifyConstructionInvariants(loc, context,
-                                                            args...)))
-        return ConcreteType();
-      return detail::TypeUniquer::get<ConcreteType>(context, kind, args...);
-    }
-
-    /// Default implementation that just returns success.
-    template <typename... Args>
-    static LogicalResult
-    verifyConstructionInvariants(llvm::Optional<Location> loc,
-                                 MLIRContext *context, Args... args) {
-      return success();
-    }
-
-    /// Utility for easy access to the storage instance.
-    ImplType *getImpl() const { return static_cast<ImplType *>(this->type); }
-  };
+  using TypeBase = detail::StorageUserBase<ConcreteType, BaseType, StorageType,
+                                           detail::TypeUniquer>;
 
   using ImplType = TypeStorage;
 
-  Type() : type(nullptr) {}
-  /* implicit */ Type(const ImplType *type)
-      : type(const_cast<ImplType *>(type)) {}
+  Type() : impl(nullptr) {}
+  /* implicit */ Type(const ImplType *impl)
+      : impl(const_cast<ImplType *>(impl)) {}
 
-  Type(const Type &other) : type(other.type) {}
+  Type(const Type &other) : impl(other.impl) {}
   Type &operator=(Type other) {
-    type = other.type;
+    impl = other.impl;
     return *this;
   }
 
-  bool operator==(Type other) const { return type == other.type; }
+  bool operator==(Type other) const { return impl == other.impl; }
   bool operator!=(Type other) const { return !(*this == other); }
-  explicit operator bool() const { return type; }
+  explicit operator bool() const { return impl; }
 
-  bool operator!() const { return type == nullptr; }
+  bool operator!() const { return impl == nullptr; }
 
   template <typename U> bool isa() const;
   template <typename U> U dyn_cast() const;
   template <typename U> U dyn_cast_or_null() const;
   template <typename U> U cast() const;
+
+  // Support type casting Type to itself.
+  static bool classof(Type) { return true; }
 
   /// Return the classification for this type.
   unsigned getKind() const;
@@ -203,33 +148,33 @@ public:
   MLIRContext *getContext() const;
 
   /// Get the dialect this type is registered to.
-  const Dialect &getDialect() const;
+  Dialect &getDialect() const;
 
   // Convenience predicates.  This is only for floating point types,
   // derived types should use isa/dyn_cast.
-  bool isIndex() const;
-  bool isBF16() const;
-  bool isF16() const;
-  bool isF32() const;
-  bool isF64() const;
+  bool isIndex();
+  bool isBF16();
+  bool isF16();
+  bool isF32();
+  bool isF64();
 
   /// Return true if this is an integer type with the specified width.
-  bool isInteger(unsigned width) const;
+  bool isInteger(unsigned width);
 
   /// Return the bit width of an integer or a float type, assert failure on
   /// other types.
-  unsigned getIntOrFloatBitWidth() const;
+  unsigned getIntOrFloatBitWidth();
 
   /// Return true if this is an integer or index type.
-  bool isIntOrIndex() const;
+  bool isIntOrIndex();
   /// Return true if this is an integer, index, or float type.
-  bool isIntOrIndexOrFloat() const;
+  bool isIntOrIndexOrFloat();
   /// Return true of this is an integer or a float type.
-  bool isIntOrFloat() const;
+  bool isIntOrFloat();
 
   /// Print the current type.
-  void print(raw_ostream &os) const;
-  void dump() const;
+  void print(raw_ostream &os);
+  void dump();
 
   friend ::llvm::hash_code hash_value(Type arg);
 
@@ -238,14 +183,14 @@ public:
 
   /// Methods for supporting PointerLikeTypeTraits.
   const void *getAsOpaquePointer() const {
-    return static_cast<const void *>(type);
+    return static_cast<const void *>(impl);
   }
   static Type getFromOpaquePointer(const void *pointer) {
     return Type(reinterpret_cast<ImplType *>(const_cast<void *>(pointer)));
   }
 
 protected:
-  ImplType *type;
+  ImplType *impl;
 };
 
 inline raw_ostream &operator<<(raw_ostream &os, Type type) {
@@ -315,22 +260,22 @@ public:
 
 // Make Type hashable.
 inline ::llvm::hash_code hash_value(Type arg) {
-  return ::llvm::hash_value(arg.type);
+  return ::llvm::hash_value(arg.impl);
 }
 
 template <typename U> bool Type::isa() const {
-  assert(type && "isa<> used on a null type.");
-  return U::kindof(getKind());
+  assert(impl && "isa<> used on a null type.");
+  return U::classof(*this);
 }
 template <typename U> U Type::dyn_cast() const {
-  return isa<U>() ? U(type) : U(nullptr);
+  return isa<U>() ? U(impl) : U(nullptr);
 }
 template <typename U> U Type::dyn_cast_or_null() const {
-  return (type && isa<U>()) ? U(type) : U(nullptr);
+  return (impl && isa<U>()) ? U(impl) : U(nullptr);
 }
 template <typename U> U Type::cast() const {
   assert(isa<U>());
-  return U(type);
+  return U(impl);
 }
 
 } // end namespace mlir

@@ -24,19 +24,21 @@
 #define MLIR_ANALYSIS_PASSES_H
 
 #include "mlir/Support/LLVM.h"
+#include <memory>
 
 namespace mlir {
 
-class FunctionPassBase;
+class FuncOp;
+template <typename T> class OpPassBase;
 
-/// Creates a pass to check memref accesses in an ML Function.
-FunctionPassBase *createMemRefBoundCheckPass();
+/// Creates a pass to check memref accesses in a Function.
+std::unique_ptr<OpPassBase<FuncOp>> createMemRefBoundCheckPass();
 
-/// Creates a pass to check memref access dependences in an ML Function.
-FunctionPassBase *createMemRefDependenceCheckPass();
+/// Creates a pass to check memref access dependences in a Function.
+std::unique_ptr<OpPassBase<FuncOp>> createTestMemRefDependenceCheckPass();
 
 /// Creates a pass to test parallelism detection; emits note for parallel loops.
-FunctionPassBase *createParallelismDetectionTestPass();
+std::unique_ptr<OpPassBase<FuncOp>> createParallelismDetectionTestPass();
 
 } // end namespace mlir
 

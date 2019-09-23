@@ -72,7 +72,6 @@ public:
 private:
   // Same meaning as AffineMap's fields.
   SmallVector<AffineExpr, 8> results;
-  SmallVector<AffineExpr, 8> rangeSizes;
   unsigned numDims;
   unsigned numSymbols;
   /// A pointer to the IR's context to store all newly created
@@ -104,9 +103,6 @@ private:
 
   SmallVector<AffineExpr, 8> constraints;
   SmallVector<bool, 8> eqFlags;
-  /// A pointer to the IR's context to store all newly created
-  /// AffineExprStorage's.
-  MLIRContext *context;
 };
 
 /// An AffineValueMap is an affine map plus its ML value operands and
@@ -127,7 +123,6 @@ public:
   // Creates an empty AffineValueMap (users should call 'reset' to reset map
   // and operands).
   AffineValueMap() {}
-  AffineValueMap(AffineMap map);
   AffineValueMap(AffineMap map, ArrayRef<Value *> operands,
                  ArrayRef<Value *> results = llvm::None);
 
@@ -139,6 +134,12 @@ public:
   // Resets this AffineValueMap with 'map', 'operands', and 'results'.
   void reset(AffineMap map, ArrayRef<Value *> operands,
              ArrayRef<Value *> results = llvm::None);
+
+  /// Return the value map that is the difference of value maps 'a' and 'b',
+  /// represented as an affine map and its operands. The output map + operands
+  /// are canonicalized and simplified.
+  static void difference(const AffineValueMap &a, const AffineValueMap &b,
+                         AffineValueMap *res);
 
   /// Return true if the idx^th result can be proved to be a multiple of
   /// 'factor', false otherwise.
@@ -154,6 +155,8 @@ public:
   /// Return true if this is an identity map.
   bool isIdentity() const;
 
+  void setResult(unsigned i, AffineExpr e) { map.setResult(i, e); }
+  AffineExpr getResult(unsigned i) { return map.getResult(i); }
   inline unsigned getNumOperands() const { return operands.size(); }
   inline unsigned getNumDims() const { return map.getNumDims(); }
   inline unsigned getNumSymbols() const { return map.getNumSymbols(); }
@@ -208,8 +211,8 @@ private:
 };
 
 /// A flat list of affine equalities and inequalities in the form.
-/// Inequality: c_0*x_0 + c_1*x_1 + .... + c_{n-1}*x_{n-1} == 0
-/// Equality: c_0*x_0 + c_1*x_1 + .... + c_{n-1}*x_{n-1} >= 0
+/// Inequality: c_0*x_0 + c_1*x_1 + .... + c_{n-1}*x_{n-1} >= 0
+/// Equality: c_0*x_0 + c_1*x_1 + .... + c_{n-1}*x_{n-1} == 0
 ///
 /// FlatAffineConstraints stores coefficients in a contiguous buffer (one buffer
 /// for equalities and one for inequalities). The size of each buffer is
@@ -383,8 +386,8 @@ public:
   /// constraint system. Returns failure for the yet unimplemented/unsupported
   /// cases.  Any new identifiers that are found in the bound operands of the
   /// 'affine.for' operation are added as trailing identifiers (either
-  /// dimensional or symbolic depending on whether the operand is a valid ML
-  /// Function symbol).
+  /// dimensional or symbolic depending on whether the operand is a valid
+  /// symbol).
   //  TODO(bondhugula): add support for non-unit strides.
   LogicalResult addAffineForOpDomain(AffineForOp forOp);
 
@@ -397,12 +400,12 @@ public:
                                      bool lower = true);
 
   /// Computes the lower and upper bounds of the first 'num' dimensional
-  /// identifiers as an affine map of the remaining identifiers (dimensional and
-  /// symbolic). This method is able to detect identifiers as floordiv's
-  /// and mod's of affine expressions of other identifiers with respect to
-  /// (positive) constants. Sets bound map to a null AffineMap if such a bound
-  /// can't be found (or yet unimplemented).
-  void getSliceBounds(unsigned num, MLIRContext *context,
+  /// identifiers (starting at 'offset') as an affine map of the remaining
+  /// identifiers (dimensional and symbolic). This method is able to detect
+  /// identifiers as floordiv's and mod's of affine expressions of other
+  /// identifiers with respect to (positive) constants. Sets bound map to a
+  /// null AffineMap if such a bound can't be found (or yet unimplemented).
+  void getSliceBounds(unsigned offset, unsigned num, MLIRContext *context,
                       SmallVectorImpl<AffineMap> *lbMaps,
                       SmallVectorImpl<AffineMap> *ubMaps);
 
@@ -481,7 +484,13 @@ public:
   /// symbolic operands of vMap should match 1:1 (in the same order) with those
   /// of this constraint system, but the latter could have additional trailing
   /// operands.
-  LogicalResult composeMap(AffineValueMap *vMap);
+  LogicalResult composeMap(const AffineValueMap *vMap);
+
+  /// Composes an affine map whose dimensions match one to one to the
+  /// dimensions of this FlatAffineConstraints. The results of the map 'other'
+  /// are added as the leading dimensions of this constraint system. Returns
+  /// failure if 'other' is a semi-affine map.
+  LogicalResult composeMatchingMap(AffineMap other);
 
   /// Projects out (aka eliminates) 'num' identifiers starting at position
   /// 'pos'. The resulting constraint system is the shadow along the dimensions
@@ -523,12 +532,6 @@ public:
   /// 'num' identifiers starting at position 'pos'.
   void constantFoldIdRange(unsigned pos, unsigned num);
 
-  /// Returns true if all the identifiers in the specified range [start, limit)
-  /// can only take a single value each if the remaining identifiers are treated
-  /// as symbols/parameters, i.e., for given values of the latter, there only
-  /// exists a unique value for each of the dimensions in the specified range.
-  bool isRangeOneToOne(unsigned start, unsigned limit) const;
-
   /// Updates the constraints to be the smallest bounding (enclosing) box that
   /// contains the points of 'this' set and that of 'other', with the symbols
   /// being treated specially. For each of the dimensions, the min of the lower
@@ -543,6 +546,25 @@ public:
   /// 3) 'this' = {0 <= d0 <= 5, 1 <= d1 <= 9}, 'other' = {2 <= d0 <= 6, 5 <= d1
   ///     <= 15}, output = {0 <= d0 <= 6, 1 <= d1 <= 15}.
   LogicalResult unionBoundingBox(const FlatAffineConstraints &other);
+
+  /// Returns 'true' if this constraint system and 'other' are in the same
+  /// space, i.e., if they are associated with the same set of identifiers,
+  /// appearing in the same order. Returns 'false' otherwise.
+  bool areIdsAlignedWithOther(const FlatAffineConstraints &other);
+
+  /// Merge and align the identifiers of 'this' and 'other' starting at
+  /// 'offset', so that both constraint systems get the union of the contained
+  /// identifiers that is dimension-wise and symbol-wise unique; both
+  /// constraint systems are updated so that they have the union of all
+  /// identifiers, with this's original identifiers appearing first followed by
+  /// any of other's identifiers that didn't appear in 'this'. Local
+  /// identifiers of each system are by design separate/local and are placed
+  /// one after other (this's followed by other's).
+  //  Eg: Input: 'this'  has ((%i %j) [%M %N])
+  //             'other' has (%k, %j) [%P, %N, %M])
+  //      Output: both 'this', 'other' have (%i, %j, %k) [%M, %N, %P]
+  //
+  void mergeAndAlignIdsWithOther(unsigned offset, FlatAffineConstraints *other);
 
   unsigned getNumConstraints() const {
     return getNumInequalities() + getNumEqualities();
@@ -633,13 +655,14 @@ public:
   Optional<int64_t> getConstantUpperBound(unsigned pos) const;
 
   /// Gets the lower and upper bound of the pos^th identifier treating
-  /// [dimStartPos, symbStartPos) as dimensions and [symStartPos,
-  /// getNumDimAndSymbolIds) as symbols. The returned multi-dimensional maps
-  /// in the pair represent the max and min of potentially multiple affine
-  /// expressions. The upper bound is exclusive. 'localExprs' holds pre-computed
-  /// AffineExpr's for all local identifiers in the system.
+  /// [0, offset) U [offset + num, symbStartPos) as dimensions and
+  /// [symStartPos, getNumDimAndSymbolIds) as symbols. The returned
+  /// multi-dimensional maps in the pair represent the max and min of
+  /// potentially multiple affine expressions. The upper bound is exclusive.
+  /// 'localExprs' holds pre-computed AffineExpr's for all local identifiers in
+  /// the system.
   std::pair<AffineMap, AffineMap>
-  getLowerAndUpperBound(unsigned pos, unsigned dimStartPos,
+  getLowerAndUpperBound(unsigned pos, unsigned offset, unsigned num,
                         unsigned symStartPos, ArrayRef<AffineExpr> localExprs,
                         MLIRContext *context);
 

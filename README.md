@@ -13,8 +13,8 @@ main TensorFlow repository soon.
 
 # How to Contribute
 
-We'd love to accept your patches and contributions to this project soon. But we
-are not yet ready to accept community contributions at this time.
+Thank you for your interest in contributing to MLIR! If you want to contribute
+to MLIR, be sure to review the [contribution guidelines](CONTRIBUTING.md).
 
 ## More resources
 
@@ -28,6 +28,14 @@ For more information on MLIR, please see:
 
 Join the [MLIR mailing list](https://groups.google.com/a/tensorflow.org/forum/#!forum/mlir)
 to hear about announcements and discussions.
+
+We also have an [MLIR SIG](https://github.com/tensorflow/community/blob/master/sigs/mlir/CHARTER.md)
+which was created to enable collaboration and form a strong
+engineering-driven open community. We have weekly 'Open Design Meetings'. If you’d like
+to discuss a particular topic or have questions, please add it to the [agenda doc](https://docs.google.com/document/d/1y_9f1AbfgcoVdJh4_aM6-BaSHvrHl8zuA5G4jv_94K8/edit#).
+Details on how to join the meeting are in the agenda doc. You
+should also get an invite when you join the mailing list.
+
 Please be mindful of the [TensorFlow Code of Conduct](https://github.com/tensorflow/tensorflow/blob/master/CODE_OF_CONDUCT.md),
 which pledges to foster an open and welcoming environment.
 
@@ -67,7 +75,7 @@ project that compiles down to MLIR.
 
 ## Compiler infrastructure
 
-We benefitted from experience gained from building other IRs (HLO, LLVM and SIL)
+We benefited from experience gained from building other IRs (HLO, LLVM and SIL)
 when building MLIR. We will directly adopt existing best practices, e.g. writing
 and maintaining an IR spec, building an IR verifier, providing the ability to
 dump and parse MLIR files to text, writing extensive unit tests with the
@@ -84,18 +92,33 @@ and by making references explicit with `function_ref`.
 
 # Getting started with MLIR
 
-The following instructions assume that you have `git`,
-[`ninja`](https://ninja-build.org/), and a working C++ toolchain. In the future,
-we aim to align on the same level of platform support as
+The following instructions for compiling and testing MLIR assume that you have
+`git`, [`ninja`](https://ninja-build.org/), and a working C++ toolchain. In the
+future, we aim to align on the same level of platform support as
 [LLVM](https://llvm.org/docs/GettingStarted.html#requirements). For now, MLIR
-has been tested on Linux and macOS, with recent versions of clang and with gcc 7.
+has been tested on Linux and macOS, with recent versions of clang and with
+gcc 7.
 
-```
+```sh
 git clone https://github.com/llvm/llvm-project.git
 git clone https://github.com/tensorflow/mlir llvm-project/llvm/projects/mlir
 mkdir llvm-project/build
 cd llvm-project/build
-cmake -G Ninja ../llvm -DLLVM_BUILD_EXAMPLES=ON -DLLVM_ENABLE_CXX1Y=Y -DLLVM_TARGETS_TO_BUILD="host"
+cmake -G Ninja ../llvm -DLLVM_BUILD_EXAMPLES=ON -DLLVM_TARGETS_TO_BUILD="host"
+cmake --build . --target check-mlir
+```
+
+To compile and test on Windows using Visual Studio 2017:
+
+```bat
+REM In shell with Visual Studio environment set up, e.g., with command such as
+REM   $visual-studio-install\Auxiliary\Build\vcvarsall.bat" x64
+REM invoked.
+git clone https://github.com/llvm/llvm-project.git
+git clone https://github.com/tensorflow/mlir llvm-project\llvm\projects\mlir
+mkdir llvm-project\build
+cd llvm-project\build
+cmake ..\llvm -G "Visual Studio 15 2017 Win64" -DLLVM_BUILD_EXAMPLES=ON -DLLVM_TARGETS_TO_BUILD="host" -DCMAKE_BUILD_TYPE=Release -Thost=x64
 cmake --build . --target check-mlir
 ```
 
@@ -104,8 +127,7 @@ building a compiler for a Toy language.
 
 # MLIR talks
 
-* "[MLIR Primer: A Compiler Infrastructure for the End of Moore’s
-    Law](https://drive.google.com/file/d/1hUeAJXcAXwz82RXA5VtO5ZoH8cVQhrOK/view?usp=sharing)"
+* "[MLIR Primer: A Compiler Infrastructure for the End of Moore’s Law](https://ai.google/research/pubs/pub48035.pdf)"
   * Chris Lattner & Jacques Pienaar, Google at
     [Compilers for Machine Learning](https://www.c4ml.org/) workshop at
     [CGO 2019](http://cgo.org/cgo2019/)

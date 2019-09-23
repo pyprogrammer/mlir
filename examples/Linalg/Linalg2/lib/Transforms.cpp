@@ -28,9 +28,11 @@
 #include "mlir/IR/StandardTypes.h"
 
 using llvm::ArrayRef;
+using llvm::cast;
+using llvm::isa;
 using llvm::SmallVector;
-using mlir::FuncBuilder;
 using mlir::MemRefType;
+using mlir::OpBuilder;
 using mlir::Value;
 using mlir::edsc::ScopedContext;
 using mlir::edsc::ValueHandle;
@@ -43,17 +45,17 @@ using namespace linalg::intrinsics;
 // analyses. This builds the chain.
 static SmallVector<Value *, 8> getViewChain(mlir::Value *v) {
   assert(v->getType().isa<ViewType>() && "ViewType expected");
-  if (v->getDefiningOp()->dyn_cast<ViewOp>()) {
+  if (isa<ViewOp>(v->getDefiningOp())) {
     return SmallVector<mlir::Value *, 8>{v};
   }
 
   SmallVector<mlir::Value *, 8> tmp;
   do {
-    auto sliceOp = v->getDefiningOp()->cast<SliceOp>(); // must be a slice op
+    auto sliceOp = cast<SliceOp>(v->getDefiningOp()); // must be a slice op
     tmp.push_back(v);
     v = sliceOp.getParentView();
   } while (!v->getType().isa<ViewType>());
-  assert(v->getDefiningOp()->cast<ViewOp>() && "must be a ViewOp");
+  assert(isa<ViewOp>(v->getDefiningOp()) && "must be a ViewOp");
   tmp.push_back(v);
   return SmallVector<mlir::Value *, 8>(tmp.rbegin(), tmp.rend());
 }
@@ -62,15 +64,15 @@ static mlir::Value *createFullyComposedIndexing(unsigned dim,
                                                 ArrayRef<Value *> chain) {
   using namespace mlir::edsc::op;
   assert(chain.front()->getType().isa<ViewType>() && "must be a ViewType");
-  auto viewOp = chain.front()->getDefiningOp()->cast<ViewOp>();
+  auto viewOp = cast<ViewOp>(chain.front()->getDefiningOp());
   auto *indexing = viewOp.getIndexing(dim);
   if (!indexing->getType().isa<RangeType>())
     return indexing;
-  auto rangeOp = indexing->getDefiningOp()->cast<RangeOp>();
+  auto rangeOp = cast<RangeOp>(indexing->getDefiningOp());
   Value *min = rangeOp.getMin(), *max = rangeOp.getMax(),
         *step = rangeOp.getStep();
   for (auto *v : chain.drop_front(1)) {
-    auto slice = v->getDefiningOp()->cast<SliceOp>();
+    auto slice = cast<SliceOp>(v->getDefiningOp());
     if (slice.getRank() != slice.getParentRank()) {
       // Rank-reducing slice.
       if (slice.getSlicingDim() == dim) {
@@ -82,7 +84,7 @@ static mlir::Value *createFullyComposedIndexing(unsigned dim,
       dim = (slice.getSlicingDim() < dim) ? dim - 1 : dim;
     } else { // not a rank-reducing slice.
       if (slice.getSlicingDim() == dim) {
-        auto range = slice.getIndexing()->getDefiningOp()->cast<RangeOp>();
+        auto range = cast<RangeOp>(slice.getIndexing()->getDefiningOp());
         auto oldMin = min;
         min = ValueHandle(min) + ValueHandle(range.getMin());
         // ideally: max = min(oldMin + ValueHandle(range.getMax()), oldMax);
@@ -99,8 +101,8 @@ static mlir::Value *createFullyComposedIndexing(unsigned dim,
 }
 
 ViewOp linalg::emitAndReturnFullyComposedView(Value *v) {
-  ScopedContext scope(FuncBuilder(v->getDefiningOp()),
-                      v->getDefiningOp()->getLoc());
+  OpBuilder builder(v->getDefiningOp());
+  ScopedContext scope(builder, v->getDefiningOp()->getLoc());
   assert(v->getType().isa<ViewType>() && "must be a ViewType");
   auto *memRef = getViewSupportingMemRef(v);
   auto chain = getViewChain(v);
@@ -110,5 +112,5 @@ ViewOp linalg::emitAndReturnFullyComposedView(Value *v) {
   for (unsigned idx = 0; idx < rank; ++idx) {
     ranges.push_back(createFullyComposedIndexing(idx, chain));
   }
-  return view(memRef, ranges).getOperation()->cast<ViewOp>();
+  return cast<ViewOp>(view(memRef, ranges).getOperation());
 }

@@ -23,10 +23,11 @@
 #ifndef MLIR_EDSC_BUILDERS_H_
 #define MLIR_EDSC_BUILDERS_H_
 
-#include "mlir/AffineOps/AffineOps.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
+#include "mlir/Dialect/VectorOps/VectorOps.h"
 #include "mlir/IR/Builders.h"
-#include "mlir/StandardOps/Ops.h"
-#include "mlir/VectorOps/VectorOps.h"
+#include "mlir/Transforms/FoldUtils.h"
 
 namespace mlir {
 
@@ -50,13 +51,17 @@ class ValueHandle;
 /// setting and restoring of insertion points.
 class ScopedContext {
 public:
-  /// Sets location to fun->getLoc() in case the provided Loction* is null.
-  ScopedContext(Function *fun, Location *loc = nullptr);
-  ScopedContext(FuncBuilder builder, Location location);
+  ScopedContext(OpBuilder &builder, Location location);
+
+  /// Sets the insertion point of the builder to 'newInsertPt' for the duration
+  /// of the scope. The existing insertion point of the builder is restored on
+  /// destruction.
+  ScopedContext(OpBuilder &builder, OpBuilder::InsertPoint newInsertPt,
+                Location location);
   ~ScopedContext();
 
   static MLIRContext *getContext();
-  static FuncBuilder *getBuilder();
+  static OpBuilder &getBuilder();
   static Location getLocation();
 
 private:
@@ -70,8 +75,10 @@ private:
 
   static ScopedContext *&getCurrentScopedContext();
 
-  /// Current FuncBuilder.
-  FuncBuilder builder;
+  /// Top level OpBuilder.
+  OpBuilder &builder;
+  /// The previous insertion point of the builder.
+  llvm::Optional<OpBuilder::InsertPoint> prevBuilderInsertPoint;
   /// Current location.
   Location location;
   /// Parent context we return into.
@@ -110,19 +117,20 @@ protected:
   /// Enter an mlir::Block and setup a ScopedContext to insert operations at
   /// the end of it. Since we cannot use c++ language-level scoping to implement
   /// scoping itself, we use enter/exit pairs of operations.
-  /// As a consequence we must allocate a new FuncBuilder + ScopedContext and
+  /// As a consequence we must allocate a new OpBuilder + ScopedContext and
   /// let the escape.
   /// Step back "prev" times from the end of the block to set up the insertion
   /// point, which is useful for non-empty blocks.
   void enter(mlir::Block *block, int prev = 0) {
-    bodyScope =
-        new ScopedContext(FuncBuilder(block, std::prev(block->end(), prev)),
-                          ScopedContext::getLocation());
+    bodyScope = new ScopedContext(
+        ScopedContext::getBuilder(),
+        OpBuilder::InsertPoint(block, std::prev(block->end(), prev)),
+        ScopedContext::getLocation());
     bodyScope->nestedBuilder = this;
   }
 
   /// Exit the current mlir::Block by explicitly deleting the dynamically
-  /// allocated FuncBuilder and ScopedContext.
+  /// allocated OpBuilder and ScopedContext.
   void exit() {
     // Reclaim now to exit the scope.
     bodyScope->nestedBuilder = nullptr;
@@ -162,12 +170,9 @@ public:
   LoopBuilder &operator=(LoopBuilder &&) = default;
 
   /// The only purpose of this operator is to serve as a sequence point so that
-  /// the evaluation of `stmts` (which build IR snippets in a scoped fashion) is
-  /// sequenced strictly after the constructor of LoopBuilder.
-  /// In order to be admissible in a nested ArrayRef<ValueHandle>, operator()
-  /// returns a ValueHandle::null() that cannot be captured.
-  // TODO(ntv): when loops return escaping ssa-values, this should be adapted.
-  ValueHandle operator()(ArrayRef<CapturableHandle> stmts);
+  /// the evaluation of `fun` (which build IR snippets in a scoped fashion) is
+  /// scoped within a LoopBuilder.
+  ValueHandle operator()(llvm::function_ref<void(void)> fun = nullptr);
 };
 
 /// Explicit nested LoopBuilder. Offers a compressed multi-loop builder to avoid
@@ -177,15 +182,16 @@ public:
 /// Usage:
 ///
 /// ```c++
-///    LoopNestBuilder({&i, &j, &k}, {lb, lb, lb}, {ub, ub, ub}, {1, 1, 1})({
-///      ...
-///    });
+///    LoopNestBuilder({&i, &j, &k}, {lb, lb, lb}, {ub, ub, ub}, {1, 1, 1})(
+///      [&](){
+///        ...
+///      });
 /// ```
 ///
 /// ```c++
-///    LoopNestBuilder({&i}, {lb}, {ub}, {1})({
-///      LoopNestBuilder({&j}, {lb}, {ub}, {1})({
-///        LoopNestBuilder({&k}, {lb}, {ub}, {1})({
+///    LoopNestBuilder({&i}, {lb}, {ub}, {1})([&](){
+///      LoopNestBuilder({&j}, {lb}, {ub}, {1})([&](){
+///        LoopNestBuilder({&k}, {lb}, {ub}, {1})([&](){
 ///          ...
 ///        }),
 ///      }),
@@ -196,8 +202,7 @@ public:
   LoopNestBuilder(ArrayRef<ValueHandle *> ivs, ArrayRef<ValueHandle> lbs,
                   ArrayRef<ValueHandle> ubs, ArrayRef<int64_t> steps);
 
-  // TODO(ntv): when loops return escaping ssa-values, this should be adapted.
-  ValueHandle operator()(ArrayRef<CapturableHandle> stmts);
+  ValueHandle operator()(llvm::function_ref<void(void)> fun = nullptr);
 
 private:
   SmallVector<LoopBuilder, 4> loops;
@@ -228,9 +233,9 @@ public:
   BlockBuilder(BlockHandle *bh, ArrayRef<ValueHandle *> args);
 
   /// The only purpose of this operator is to serve as a sequence point so that
-  /// the evaluation of `stmts` (which build IR snippets in a scoped fashion) is
-  /// sequenced strictly after the constructor of BlockBuilder.
-  void operator()(ArrayRef<CapturableHandle> stmts);
+  /// the evaluation of `fun` (which build IR snippets in a scoped fashion) is
+  /// scoped within a BlockBuilder.
+  void operator()(llvm::function_ref<void(void)> fun = nullptr);
 
 private:
   BlockBuilder(BlockBuilder &) = delete;
@@ -239,7 +244,7 @@ private:
 
 /// Base class for ValueHandle, OperationHandle and BlockHandle.
 /// Not meant to be used outside of these classes.
-struct CapturableHandle {
+class CapturableHandle {
 protected:
   CapturableHandle() = default;
 };
@@ -249,7 +254,7 @@ protected:
 /// everywhere.
 /// A ValueHandle can have 3 states:
 ///   1. null state (empty type and empty value), in which case it does not hold
-///      a value and may never hold a Value (not now of in the future). This is
+///      a value and must never hold a Value (now or in the future). This is
 ///      used for MLIR operations with zero returns as well as the result of
 ///      calling a NestedBuilder::operator(). In both cases the objective is to
 ///      have an object that can be inserted in an ArrayRef<ValueHandle> to
@@ -311,6 +316,11 @@ public:
   template <typename Op, typename... Args>
   static ValueHandle create(Args... args);
 
+  /// Generic mlir::Op create. This is the key to being extensible to the whole
+  /// of MLIR without duplicating the type system or the op definitions.
+  template <typename Op, typename... Args>
+  static ValueHandle create(OperationFolder &folder, Args... args);
+
   /// Special case to build composed AffineApply operations.
   // TODO: createOrFold when available and move inside of the `create` method.
   static ValueHandle createComposedAffineApply(AffineMap map,
@@ -360,6 +370,7 @@ struct OperationHandle : public CapturableHandle {
   /// of MLIR without duplicating the type system or the op definitions.
   template <typename Op, typename... Args>
   static OperationHandle create(Args... args);
+  template <typename Op, typename... Args> static Op createOp(Args... args);
 
   /// Generic create for a named operation.
   static OperationHandle create(StringRef name, ArrayRef<ValueHandle> operands,
@@ -427,23 +438,38 @@ private:
 template <typename Op, typename... Args>
 OperationHandle OperationHandle::create(Args... args) {
   return OperationHandle(ScopedContext::getBuilder()
-                             ->create<Op>(ScopedContext::getLocation(), args...)
+                             .create<Op>(ScopedContext::getLocation(), args...)
                              .getOperation());
+}
+
+template <typename Op, typename... Args>
+Op OperationHandle::createOp(Args... args) {
+  return cast<Op>(
+      OperationHandle(ScopedContext::getBuilder()
+                          .create<Op>(ScopedContext::getLocation(), args...)
+                          .getOperation())
+          .getOperation());
 }
 
 template <typename Op, typename... Args>
 ValueHandle ValueHandle::create(Args... args) {
   Operation *op = ScopedContext::getBuilder()
-                      ->create<Op>(ScopedContext::getLocation(), args...)
+                      .create<Op>(ScopedContext::getLocation(), args...)
                       .getOperation();
   if (op->getNumResults() == 1) {
     return ValueHandle(op->getResult(0));
   } else if (op->getNumResults() == 0) {
-    if (auto f = op->dyn_cast<AffineForOp>()) {
+    if (auto f = dyn_cast<AffineForOp>(op)) {
       return ValueHandle(f.getInductionVar());
     }
   }
   llvm_unreachable("unsupported operation, use an OperationHandle instead");
+}
+
+template <typename Op, typename... Args>
+ValueHandle ValueHandle::create(OperationFolder &folder, Args... args) {
+  return ValueHandle(folder.create<Op>(ScopedContext::getBuilder(),
+                                       ScopedContext::getLocation(), args...));
 }
 
 namespace op {

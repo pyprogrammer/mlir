@@ -17,6 +17,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
@@ -24,6 +25,7 @@
 #include <unordered_map>
 
 #include "mlir-c/Core.h"
+#include "mlir/Conversion/StandardToLLVM/ConvertStandardToLLVMPass.h"
 #include "mlir/EDSC/Builders.h"
 #include "mlir/EDSC/Helpers.h"
 #include "mlir/EDSC/Intrinsics.h"
@@ -33,6 +35,7 @@
 #include "mlir/IR/Module.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR.h"
 #include "mlir/Transforms/Passes.h"
 #include "pybind11/pybind11.h"
@@ -108,13 +111,14 @@ struct PythonValueHandle {
 struct PythonFunction {
   PythonFunction() : function{nullptr} {}
   PythonFunction(mlir_func_t f) : function{f} {}
-  PythonFunction(mlir::Function *f) : function{f} {}
+  PythonFunction(mlir::FuncOp f)
+      : function(const_cast<void *>(f.getAsOpaquePointer())) {}
   operator mlir_func_t() { return function; }
   std::string str() {
-    mlir::Function *f = reinterpret_cast<mlir::Function *>(function);
+    mlir::FuncOp f = mlir::FuncOp::getFromOpaquePointer(function);
     std::string res;
     llvm::raw_string_ostream os(res);
-    f->print(os);
+    f.print(os);
     return res;
   }
 
@@ -122,18 +126,18 @@ struct PythonFunction {
   // declaration, add the entry block, transforming the declaration into a
   // definition.  Return true if the block was added, false otherwise.
   bool define() {
-    auto *f = reinterpret_cast<mlir::Function *>(function);
-    if (!f->getBlocks().empty())
+    auto f = mlir::FuncOp::getFromOpaquePointer(function);
+    if (!f.getBlocks().empty())
       return false;
 
-    f->addEntryBlock();
+    f.addEntryBlock();
     return true;
   }
 
   PythonValueHandle arg(unsigned index) {
-    Function *f = static_cast<Function *>(function);
-    assert(index < f->getNumArguments() && "argument index out of bounds");
-    return PythonValueHandle(ValueHandle(f->getArgument(index)));
+    auto f = mlir::FuncOp::getFromOpaquePointer(function);
+    assert(index < f.getNumArguments() && "argument index out of bounds");
+    return PythonValueHandle(ValueHandle(f.getArgument(index)));
   }
 
   mlir_func_t function;
@@ -141,7 +145,10 @@ struct PythonFunction {
 
 /// Trivial C++ wrappers make use of the EDSC C API.
 struct PythonMLIRModule {
-  PythonMLIRModule() : mlirContext(), module(new mlir::Module(&mlirContext)) {}
+  PythonMLIRModule()
+      : mlirContext(),
+        module(mlir::ModuleOp::create(mlir::UnknownLoc::get(&mlirContext))),
+        moduleManager(*module) {}
 
   PythonType makeScalarType(const std::string &mlirElemType,
                             unsigned bitwidth) {
@@ -186,7 +193,17 @@ struct PythonMLIRModule {
   PythonAttribute boolAttr(bool value);
 
   void compile() {
-    auto created = mlir::ExecutionEngine::create(module.get());
+    PassManager manager(module->getContext());
+    manager.addPass(mlir::createCanonicalizerPass());
+    manager.addPass(mlir::createCSEPass());
+    manager.addPass(mlir::createLowerAffinePass());
+    manager.addPass(mlir::createLowerToLLVMPass());
+    if (failed(manager.run(*module))) {
+      llvm::errs() << "conversion to the LLVM IR dialect failed\n";
+      return;
+    }
+
+    auto created = mlir::ExecutionEngine::create(*module);
     llvm::handleAllErrors(created.takeError(),
                           [](const llvm::ErrorInfoBase &b) {
                             b.log(llvm::errs());
@@ -208,7 +225,7 @@ struct PythonMLIRModule {
   }
 
   PythonFunction getNamedFunction(const std::string &name) {
-    return module->getNamedFunction(name);
+    return moduleManager.lookupSymbol<FuncOp>(name);
   }
 
   PythonFunctionContext
@@ -219,7 +236,8 @@ struct PythonMLIRModule {
 private:
   mlir::MLIRContext mlirContext;
   // One single module in a python-exposed MLIRContext for now.
-  std::unique_ptr<mlir::Module> module;
+  mlir::OwningModuleRef module;
+  mlir::ModuleManager moduleManager;
   std::unique_ptr<mlir::ExecutionEngine> engine;
 };
 
@@ -235,18 +253,21 @@ struct PythonFunctionContext {
 
   PythonFunction enter() {
     assert(function.function && "function is not set up");
-    context = new mlir::edsc::ScopedContext(
-        static_cast<mlir::Function *>(function.function));
+    auto mlirFunc = mlir::FuncOp::getFromOpaquePointer(function.function);
+    contextBuilder.emplace(mlirFunc.getBody());
+    context = new mlir::edsc::ScopedContext(*contextBuilder, mlirFunc.getLoc());
     return function;
   }
 
   void exit(py::object, py::object, py::object) {
     delete context;
     context = nullptr;
+    contextBuilder.reset();
   }
 
   PythonFunction function;
   mlir::edsc::ScopedContext *context;
+  llvm::Optional<OpBuilder> contextBuilder;
 };
 
 PythonFunctionContext PythonMLIRModule::makeFunctionContext(
@@ -466,7 +487,7 @@ struct PythonAttributedType {
     std::string res;
     llvm::raw_string_ostream os(res);
     t.print(os);
-    if (attrs.size() == 0)
+    if (attrs.empty())
       return os.str();
 
     os << '{';
@@ -571,15 +592,15 @@ PythonMLIRModule::declareFunction(const std::string &name,
       inAttrs.emplace_back(Identifier::get(named.name, &mlirContext),
                            mlir::Attribute::getFromOpaquePointer(
                                reinterpret_cast<const void *>(named.value)));
-    inputAttrs.emplace_back(&mlirContext, inAttrs);
+    inputAttrs.emplace_back(inAttrs);
   }
 
   // Create the function itself.
-  auto *func = new mlir::Function(
+  auto func = mlir::FuncOp::create(
       UnknownLoc::get(&mlirContext), name,
       mlir::Type::getFromOpaquePointer(funcType).cast<FunctionType>(), attrs,
       inputAttrs);
-  module->getFunctions().push_back(func);
+  moduleManager.insert(func);
   return func;
 }
 
@@ -633,9 +654,9 @@ PYBIND11_MODULE(pybind, m) {
     return ValueHandle::create<ConstantFloatOp>(value, floatType);
   });
   m.def("constant_function", [](PythonFunction func) -> PythonValueHandle {
-    auto *function = reinterpret_cast<Function *>(func.function);
-    auto attr = FunctionAttr::get(function, function->getContext());
-    return ValueHandle::create<ConstantOp>(function->getType(), attr);
+    auto function = FuncOp::getFromOpaquePointer(func.function);
+    auto attr = SymbolRefAttr::get(function.getName(), function.getContext());
+    return ValueHandle::create<ConstantOp>(function.getType(), attr);
   });
   m.def("appendTo", [](const PythonBlockHandle &handle) {
     return PythonBlockAppender(handle);
@@ -703,8 +724,7 @@ PYBIND11_MODULE(pybind, m) {
           return ValueHandle::create(name, operandHandles, types, attrs);
         });
 
-  py::class_<PythonFunction>(m, "Function",
-                             "Wrapping class for mlir::Function.")
+  py::class_<PythonFunction>(m, "Function", "Wrapping class for mlir::FuncOp.")
       .def(py::init<PythonFunction>())
       .def("__str__", &PythonFunction::str)
       .def("define", &PythonFunction::define,
@@ -736,7 +756,8 @@ PYBIND11_MODULE(pybind, m) {
   py::class_<PythonMLIRModule>(
       m, "MLIRModule",
       "An MLIRModule is the abstraction that owns the allocations to support "
-      "compilation of a single mlir::Module into an ExecutionEngine backed by "
+      "compilation of a single mlir::ModuleOp into an ExecutionEngine backed "
+      "by "
       "the LLVM ORC JIT. A typical flow consists in creating an MLIRModule, "
       "adding functions, compiling the module to obtain an ExecutionEngine on "
       "which named functions may be called. For now the only means to retrieve "
@@ -753,13 +774,13 @@ PYBIND11_MODULE(pybind, m) {
           "Creates an mlir::IntegerAttr of the given type with the given value "
           "in the context associated with this MLIR module.")
       .def("declare_function", &PythonMLIRModule::declareFunction,
-           "Declares a new mlir::Function in the current mlir::Module.  The "
+           "Declares a new mlir::FuncOp in the current mlir::ModuleOp.  The "
            "function arguments can have attributes.  The function has no "
            "definition and can be linked to an external library.")
       .def("make_function", &PythonMLIRModule::makeFunction,
-           "Defines a new mlir::Function in the current mlir::Module.")
+           "Defines a new mlir::FuncOp in the current mlir::ModuleOp.")
       .def("function_context", &PythonMLIRModule::makeFunctionContext,
-           "Defines a new mlir::Function in the mlir::Module and creates the "
+           "Defines a new mlir::FuncOp in the mlir::ModuleOp and creates the "
            "function context for building the body of the function.")
       .def("get_function", &PythonMLIRModule::getNamedFunction,
            "Looks up the function with the given name in the module.")
@@ -786,7 +807,7 @@ PYBIND11_MODULE(pybind, m) {
       .def("make_index_type", &PythonMLIRModule::makeIndexType,
            "Returns an mlir::IndexType")
       .def("compile", &PythonMLIRModule::compile,
-           "Compiles the mlir::Module to LLVMIR a creates new opaque "
+           "Compiles the mlir::ModuleOp to LLVMIR a creates new opaque "
            "ExecutionEngine backed by the ORC JIT.")
       .def("get_ir", &PythonMLIRModule::getIR,
            "Returns a dump of the MLIR representation of the module. This is "

@@ -27,9 +27,9 @@ namespace mlir {
 class AffineApplyOp;
 class AffineForOp;
 class AffineMap;
-class FuncBuilder;
 class Location;
 class MemRefType;
+class OpBuilder;
 class Operation;
 class Value;
 class VectorType;
@@ -122,7 +122,7 @@ shapeRatio(VectorType superVectorType, VectorType subVectorType);
 /// `%arg0[%c0, %c0]` into vector<128xf32> which needs a 1-D vector broadcast.
 ///
 AffineMap makePermutationMap(
-    Operation *op,
+    Operation *op, ArrayRef<Value *> indices,
     const llvm::DenseMap<Operation *, unsigned> &loopToVectorDim);
 
 namespace matcher {

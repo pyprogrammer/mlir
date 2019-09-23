@@ -36,11 +36,11 @@ class IntegerSet;
 
 namespace detail {
 
-class AffineExprStorage;
-class AffineBinaryOpExprStorage;
-class AffineDimExprStorage;
-class AffineSymbolExprStorage;
-class AffineConstantExprStorage;
+struct AffineExprStorage;
+struct AffineBinaryOpExprStorage;
+struct AffineDimExprStorage;
+struct AffineSymbolExprStorage;
+struct AffineConstantExprStorage;
 
 } // namespace detail
 
@@ -48,7 +48,8 @@ enum class AffineExprKind {
   Add,
   /// RHS of mul is always a constant or a symbolic expression.
   Mul,
-  /// RHS of mod is always a constant or a symbolic expression.
+  /// RHS of mod is always a constant or a symbolic expression with a positive
+  /// value.
   Mod,
   /// RHS of floordiv is always a constant or a symbolic expression.
   FloorDiv,
@@ -70,7 +71,7 @@ enum class AffineExprKind {
 /// Base type for affine expression.
 /// AffineExpr's are immutable value types with intuitive operators to
 /// operate on chainable, lightweight compositions.
-/// An AffineExpr is a POD interface to the underlying storage type pointer.
+/// An AffineExpr is an interface to the underlying storage type pointer.
 class AffineExpr {
 public:
   using ImplType = detail::AffineExprStorage;
@@ -85,10 +86,10 @@ public:
     return *this;
   }
 
-  static AffineExpr Null() { return AffineExpr(nullptr); }
-
   bool operator==(AffineExpr other) const { return expr == other.expr; }
   bool operator!=(AffineExpr other) const { return !(*this == other); }
+  bool operator==(int64_t v) const;
+  bool operator!=(int64_t v) const { return !(*this == v); }
   explicit operator bool() const { return expr; }
 
   bool operator!() const { return expr == nullptr; }
@@ -190,7 +191,7 @@ public:
 /// A symbolic identifier appearing in an affine expression.
 class AffineSymbolExpr : public AffineExpr {
 public:
-  using ImplType = detail::AffineSymbolExprStorage;
+  using ImplType = detail::AffineDimExprStorage;
   /* implicit */ AffineSymbolExpr(AffineExpr::ImplType *ptr);
   unsigned getPosition() const;
 };

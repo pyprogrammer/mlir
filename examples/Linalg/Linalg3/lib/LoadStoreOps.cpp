@@ -33,25 +33,25 @@ using namespace linalg;
 ////////////////////////////////////////////////////////////////////////////////
 // LoadOp.
 ////////////////////////////////////////////////////////////////////////////////
-void linalg::LoadOp::build(Builder *b, OperationState *result, Value *view,
+void linalg::LoadOp::build(Builder *b, OperationState &result, Value *view,
                            ArrayRef<Value *> indices) {
   auto viewType = view->getType().cast<ViewType>();
-  result->addOperands(view);
-  result->addOperands(indices);
-  result->addTypes(viewType.getElementType());
+  result.addOperands(view);
+  result.addOperands(indices);
+  result.addTypes(viewType.getElementType());
 }
 
-void linalg::LoadOp::print(OpAsmPrinter *p) {
-  *p << getOperationName() << " " << *getView() << '[';
-  p->printOperands(getIndices());
-  *p << ']';
-  p->printOptionalAttrDict(getAttrs());
-  *p << " : " << getViewType();
+void linalg::LoadOp::print(OpAsmPrinter &p) {
+  p << getOperationName() << " " << *getView() << '[';
+  p.printOperands(getIndices());
+  p << ']';
+  p.printOptionalAttrDict(getAttrs());
+  p << " : " << getViewType();
 }
 
-bool linalg::LoadOp::parse(OpAsmParser *parser, OperationState *result) {
+ParseResult linalg::LoadOp::parse(OpAsmParser &parser, OperationState &result) {
   llvm_unreachable("Parsing linalg dialect is not supported in this tutorial");
-  return false;
+  return success();
 }
 
 LogicalResult linalg::LoadOp::verify() {
@@ -84,26 +84,27 @@ unsigned linalg::LoadOp::getRank() { return getViewType().getRank(); }
 ////////////////////////////////////////////////////////////////////////////////
 // StoreOp.
 ////////////////////////////////////////////////////////////////////////////////
-void linalg::StoreOp::build(Builder *b, OperationState *result,
+void linalg::StoreOp::build(Builder *b, OperationState &result,
                             Value *valueToStore, Value *view,
                             ArrayRef<Value *> indices) {
-  result->addOperands(valueToStore);
-  result->addOperands(view);
-  result->addOperands(indices);
+  result.addOperands(valueToStore);
+  result.addOperands(view);
+  result.addOperands(indices);
 }
 
-void linalg::StoreOp::print(OpAsmPrinter *p) {
-  *p << getOperationName() << " " << *getValueToStore();
-  *p << ", " << *getView() << '[';
-  p->printOperands(getIndices());
-  *p << ']';
-  p->printOptionalAttrDict(getAttrs());
-  *p << " : " << getViewType();
+void linalg::StoreOp::print(OpAsmPrinter &p) {
+  p << getOperationName() << " " << *getValueToStore();
+  p << ", " << *getView() << '[';
+  p.printOperands(getIndices());
+  p << ']';
+  p.printOptionalAttrDict(getAttrs());
+  p << " : " << getViewType();
 }
 
-bool linalg::StoreOp::parse(OpAsmParser *parser, OperationState *result) {
+ParseResult linalg::StoreOp::parse(OpAsmParser &parser,
+                                   OperationState &result) {
   assert(false && "NYI");
-  return false;
+  return success();
 }
 
 LogicalResult linalg::StoreOp::verify() {

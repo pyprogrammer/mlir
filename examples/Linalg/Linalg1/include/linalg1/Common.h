@@ -18,8 +18,10 @@
 #ifndef LINALG1_COMMON_H_
 #define LINALG1_COMMON_H_
 
-#include "mlir/AffineOps/AffineOps.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Analysis/Verifier.h"
+#include "mlir/Dialect/AffineOps/AffineOps.h"
+#include "mlir/Dialect/StandardOps/Ops.h"
 #include "mlir/EDSC/Builders.h"
 #include "mlir/EDSC/Helpers.h"
 #include "mlir/EDSC/Intrinsics.h"
@@ -34,7 +36,6 @@
 #include "mlir/IR/Types.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/StandardOps/Ops.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/LoopUtils.h"
 #include "mlir/Transforms/Passes.h"
@@ -57,21 +58,22 @@ inline mlir::MemRefType floatMemRefType(mlir::MLIRContext *context,
 }
 
 /// A basic function builder
-inline mlir::Function *makeFunction(mlir::Module &module, llvm::StringRef name,
-                                    llvm::ArrayRef<mlir::Type> types,
-                                    llvm::ArrayRef<mlir::Type> resultTypes) {
+inline mlir::FuncOp makeFunction(mlir::ModuleOp module, llvm::StringRef name,
+                                 llvm::ArrayRef<mlir::Type> types,
+                                 llvm::ArrayRef<mlir::Type> resultTypes) {
   auto *context = module.getContext();
-  auto *function = new mlir::Function(
+  auto function = mlir::FuncOp::create(
       mlir::UnknownLoc::get(context), name,
       mlir::FunctionType::get({types}, resultTypes, context));
-  function->addEntryBlock();
-  module.getFunctions().push_back(function);
+  function.addEntryBlock();
+  module.push_back(function);
   return function;
 }
 
 /// A basic pass manager pre-populated with cleanup passes.
-inline std::unique_ptr<mlir::PassManager> cleanupPassManager() {
-  std::unique_ptr<mlir::PassManager> pm(new mlir::PassManager());
+inline std::unique_ptr<mlir::PassManager>
+cleanupPassManager(mlir::MLIRContext *ctx) {
+  std::unique_ptr<mlir::PassManager> pm(new mlir::PassManager(ctx));
   pm->addPass(mlir::createCanonicalizerPass());
   pm->addPass(mlir::createSimplifyAffineStructuresPass());
   pm->addPass(mlir::createCSEPass());
@@ -83,20 +85,19 @@ inline std::unique_ptr<mlir::PassManager> cleanupPassManager() {
 /// llvm::outs() for FileCheck'ing.
 /// If an error occurs, dump to llvm::errs() and do not print to llvm::outs()
 /// which will make the associated FileCheck test fail.
-inline void cleanupAndPrintFunction(mlir::Function *f) {
+inline void cleanupAndPrintFunction(mlir::FuncOp f) {
   bool printToOuts = true;
-  auto check = [f, &printToOuts](mlir::LogicalResult result) {
+  auto check = [&f, &printToOuts](mlir::LogicalResult result) {
     if (failed(result)) {
-      f->getContext()->emitError(f->getLoc(),
-                                 "Verification and cleanup passes failed");
+      f.emitError("Verification and cleanup passes failed");
       printToOuts = false;
     }
   };
-  auto pm = cleanupPassManager();
-  check(f->getModule()->verify());
-  check(pm->run(f->getModule()));
+  auto pm = cleanupPassManager(f.getContext());
+  check(mlir::verify(f.getParentOfType<mlir::ModuleOp>()));
+  check(pm->run(f.getParentOfType<mlir::ModuleOp>()));
   if (printToOuts)
-    f->print(llvm::outs());
+    f.print(llvm::outs());
 }
 
 /// Helper class to sugar building loop nests from indexings that appear in
@@ -107,8 +108,7 @@ public:
                        llvm::ArrayRef<mlir::edsc::ValueHandle> indexings);
   LoopNestRangeBuilder(llvm::ArrayRef<mlir::edsc::ValueHandle *> ivs,
                        llvm::ArrayRef<mlir::Value *> indexings);
-  mlir::edsc::ValueHandle
-  operator()(llvm::ArrayRef<mlir::edsc::CapturableHandle> stmts);
+  mlir::edsc::ValueHandle operator()(std::function<void(void)> fun = nullptr);
 
 private:
   llvm::SmallVector<mlir::edsc::LoopBuilder, 4> loops;

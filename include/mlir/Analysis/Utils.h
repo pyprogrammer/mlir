@@ -39,7 +39,7 @@ class AffineForOp;
 class Block;
 class FlatAffineConstraints;
 class Location;
-class MemRefAccess;
+struct MemRefAccess;
 class Operation;
 class Value;
 
@@ -73,6 +73,8 @@ struct ComputationSliceState {
   std::vector<SmallVector<Value *, 4>> lbOperands;
   // List of upper bound operands (ubOperands[i] are used by 'ubs[i]').
   std::vector<SmallVector<Value *, 4>> ubOperands;
+  // Slice loop nest insertion point in target loop nest.
+  Block::iterator insertPoint;
   // Adds to 'cst' with constraints which represent the slice bounds on 'ivs'
   // in 'this'. Specifically, the values in 'ivs' are added to 'cst' as dim
   // identifiers and the values in 'lb/ubOperands' are added as symbols.
@@ -85,12 +87,68 @@ struct ComputationSliceState {
   void clearBounds();
 };
 
-/// Computes computation slice loop bounds for the loop nest surrounding
-/// 'srcAccess', where the returned loop bound AffineMaps are functions of
-/// loop IVs from the loop nest surrounding 'dstAccess'.
-LogicalResult getBackwardComputationSliceState(
-    const MemRefAccess &srcAccess, const MemRefAccess &dstAccess,
-    unsigned dstLoopDepth, ComputationSliceState *sliceState);
+/// Computes the computation slice loop bounds for one loop nest as affine maps
+/// of the other loop nest's IVs and symbols, using 'dependenceConstraints'
+/// computed between 'depSourceAccess' and 'depSinkAccess'.
+/// If 'isBackwardSlice' is true, a backwards slice is computed in which the
+/// slice bounds of loop nest surrounding 'depSourceAccess' are computed in
+/// terms of loop IVs and symbols of the loop nest surrounding 'depSinkAccess'
+/// at 'loopDepth'.
+/// If 'isBackwardSlice' is false, a forward slice is computed in which the
+/// slice bounds of loop nest surrounding 'depSinkAccess' are computed in terms
+/// of loop IVs and symbols of the loop nest surrounding 'depSourceAccess' at
+/// 'loopDepth'.
+/// The slice loop bounds and associated operands are returned in 'sliceState'.
+//
+//  Backward slice example:
+//
+//    affine.for %i0 = 0 to 10 {
+//      affine.store %cst, %0[%i0] : memref<100xf32>  // 'depSourceAccess'
+//    }
+//    affine.for %i1 = 0 to 10 {
+//      %v = affine.load %0[%i1] : memref<100xf32>    // 'depSinkAccess'
+//    }
+//
+//    // Backward computation slice of loop nest '%i0'.
+//    affine.for %i0 = (d0) -> (d0)(%i1) to (d0) -> (d0 + 1)(%i1) {
+//      affine.store %cst, %0[%i0] : memref<100xf32>  // 'depSourceAccess'
+//    }
+//
+//  Forward slice example:
+//
+//    affine.for %i0 = 0 to 10 {
+//      affine.store %cst, %0[%i0] : memref<100xf32>  // 'depSourceAccess'
+//    }
+//    affine.for %i1 = 0 to 10 {
+//      %v = affine.load %0[%i1] : memref<100xf32>    // 'depSinkAccess'
+//    }
+//
+//    // Forward computation slice of loop nest '%i1'.
+//    affine.for %i1 = (d0) -> (d0)(%i0) to (d0) -> (d0 + 1)(%i0) {
+//      %v = affine.load %0[%i1] : memref<100xf32>    // 'depSinkAccess'
+//    }
+//
+void getComputationSliceState(Operation *depSourceOp, Operation *depSinkOp,
+                              FlatAffineConstraints *dependenceConstraints,
+                              unsigned loopDepth, bool isBackwardSlice,
+                              ComputationSliceState *sliceState);
+
+/// Computes in 'sliceUnion' the union of all slice bounds computed at
+/// 'loopDepth' between all dependent pairs of ops in 'opsA' and 'opsB'.
+/// The parameter 'numCommonLoops' is the number of loops common to the
+/// operations in 'opsA' and 'opsB'.
+/// If 'isBackwardSlice' is true, computes slice bounds for loop nest
+/// surrounding ops in 'opsA', as a function of IVs and symbols of loop nest
+/// surrounding ops in 'opsB' at 'loopDepth'.
+/// If 'isBackwardSlice' is false, computes slice bounds for loop nest
+/// surrounding ops in 'opsB', as a function of IVs and symbols of loop nest
+/// surrounding ops in 'opsA' at 'loopDepth'.
+/// Returns 'success' if union was computed, 'failure' otherwise.
+// TODO(andydavis) Change this API to take 'forOpA'/'forOpB'.
+LogicalResult computeSliceUnion(ArrayRef<Operation *> opsA,
+                                ArrayRef<Operation *> opsB, unsigned loopDepth,
+                                unsigned numCommonLoops, bool isBackwardSlice,
+                                ComputationSliceState *sliceUnion);
 
 /// Creates a clone of the computation contained in the loop nest surrounding
 /// 'srcOpInst', slices the iteration space of src loop based on slice bounds
@@ -114,7 +172,7 @@ AffineForOp insertBackwardComputationSlice(Operation *srcOpInst,
 //
 //    affine.for %i = 0 to 32 {
 //      affine.for %ii = %i to (d0) -> (d0 + 8) (%i) {
-//        load %A[%ii]
+//        affine.load %A[%ii]
 //      }
 //    }
 //
@@ -141,6 +199,8 @@ struct MemRefRegion {
   /// *) Inequality constraints for the slice bounds in 'sliceState', which
   ///    represent the bounds on the loop IVs in this constraint system w.r.t
   ///    to slice operands (which correspond to symbols).
+  /// If 'addMemRefDimBounds' is true, constant upper/lower bounds
+  /// [0, memref.getDimSize(i)) are added for each MemRef dimension 'i'.
   ///
   ///  For example, the memref region for this operation at loopDepth = 1 will
   ///  be:
@@ -155,7 +215,8 @@ struct MemRefRegion {
   /// The last field is a 2-d FlatAffineConstraints symbolic in %i.
   ///
   LogicalResult compute(Operation *op, unsigned loopDepth,
-                        ComputationSliceState *sliceState = nullptr);
+                        ComputationSliceState *sliceState = nullptr,
+                        bool addMemRefDimBounds = true);
 
   FlatAffineConstraints *getConstraints() { return &cst; }
   const FlatAffineConstraints *getConstraints() const { return &cst; }

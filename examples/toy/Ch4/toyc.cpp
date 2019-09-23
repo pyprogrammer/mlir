@@ -24,9 +24,11 @@
 #include "toy/Parser.h"
 #include "toy/Passes.h"
 
+#include "mlir/Analysis/Verifier.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Module.h"
 #include "mlir/Parser.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -78,26 +80,23 @@ std::unique_ptr<toy::ModuleAST> parseInputFile(llvm::StringRef filename) {
   return parser.ParseModule();
 }
 
-mlir::LogicalResult optimize(mlir::Module &module) {
-  mlir::PassManager pm;
+mlir::LogicalResult optimize(mlir::ModuleOp module) {
+  mlir::PassManager pm(module.getContext());
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(createShapeInferencePass());
   pm.addPass(mlir::createCanonicalizerPass());
   // Apply any generic pass manager command line options.
   applyPassManagerCLOptions(pm);
 
-  return pm.run(&module);
+  return pm.run(module);
 }
 
 int dumpMLIR() {
   // Register our Dialect with MLIR
   mlir::registerDialect<ToyDialect>();
 
-  // Add generic options for the pass-manager (timing, print-after-all, ...)
-  mlir::registerPassManagerCLOptions();
-
   mlir::MLIRContext context;
-  std::unique_ptr<mlir::Module> module;
+  mlir::OwningModuleRef module;
   if (inputType == InputType::MLIR ||
       llvm::StringRef(inputFilename).endswith(".mlir")) {
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileOrErr =
@@ -108,12 +107,12 @@ int dumpMLIR() {
     }
     llvm::SourceMgr sourceMgr;
     sourceMgr.AddNewSourceBuffer(std::move(*fileOrErr), llvm::SMLoc());
-    module.reset(mlir::parseSourceFile(sourceMgr, &context));
+    module = mlir::parseSourceFile(sourceMgr, &context);
     if (!module) {
       llvm::errs() << "Error can't load file " << inputFilename << "\n";
       return 3;
     }
-    if (failed(module->verify())) {
+    if (failed(mlir::verify(*module))) {
       llvm::errs() << "Error verifying MLIR module\n";
       return 4;
     }

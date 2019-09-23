@@ -24,9 +24,16 @@
 #define MLIR_SUPPORT_STLEXTRAS_H
 
 #include "mlir/Support/LLVM.h"
+#include "llvm/ADT/iterator.h"
 #include <tuple>
 
 namespace mlir {
+
+namespace detail {
+template <typename RangeT>
+using ValueOfRange = typename std::remove_reference<decltype(
+    *std::begin(std::declval<RangeT &>()))>::type;
+} // end namespace detail
 
 /// An STL-style algorithm similar to std::for_each that applies a second
 /// functor between every pair of elements.
@@ -39,7 +46,10 @@ namespace mlir {
 ///              [&] { os << ", "; });
 /// \endcode
 template <typename ForwardIterator, typename UnaryFunctor,
-          typename NullaryFunctor>
+          typename NullaryFunctor,
+          typename = typename std::enable_if<
+              !std::is_constructible<StringRef, UnaryFunctor>::value &&
+              !std::is_constructible<StringRef, NullaryFunctor>::value>::type>
 inline void interleave(ForwardIterator begin, ForwardIterator end,
                        UnaryFunctor each_fn, NullaryFunctor between_fn) {
   if (begin == end)
@@ -52,16 +62,128 @@ inline void interleave(ForwardIterator begin, ForwardIterator end,
   }
 }
 
-template <typename Container, typename UnaryFunctor, typename NullaryFunctor>
+template <typename Container, typename UnaryFunctor, typename NullaryFunctor,
+          typename = typename std::enable_if<
+              !std::is_constructible<StringRef, UnaryFunctor>::value &&
+              !std::is_constructible<StringRef, NullaryFunctor>::value>::type>
 inline void interleave(const Container &c, UnaryFunctor each_fn,
                        NullaryFunctor between_fn) {
   interleave(c.begin(), c.end(), each_fn, between_fn);
 }
 
-template <typename T, template <typename> class Container, typename raw_ostream>
-inline void interleaveComma(const Container<T> &c, raw_ostream &os) {
-  interleave(c.begin(), c.end(), [&](T a) { os << a; }, [&]() { os << ", "; });
+/// Overload of interleave for the common case of string separator.
+template <typename Container, typename UnaryFunctor, typename raw_ostream,
+          typename T = detail::ValueOfRange<Container>>
+inline void interleave(const Container &c, raw_ostream &os,
+                       UnaryFunctor each_fn, const StringRef &separator) {
+  interleave(c.begin(), c.end(), each_fn, [&] { os << separator; });
 }
+template <typename Container, typename raw_ostream,
+          typename T = detail::ValueOfRange<Container>>
+inline void interleave(const Container &c, raw_ostream &os,
+                       const StringRef &separator) {
+  interleave(
+      c, os, [&](const T &a) { os << a; }, separator);
+}
+
+template <typename Container, typename UnaryFunctor, typename raw_ostream,
+          typename T = detail::ValueOfRange<Container>>
+inline void interleaveComma(const Container &c, raw_ostream &os,
+                            UnaryFunctor each_fn) {
+  interleave(c, os, each_fn, ", ");
+}
+template <typename Container, typename raw_ostream,
+          typename T = detail::ValueOfRange<Container>>
+inline void interleaveComma(const Container &c, raw_ostream &os) {
+  interleaveComma(c, os, [&](const T &a) { os << a; });
+}
+
+/// A special type used to provide an address for a given class that can act as
+/// a unique identifier during pass registration.
+/// Note: We specify an explicit alignment here to allow use with PointerIntPair
+/// and other utilities/data structures that require a known pointer alignment.
+struct alignas(8) ClassID {
+  template <typename T> static ClassID *getID() {
+    static ClassID id;
+    return &id;
+  }
+  template <template <typename T> class Trait> static ClassID *getID() {
+    static ClassID id;
+    return &id;
+  }
+};
+
+/// Utilities for detecting if a given trait holds for some set of arguments
+/// 'Args'. For example, the given trait could be used to detect if a given type
+/// has a copy assignment operator:
+///   template<class T>
+///   using has_copy_assign_t = decltype(std::declval<T&>()
+///                                                 = std::declval<const T&>());
+///   bool fooHasCopyAssign = is_detected<has_copy_assign_t, FooClass>::value;
+namespace detail {
+template <typename...> using void_t = void;
+template <class, template <class...> class Op, class... Args> struct detector {
+  using value_t = std::false_type;
+};
+template <template <class...> class Op, class... Args>
+struct detector<void_t<Op<Args...>>, Op, Args...> {
+  using value_t = std::true_type;
+};
+} // end namespace detail
+
+template <template <class...> class Op, class... Args>
+using is_detected = typename detail::detector<void, Op, Args...>::value_t;
+
+/// Check if a Callable type can be invoked with the given set of arg types.
+namespace detail {
+template <typename Callable, typename... Args>
+using is_invocable =
+    decltype(std::declval<Callable &>()(std::declval<Args>()...));
+} // namespace detail
+
+template <typename Callable, typename... Args>
+using is_invocable = is_detected<detail::is_invocable, Callable, Args...>;
+
+//===----------------------------------------------------------------------===//
+//     Extra additions to <iterator>
+//===----------------------------------------------------------------------===//
+
+/// A utility class used to implement an iterator that contains some object and
+/// an index. The iterator moves the index but keeps the object constant.
+template <typename DerivedT, typename ObjectType, typename T,
+          typename PointerT = T *, typename ReferenceT = T &>
+class indexed_accessor_iterator
+    : public llvm::iterator_facade_base<DerivedT,
+                                        std::random_access_iterator_tag, T,
+                                        std::ptrdiff_t, PointerT, ReferenceT> {
+public:
+  ptrdiff_t operator-(const indexed_accessor_iterator &rhs) const {
+    assert(object == rhs.object && "incompatible iterators");
+    return index - rhs.index;
+  }
+  bool operator==(const indexed_accessor_iterator &rhs) const {
+    return object == rhs.object && index == rhs.index;
+  }
+  bool operator<(const indexed_accessor_iterator &rhs) const {
+    assert(object == rhs.object && "incompatible iterators");
+    return index < rhs.index;
+  }
+
+  DerivedT &operator+=(ptrdiff_t offset) {
+    this->index += offset;
+    return static_cast<DerivedT &>(*this);
+  }
+  DerivedT &operator-=(ptrdiff_t offset) {
+    this->index -= offset;
+    return static_cast<DerivedT &>(*this);
+  }
+
+protected:
+  indexed_accessor_iterator(ObjectType object, ptrdiff_t index)
+      : object(object), index(index) {}
+  ObjectType object;
+  ptrdiff_t index;
+};
 
 } // end namespace mlir
 

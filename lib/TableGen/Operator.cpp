@@ -33,42 +33,74 @@ using llvm::DagInit;
 using llvm::DefInit;
 using llvm::Record;
 
-tblgen::Operator::Operator(const llvm::Record &def) : def(def) {
-  std::tie(dialectName, cppClassName) = def.getName().split('_');
-  if (dialectName.empty()) {
-    // Class name with a leading underscore and without dialect name
+tblgen::Operator::Operator(const llvm::Record &def)
+    : dialect(def.getValueAsDef("opDialect")), def(def) {
+  // The first `_` in the op's TableGen def name is treated as separating the
+  // dialect prefix and the op class name. The dialect prefix will be ignored if
+  // not empty. Otherwise, if def name starts with a `_`, the `_` is considered
+  // as part of the class name.
+  StringRef prefix;
+  std::tie(prefix, cppClassName) = def.getName().split('_');
+  if (prefix.empty()) {
+    // Class name with a leading underscore and without dialect prefix
     cppClassName = def.getName();
   } else if (cppClassName.empty()) {
-    // Class name without dialect name
-    std::swap(dialectName, cppClassName);
+    // Class name without dialect prefix
+    cppClassName = prefix;
   }
 
   populateOpStructure();
 }
 
-StringRef tblgen::Operator::getOperationName() const {
-  return def.getValueAsString("opName");
+std::string tblgen::Operator::getOperationName() const {
+  auto prefix = dialect.getName();
+  auto opName = def.getValueAsString("opName");
+  if (prefix.empty())
+    return opName;
+  return llvm::formatv("{0}.{1}", prefix, opName);
 }
 
-StringRef tblgen::Operator::getDialectName() const { return dialectName; }
+StringRef tblgen::Operator::getDialectName() const { return dialect.getName(); }
 
 StringRef tblgen::Operator::getCppClassName() const { return cppClassName; }
 
-std::string tblgen::Operator::getQualCppClassName(StringRef name) {
-  StringRef ns, cls;
-  std::tie(ns, cls) = name.split('_');
-  if (ns.empty() || cls.empty())
-    return name;
-  return (ns + "::" + cls).str();
-}
-
 std::string tblgen::Operator::getQualCppClassName() const {
-  return getQualCppClassName(def.getName());
+  auto prefix = dialect.getCppNamespace();
+  if (prefix.empty())
+    return cppClassName;
+  return llvm::formatv("{0}::{1}", prefix, cppClassName);
 }
 
 int tblgen::Operator::getNumResults() const {
   DagInit *results = def.getValueAsDag("results");
   return results->getNumArgs();
+}
+
+StringRef tblgen::Operator::getExtraClassDeclaration() const {
+  constexpr auto attr = "extraClassDeclaration";
+  if (def.isValueUnset(attr))
+    return {};
+  return def.getValueAsString(attr);
+}
+
+const llvm::Record &tblgen::Operator::getDef() const { return def; }
+
+bool tblgen::Operator::isVariadic() const {
+  return getNumVariadicOperands() != 0 || getNumVariadicResults() != 0;
+}
+
+bool tblgen::Operator::skipDefaultBuilders() const {
+  return def.getValueAsBit("skipDefaultBuilders");
+}
+
+auto tblgen::Operator::result_begin() -> value_iterator {
+  return results.begin();
+}
+
+auto tblgen::Operator::result_end() -> value_iterator { return results.end(); }
+
+auto tblgen::Operator::getResults() -> value_range {
+  return {result_begin(), result_end()};
 }
 
 tblgen::TypeConstraint
@@ -82,35 +114,21 @@ StringRef tblgen::Operator::getResultName(int index) const {
   return results->getArgNameStr(index);
 }
 
-bool tblgen::Operator::hasVariadicResult() const {
-  return !results.empty() && results.back().constraint.isVariadic();
+unsigned tblgen::Operator::getNumVariadicResults() const {
+  return std::count_if(
+      results.begin(), results.end(),
+      [](const NamedTypeConstraint &c) { return c.constraint.isVariadic(); });
 }
 
-int tblgen::Operator::getNumNativeAttributes() const {
-  return numNativeAttributes;
-}
-
-int tblgen::Operator::getNumDerivedAttributes() const {
-  return getNumAttributes() - getNumNativeAttributes();
-}
-
-const tblgen::NamedAttribute &tblgen::Operator::getAttribute(int index) const {
-  return attributes[index];
-}
-
-bool tblgen::Operator::hasVariadicOperand() const {
-  return !operands.empty() && operands.back().constraint.isVariadic();
+unsigned tblgen::Operator::getNumVariadicOperands() const {
+  return std::count_if(
+      operands.begin(), operands.end(),
+      [](const NamedTypeConstraint &c) { return c.constraint.isVariadic(); });
 }
 
 StringRef tblgen::Operator::getArgName(int index) const {
   DagInit *argumentValues = def.getValueAsDag("arguments");
   return argumentValues->getArgName(index)->getValue();
-}
-
-int tblgen::Operator::getNumPredOpTraits() const {
-  return std::count_if(traits.begin(), traits.end(), [](const OpTrait &trait) {
-    return isa<tblgen::PredOpTrait>(&trait);
-  });
 }
 
 bool tblgen::Operator::hasTrait(StringRef trait) const {
@@ -124,6 +142,12 @@ bool tblgen::Operator::hasTrait(StringRef trait) const {
     }
   }
   return false;
+}
+
+unsigned tblgen::Operator::getNumRegions() const { return regions.size(); }
+
+const tblgen::NamedRegion &tblgen::Operator::getRegion(unsigned index) const {
+  return regions[index];
 }
 
 auto tblgen::Operator::trait_begin() const -> const_trait_iterator {
@@ -148,17 +172,17 @@ auto tblgen::Operator::getAttributes() const
   return {attribute_begin(), attribute_end()};
 }
 
-auto tblgen::Operator::operand_begin() -> operand_iterator {
+auto tblgen::Operator::operand_begin() -> value_iterator {
   return operands.begin();
 }
-auto tblgen::Operator::operand_end() -> operand_iterator {
+auto tblgen::Operator::operand_end() -> value_iterator {
   return operands.end();
 }
-auto tblgen::Operator::getOperands() -> llvm::iterator_range<operand_iterator> {
+auto tblgen::Operator::getOperands() -> value_range {
   return {operand_begin(), operand_end()};
 }
 
-auto tblgen::Operator::getArg(int index) -> Argument {
+auto tblgen::Operator::getArg(int index) const -> Argument {
   return arguments[index];
 }
 
@@ -222,13 +246,6 @@ void tblgen::Operator::populateOpStructure() {
     }
   }
 
-  // Verify that only the last operand can be variadic.
-  for (int i = 0, e = operands.size() - 1; i < e; ++i) {
-    if (operands[i].constraint.isVariadic())
-      PrintFatalError(def.getLoc(),
-                      "only the last operand allowed to be variadic");
-  }
-
   auto *resultsDag = def.getValueAsDag("results");
   auto *outsOp = dyn_cast<DefInit>(resultsDag->getOperator());
   if (!outsOp || outsOp->getDef()->getName() != "outs") {
@@ -246,19 +263,29 @@ void tblgen::Operator::populateOpStructure() {
     results.push_back({name, TypeConstraint(resultDef)});
   }
 
-  // Verify that only the last result can be variadic.
-  for (int i = 0, e = results.size() - 1; i < e; ++i) {
-    if (results[i].constraint.isVariadic())
-      PrintFatalError(def.getLoc(),
-                      "only the last result allowed to be variadic");
-  }
-
   auto traitListInit = def.getValueAsListInit("traits");
   if (!traitListInit)
     return;
   traits.reserve(traitListInit->size());
   for (auto traitInit : *traitListInit)
     traits.push_back(OpTrait::create(traitInit));
+
+  // Handle regions
+  auto *regionsDag = def.getValueAsDag("regions");
+  auto *regionsOp = dyn_cast<DefInit>(regionsDag->getOperator());
+  if (!regionsOp || regionsOp->getDef()->getName() != "region") {
+    PrintFatalError(def.getLoc(), "'regions' must have 'region' directive");
+  }
+
+  for (unsigned i = 0, e = regionsDag->getNumArgs(); i < e; ++i) {
+    auto name = regionsDag->getArgNameStr(i);
+    auto *regionInit = dyn_cast<DefInit>(regionsDag->getArg(i));
+    if (!regionInit) {
+      PrintFatalError(def.getLoc(),
+                      Twine("undefined kind for region #") + Twine(i));
+    }
+    regions.push_back({name, Region(regionInit->getDef())});
+  }
 }
 
 ArrayRef<llvm::SMLoc> tblgen::Operator::getLoc() const { return def.getLoc(); }

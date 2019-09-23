@@ -27,16 +27,17 @@
 
 #include "toy/Dialect.h"
 
+#include "linalg1/Dialect.h"
 #include "linalg1/Intrinsics.h"
 #include "linalg1/ViewOp.h"
 #include "linalg3/TensorOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/EDSC/Builders.h"
 #include "mlir/EDSC/Helpers.h"
 #include "mlir/EDSC/Intrinsics.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/StandardTypes.h"
-#include "mlir/LLVMIR/LLVMDialect.h"
 #include "mlir/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -56,7 +57,7 @@ namespace {
 /// time both side of the cast (producer and consumer) will be lowered to a
 /// dialect like LLVM and end up with the same LLVM representation, at which
 /// point this becomes a no-op and is eliminated.
-Value *typeCast(FuncBuilder &builder, Value *val, Type destTy) {
+Value *typeCast(ConversionPatternRewriter &builder, Value *val, Type destTy) {
   if (val->getType() == destTy)
     return val;
   return builder.create<toy::TypeCastOp>(val->getLoc(), val, destTy)
@@ -66,7 +67,7 @@ Value *typeCast(FuncBuilder &builder, Value *val, Type destTy) {
 /// Create a type cast to turn a toy.array into a memref. The Toy Array will be
 /// lowered to a memref during buffer allocation, at which point the type cast
 /// becomes useless.
-Value *memRefTypeCast(FuncBuilder &builder, Value *val) {
+Value *memRefTypeCast(ConversionPatternRewriter &builder, Value *val) {
   if (val->getType().isa<MemRefType>())
     return val;
   auto toyArrayTy = val->getType().dyn_cast<toy::ToyArrayType>();
@@ -77,22 +78,23 @@ Value *memRefTypeCast(FuncBuilder &builder, Value *val) {
 
 /// Lower toy.mul to Linalg `matmul`.
 ///
-/// This class inherit from `DialectOpConversion` and override `rewrite`,
+/// This class inherit from `ConversionPattern` and override `rewrite`,
 /// similarly to the PatternRewriter introduced in the previous chapter.
 /// It will be called by the DialectConversion framework (see `LateLowering`
 /// class below).
-class MulOpConversion : public DialectOpConversion {
+class MulOpConversion : public ConversionPattern {
 public:
   explicit MulOpConversion(MLIRContext *context)
-      : DialectOpConversion(toy::MulOp::getOperationName(), 1, context) {}
+      : ConversionPattern(toy::MulOp::getOperationName(), 1, context) {}
 
-  SmallVector<Value *, 4> rewrite(Operation *op, ArrayRef<Value *> operands,
-                                  FuncBuilder &rewriter) const override {
+  PatternMatchResult
+  matchAndRewrite(Operation *op, ArrayRef<Value *> operands,
+                  ConversionPatternRewriter &rewriter) const override {
     using namespace edsc;
     using intrinsics::constant_index;
     using linalg::intrinsics::range;
     using linalg::intrinsics::view;
-    toy::MulOp mul = op->cast<toy::MulOp>();
+    toy::MulOp mul = cast<toy::MulOp>(op);
     auto loc = mul.getLoc();
     Value *result = memRefTypeCast(
         rewriter, rewriter.create<toy::AllocOp>(loc, mul.getResult()->getType())
@@ -115,33 +117,24 @@ public:
     auto rhsView = view(rhs, {r1, r2});
     auto resultView = view(result, {r0, r2});
     rewriter.create<linalg::MatmulOp>(loc, lhsView, rhsView, resultView);
-    return {typeCast(rewriter, result, mul.getType())};
+    rewriter.replaceOp(op, {typeCast(rewriter, result, mul.getType())});
+    return matchSuccess();
   }
-};
-
-// The conversion class from Toy IR Dialect to a mix of Linalg and LLVM.
-class EarlyLowering : public DialectConversion {
-protected:
-  // Initialize the list of converters.
-  llvm::DenseSet<DialectOpConversion *>
-  initConverters(MLIRContext *context) override {
-    return ConversionListBuilder<MulOpConversion>::build(&allocator, context);
-  }
-
-private:
-  llvm::BumpPtrAllocator allocator;
 };
 
 /// This is lowering to Linalg the parts that are computationally intensive
 /// (like matmul for example...) while keeping the rest of the code in the Toy
 /// dialect.
-struct EarlyLoweringPass : public ModulePass<EarlyLoweringPass> {
+struct EarlyLoweringPass : public FunctionPass<EarlyLoweringPass> {
+  void runOnFunction() override {
+    ConversionTarget target(getContext());
+    target.addLegalDialect<linalg::LinalgDialect, StandardOpsDialect>();
+    target.addLegalOp<toy::AllocOp, toy::TypeCastOp>();
 
-  void runOnModule() override {
-    if (failed(EarlyLowering().convert(&getModule()))) {
-      getModule().getContext()->emitError(
-          mlir::UnknownLoc::get(getModule().getContext()),
-          "Error lowering Toy\n");
+    OwningRewritePatternList patterns;
+    patterns.insert<MulOpConversion>(&getContext());
+    if (failed(applyPartialConversion(getFunction(), target, patterns))) {
+      emitError(mlir::UnknownLoc::get(&getContext()), "Error lowering Toy\n");
       signalPassFailure();
     }
   }
@@ -149,10 +142,7 @@ struct EarlyLoweringPass : public ModulePass<EarlyLoweringPass> {
 } // end anonymous namespace
 
 namespace toy {
-Pass *createEarlyLoweringPass() { return new EarlyLoweringPass(); }
-
-std::unique_ptr<mlir::DialectConversion> makeToyEarlyLowering() {
-  return llvm::make_unique<EarlyLowering>();
+std::unique_ptr<mlir::Pass> createEarlyLoweringPass() {
+  return std::make_unique<EarlyLoweringPass>();
 }
-
 } // namespace toy

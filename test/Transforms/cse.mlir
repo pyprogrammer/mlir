@@ -87,7 +87,7 @@ func @different_attributes(index, index) -> (i1, i1, i1) {
   // CHECK-NEXT: %1 = cmpi "ne", %arg0, %arg1 : index
   /// Predicate 1 means inequality comparison.
   %1 = cmpi "ne", %a, %b : index
-  %2 = "std.cmpi"(%a, %b) {predicate: 1} : (index, index) -> i1
+  %2 = "std.cmpi"(%a, %b) {predicate = 1} : (index, index) -> i1
 
   // CHECK-NEXT: return %0, %1, %1 : i1, i1, i1
   return %0, %1, %2 : i1, i1, i1
@@ -113,7 +113,7 @@ func @down_propagate_for() {
   // CHECK: %c1_i32 = constant 1 : i32
   %0 = constant 1 : i32
 
-  // CHECK-NEXT: affine.for %i0 = 0 to 4 {
+  // CHECK-NEXT: affine.for {{.*}} = 0 to 4 {
   affine.for %i = 0 to 4 {
     // CHECK-NEXT: "foo"(%c1_i32, %c1_i32) : (i32, i32) -> ()
     %1 = constant 1 : i32
@@ -145,16 +145,16 @@ func @down_propagate() -> i32 {
 /// Check that operation definitions are NOT propagated up the dominance tree.
 // CHECK-LABEL: @up_propagate_for
 func @up_propagate_for() -> i32 {
-  // CHECK: affine.for %i0 = 0 to 4 {
+  // CHECK: affine.for {{.*}} = 0 to 4 {
   affine.for %i = 0 to 4 {
-    // CHECK-NEXT: %c1_i32 = constant 1 : i32
-    // CHECK-NEXT: "foo"(%c1_i32) : (i32) -> ()
+    // CHECK-NEXT: %c1_i32_0 = constant 1 : i32
+    // CHECK-NEXT: "foo"(%c1_i32_0) : (i32) -> ()
     %0 = constant 1 : i32
     "foo"(%0) : (i32) -> ()
   }
 
-  // CHECK: %c1_i32_0 = constant 1 : i32
-  // CHECK-NEXT: return %c1_i32_0 : i32
+  // CHECK: %c1_i32 = constant 1 : i32
+  // CHECK-NEXT: return %c1_i32 : i32
   %1 = constant 1 : i32
   return %1 : i32
 }
@@ -193,23 +193,23 @@ func @up_propagate() -> i32 {
 // CHECK-LABEL: func @up_propagate_region
 func @up_propagate_region() -> i32 {
   // CHECK-NEXT: %0 = "foo.region"
-  %0 = "foo.region"() : () -> (i32) {
+  %0 = "foo.region"() ({
     // CHECK-NEXT:  %c0_i32 = constant 0 : i32
     // CHECK-NEXT: %true = constant 1 : i1
     // CHECK-NEXT: cond_br
 
     %1 = constant 0 : i32
     %true = constant 1 : i1
-    cond_br %true, ^bb2, ^bb3(%1 : i32)
+    cond_br %true, ^bb1, ^bb2(%1 : i32)
 
-  ^bb2: // CHECK: ^bb2:
+  ^bb1: // CHECK: ^bb1:
     // CHECK-NEXT: %c1_i32 = constant 1 : i32
     // CHECK-NEXT: br
 
     %c1_i32 = constant 1 : i32
-    br ^bb3(%c1_i32 : i32)
+    br ^bb2(%c1_i32 : i32)
 
-  ^bb3(%arg : i32): // CHECK: ^bb3(%1: i32):
+  ^bb2(%arg : i32): // CHECK: ^bb2(%1: i32):
     // CHECK-NEXT: %c1_i32_0 = constant 1 : i32
     // CHECK-NEXT: %2 = addi %1, %c1_i32_0 : i32
     // CHECK-NEXT: "foo.yield"(%2) : (i32) -> ()
@@ -217,6 +217,30 @@ func @up_propagate_region() -> i32 {
     %c1_i32_0 = constant 1 : i32
     %2 = addi %arg, %c1_i32_0 : i32
     "foo.yield" (%2) : (i32) -> ()
+  }) : () -> (i32)
+  return %0 : i32
+}
+
+/// This test checks that nested regions that are isolated from above are
+/// properly handled.
+// CHECK-LABEL: @nested_isolated
+func @nested_isolated() -> i32 {
+  // CHECK-NEXT: constant 1
+  %0 = constant 1 : i32
+
+  // CHECK-NEXT: @nested_func
+  func @nested_func() {
+    // CHECK-NEXT: constant 1
+    %foo = constant 1 : i32
+    "foo.yield"(%foo) : (i32) -> ()
   }
+
+  // CHECK: "foo.region"
+  "foo.region"() ({
+    // CHECK-NEXT: constant 1
+    %foo = constant 1 : i32
+    "foo.yield"(%foo) : (i32) -> ()
+  }) : () -> ()
+
   return %0 : i32
 }

@@ -30,7 +30,7 @@ methods defined in `DialectConversion`:
     function type and the conversion generates a new prototype for the converted
     function. The default implementation will call into the type conversion for
     the returned values and for each of the parameters.
--   Operations convertions: each pattern is expected to generate new results
+-   Operations conversions: each pattern is expected to generate new results
     matching the current operations' in the new function. This may involve
     generating one or multiple new operations, or possibly just remapping
     existing operands (folding).
@@ -49,11 +49,10 @@ public:
       SmallVectorImpl<NamedAttributeList> &convertedArgAttrs) { /*...*/ }
 
   // This gets called once to set up operation converters.
-  llvm::DenseSet<DialectOpConversion *>
+  llvm::DenseSet<ConversionPattern *>
   initConverters(MLIRContext *context) override {
-    return ConversionListBuilder<MulOpConversion,
-                                 PrintOpConversion,
-                                 TransposeOpConversion>::build(allocator, context);
+    RewriteListBuilder<MulOpConversion, PrintOpConversion,
+                       TransposeOpConversion>::build(allocator, context);
   }
 
 private:
@@ -66,14 +65,14 @@ Individual operation converters are following this pattern:
 ```c++
 /// Lower a toy.add to an affine loop nest.
 ///
-/// This class inherit from `DialectOpConversion` and override `rewrite`,
+/// This class inherit from `ConversionPattern` and override `rewrite`,
 /// similarly to the PatternRewriter introduced in the previous chapter.
 /// It will be called by the DialectConversion framework (see `LateLowering`
 /// class below).
-class AddOpConversion : public DialectOpConversion {
+class AddOpConversion : public ConversionPattern {
 public:
   explicit AddOpConversion(MLIRContext *context)
-      : DialectOpConversion(toy::AddOp::getOperationName(), 1, context) {}
+      : ConversionPattern(toy::AddOp::getOperationName(), 1, context) {}
 
   /// Lower the `op` by generating IR using the `rewriter` builder. The builder
   /// is setup with a new function, the `operands` array has been populated with
@@ -81,7 +80,7 @@ public:
   /// The results created by the new IR with the builder are returned, and their
   /// number must match the number of result of `op`.
   SmallVector<Value *, 4> rewrite(Operation *op, ArrayRef<Value *> operands,
-                                  FuncBuilder &rewriter) const override {
+                                  OpBuilder &rewriter) const override {
     ...
 
     // Return the newly allocated buffer, it will be used as an operand when
@@ -168,10 +167,10 @@ in this chapter for lowering `toy.print`:
     LoopBuilder(&i, zero, M, 1)({
       LoopBuilder(&j, zero, N, 1)({
         llvmCall(retTy,
-                 rewriter.getFunctionAttr(printfFunc),
+                 rewriter.getSymbolRefAttr(printfFunc),
                  {fmtCst, iOp(i, j)})
       }),
-      llvmCall(retTy, rewriter.getFunctionAttr(printfFunc), {fmtEol})
+      llvmCall(retTy, rewriter.getSymbolRefAttr(printfFunc), {fmtEol})
     });
 ```
 
@@ -202,26 +201,26 @@ Note the mix of a loop nest in the `Affine` dialect, with an operation
   %90 = llvm.icmp "slt" %89, %88 : !llvm.i64
   llvm.cond_br %90, ^bb2, ^bb6
 ^bb2:   // pred: ^bb1
-  %91 = llvm.constant(0 : index) : !llvm.i64
-  %92 = llvm.constant(2 : index) : !llvm.i64
+  %91 = llvm.mlir.constant(0 : index) : !llvm.i64
+  %92 = llvm.mlir.constant(2 : index) : !llvm.i64
   llvm.br ^bb3(%91 : !llvm.i64)
 ^bb3(%93: !llvm.i64):   // 2 preds: ^bb2, ^bb4
   %94 = llvm.icmp "slt" %93, %92 : !llvm.i64
   llvm.cond_br %94, ^bb4, ^bb5
 ^bb4:   // pred: ^bb3
-  %95 = llvm.constant(2 : index) : !llvm.i64
-  %96 = llvm.constant(2 : index) : !llvm.i64
+  %95 = llvm.mlir.constant(2 : index) : !llvm.i64
+  %96 = llvm.mlir.constant(2 : index) : !llvm.i64
   %97 = llvm.mul %89, %96 : !llvm.i64
   %98 = llvm.add %97, %93 : !llvm.i64
   %99 = llvm.getelementptr %6[%98] : (!llvm<"double*">, !llvm.i64) -> !llvm<"double*">
   %100 = llvm.load %99 : !llvm<"double*">
   %101 = llvm.call @printf(%48, %100) : (!llvm<"i8*">, !llvm.double) -> !llvm.i32
-  %102 = llvm.constant(1 : index) : !llvm.i64
+  %102 = llvm.mlir.constant(1 : index) : !llvm.i64
   %103 = llvm.add %93, %102 : !llvm.i64
   llvm.br ^bb3(%103 : !llvm.i64)
 ^bb5:   // pred: ^bb3
   %104 = llvm.call @printf(%76, %71) : (!llvm<"i8*">, !llvm.double) -> !llvm.i32
-  %105 = llvm.constant(1 : index) : !llvm.i64
+  %105 = llvm.mlir.constant(1 : index) : !llvm.i64
   %106 = llvm.add %89, %105 : !llvm.i64
   llvm.br ^bb1(%106 : !llvm.i64)
 ```

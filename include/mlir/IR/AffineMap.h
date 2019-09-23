@@ -30,7 +30,7 @@
 namespace mlir {
 
 namespace detail {
-class AffineMapStorage;
+struct AffineMapStorage;
 } // end namespace detail
 
 class AffineExpr;
@@ -52,9 +52,11 @@ public:
   AffineMap(const AffineMap &other) : map(other.map) {}
   AffineMap &operator=(const AffineMap &other) = default;
 
+  /// Returns a zero result affine map with no dimensions or symbols: () -> ().
+  static AffineMap get(MLIRContext *context);
+
   static AffineMap get(unsigned dimCount, unsigned symbolCount,
-                       ArrayRef<AffineExpr> results,
-                       ArrayRef<AffineExpr> rangeSizes);
+                       ArrayRef<AffineExpr> results);
 
   /// Returns a single constant result affine map.
   static AffineMap getConstantMap(int64_t val, MLIRContext *context);
@@ -69,15 +71,13 @@ public:
   bool operator==(AffineMap other) const { return other.map == map; }
   bool operator!=(AffineMap other) const { return !(other.map == map); }
 
-  /// Returns true if the co-domain (or more loosely speaking, range) of this
-  /// map is bounded. Bounded affine maps have a size (extent) for each of
-  /// their range dimensions (more accurately co-domain dimensions).
-  bool isBounded() const;
-
   /// Returns true if this affine map is an identity affine map.
   /// An identity affine map corresponds to an identity affine function on the
   /// dimensional identifiers.
   bool isIdentity() const;
+
+  /// Returns true if this affine map is an empty map, i.e., () -> ().
+  bool isEmpty() const;
 
   /// Returns true if this affine map is a single result constant function.
   bool isSingleConstant() const;
@@ -98,10 +98,7 @@ public:
   ArrayRef<AffineExpr> getResults() const;
   AffineExpr getResult(unsigned idx) const;
 
-  ArrayRef<AffineExpr> getRangeSizes() const;
-
-  /// Walk all of the AffineExpr's in this mapping.  The results are visited
-  /// first, and then the range sizes (if present).  Each node in an expression
+  /// Walk all of the AffineExpr's in this mapping. Each node in an expression
   /// tree is visited in postorder.
   void walkExprs(std::function<void(AffineExpr)> callback) const;
 
@@ -128,21 +125,31 @@ public:
   /// Prerequisites:
   /// The maps are composable, i.e. that the number of AffineDimExpr of `this`
   /// matches the number of results of `map`.
-  /// At this time, composition of bounded AffineMap is not supported. Both
-  /// `this` and `map` must be unbounded.
   ///
   /// Example:
   ///   map1: `(d0, d1)[s0, s1] -> (d0 + 1 + s1, d1 - 1 - s0)`
   ///   map2: `(d0)[s0] -> (d0 + s0, d0 - s0))`
   ///   map1.compose(map2):
   ///     `(d0)[s0, s1, s2] -> (d0 + s1 + s2 + 1, d0 - s0 - s2 - 1)`
-  // TODO(ntv): support composition of bounded maps when we have a need for it.
   AffineMap compose(AffineMap map);
+
+  /// Returns true if the AffineMap represents a subset (i.e. a projection) of a
+  /// symbol-less permutation map.
+  bool isProjectedPermutation();
+
+  /// Returns true if the AffineMap represents a symbol-less permutation map.
+  bool isPermutation();
+
+  /// Returns the map consisting of the `resultPos` subset.
+  AffineMap getSubMap(ArrayRef<unsigned> resultPos);
 
   friend ::llvm::hash_code hash_value(AffineMap arg);
 
 private:
   ImplType *map;
+
+  static AffineMap getImpl(unsigned dimCount, unsigned symbolCount,
+                           ArrayRef<AffineExpr> results, MLIRContext *context);
 };
 
 // Make AffineExpr hashable.
@@ -150,10 +157,73 @@ inline ::llvm::hash_code hash_value(AffineMap arg) {
   return ::llvm::hash_value(arg.map);
 }
 
-/// Simplify an affine map by simplifying its underlying AffineExpr results and
-/// sizes.
+/// Simplify an affine map by simplifying its underlying AffineExpr results.
 AffineMap simplifyAffineMap(AffineMap map);
 
+/// Returns a map of codomain to domain dimensions such that the first codomain
+/// dimension for a particular domain dimension is selected.
+/// Returns an empty map if the input map is empty or if `map` is not invertible
+/// (i.e. `map` does not contain a subset that is a permutation of full domain
+/// rank).
+///
+/// Prerequisites:
+///   1. `map` has no symbols.
+///
+/// Example 1:
+///
+/// ```{.mlir}
+///    (d0, d1, d2) -> (d1, d1, d0, d2, d1, d2, d1, d0)
+///                      0       2   3
+/// ```
+///
+/// returns:
+///
+/// ```{.mlir}
+///    (d0, d1, d2, d3, d4, d5, d6, d7) -> (d2, d0, d3)
+/// ```
+///
+/// Example 2:
+///
+/// ```{.mlir}
+///    (d0, d1, d2) -> (d1, d0 + d1, d0, d2, d1, d2, d1, d0)
+///                      0            2   3
+/// ```
+///
+/// returns:
+///
+/// ```{.mlir}
+///    (d0, d1, d2, d3, d4, d5, d6, d7) -> (d2, d0, d3)
+/// ```
+AffineMap inversePermutation(AffineMap map);
+
+/// Concatenates a list of `maps` into a single AffineMap, stepping over
+/// potentially empty maps. Assumes each of the underlying map has 0 symbols.
+/// The resulting map has a number of dims equal to the max of `maps`' dims and
+/// the concatenated results as its results.
+/// Returns an empty map if all input `maps` are empty.
+///
+/// Example:
+/// When applied to the following list of 3 affine maps,
+///
+/// ```{.mlir}
+///    {
+///      (i, j, k) -> (i, k),
+///      (i, j, k) -> (k, j),
+///      (i, j, k) -> (i, j)
+///    }
+/// ```
+///
+/// Returns the map:
+///
+/// ```{.mlir}
+///     (i, j, k) -> (i, k, k, j, i, j)
+/// ```
+AffineMap concatAffineMaps(llvm::ArrayRef<AffineMap> maps);
+
+inline raw_ostream &operator<<(raw_ostream &os, AffineMap map) {
+  map.print(os);
+  return os;
+}
 } // end namespace mlir
 
 namespace llvm {

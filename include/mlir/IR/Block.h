@@ -1,4 +1,4 @@
-//===- Block.h - MLIR Block and Region Classes ------------------*- C++ -*-===//
+//===- Block.h - MLIR Block Class -------------------------------*- C++ -*-===//
 //
 // Copyright 2019 The MLIR Authors.
 //
@@ -15,7 +15,7 @@
 // limitations under the License.
 // =============================================================================
 //
-// This file defines Block and Region classes.
+// This file defines the Block class.
 //
 //===----------------------------------------------------------------------===//
 
@@ -23,6 +23,7 @@
 #define MLIR_IR_BLOCK_H
 
 #include "mlir/IR/Value.h"
+#include "mlir/IR/Visitors.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
@@ -70,10 +71,6 @@ private:
 } // end namespace llvm
 
 namespace mlir {
-class BlockAndValueMapping;
-class Region;
-class Function;
-
 using BlockOperand = IROperandImpl<Block>;
 
 class PredecessorIterator;
@@ -97,22 +94,20 @@ public:
   }
 
   /// Blocks are maintained in a Region.
-  Region *getParent() { return parentValidInstOrderPair.getPointer(); }
+  Region *getParent();
 
-  /// Returns the closest surrounding operation that contains this block or
-  /// nullptr if this is a top-level block.
-  Operation *getContainingOp();
+  /// Returns the closest surrounding operation that contains this block.
+  Operation *getParentOp();
 
-  /// Returns the function that this block is part of, even if the block is
-  /// nested under an operation region.
-  Function *getFunction();
+  /// Return if this block is the entry block in the parent region.
+  bool isEntryBlock();
 
   /// Insert this block (which must not already be in a function) right before
   /// the specified block.
   void insertBefore(Block *block);
 
-  /// Unlink this Block from its Function and delete it.
-  void eraseFromFunction();
+  /// Unlink this Block from its parent region and delete it.
+  void erase();
 
   //===--------------------------------------------------------------------===//
   // Block argument management
@@ -138,8 +133,10 @@ public:
   /// Add one argument to the argument list for each type specified in the list.
   llvm::iterator_range<args_iterator> addArguments(ArrayRef<Type> types);
 
-  /// Erase the argument at 'index' and remove it from the argument list.
-  void eraseArgument(unsigned index);
+  /// Erase the argument at 'index' and remove it from the argument list. If
+  /// 'updatePredTerms' is set to true, this argument is also removed from the
+  /// terminators of each predecessor to this block.
+  void eraseArgument(unsigned index, bool updatePredTerms = true);
 
   unsigned getNumArguments() { return arguments.size(); }
   BlockArgument *getArgument(unsigned i) { return arguments[i]; }
@@ -186,14 +183,10 @@ public:
 
   /// Returns true if the ordering of the child operations is valid, false
   /// otherwise.
-  bool isInstOrderValid() { return parentValidInstOrderPair.getInt(); }
+  bool isInstOrderValid();
 
   /// Invalidates the current ordering of operations.
-  void invalidateInstOrder() {
-    // Validate the current ordering.
-    assert(!verifyInstOrder());
-    parentValidInstOrderPair.setInt(false);
-  }
+  void invalidateInstOrder();
 
   /// Verifies the current ordering of child operations matches the
   /// validInstOrder flag. Returns false if the order is valid, true otherwise.
@@ -201,6 +194,56 @@ public:
 
   /// Recomputes the ordering of child operations within the block.
   void recomputeInstOrder();
+
+private:
+  /// A utility iterator that filters out operations that are not 'OpT'.
+  template <typename OpT>
+  class op_filter_iterator
+      : public llvm::filter_iterator<Block::iterator, bool (*)(Operation &)> {
+    static bool filter(Operation &op) { return llvm::isa<OpT>(op); }
+
+  public:
+    op_filter_iterator(Block::iterator it, Block::iterator end)
+        : llvm::filter_iterator<Block::iterator, bool (*)(Operation &)>(
+              it, end, &filter) {}
+
+    /// Allow implict conversion to the underlying block iterator.
+    operator Block::iterator() const { return this->wrapped(); }
+  };
+
+public:
+  /// This class provides iteration over the held instructions of a block for a
+  /// specific operation type.
+  template <typename OpT>
+  class op_iterator : public llvm::mapped_iterator<op_filter_iterator<OpT>,
+                                                   OpT (*)(Operation &)> {
+    static OpT unwrap(Operation &op) { return llvm::cast<OpT>(op); }
+
+  public:
+    using reference = OpT;
+
+    /// Initializes the iterator to the specified filter iterator.
+    op_iterator(op_filter_iterator<OpT> it)
+        : llvm::mapped_iterator<op_filter_iterator<OpT>, OpT (*)(Operation &)>(
+              it, &unwrap) {}
+
+    /// Allow implict conversion to the underlying block iterator.
+    operator Block::iterator() const { return this->wrapped(); }
+  };
+
+  /// Return an iterator range over the operations within this block that are of
+  /// 'OpT'.
+  template <typename OpT> llvm::iterator_range<op_iterator<OpT>> getOps() {
+    auto endIt = end();
+    return {op_filter_iterator<OpT>(begin(), endIt),
+            op_filter_iterator<OpT>(endIt, endIt)};
+  }
+  template <typename OpT> op_iterator<OpT> op_begin() {
+    return op_filter_iterator<OpT>(begin(), end());
+  }
+  template <typename OpT> op_iterator<OpT> op_end() {
+    return op_filter_iterator<OpT>(end(), end());
+  }
 
   //===--------------------------------------------------------------------===//
   // Terminator management
@@ -247,12 +290,35 @@ public:
 
   /// Walk the operations in this block in postorder, calling the callback for
   /// each operation.
-  void walk(const std::function<void(Operation *)> &callback);
+  /// See Operation::walk for more details.
+  template <typename FnT, typename RetT = detail::walkResultType<FnT>>
+  RetT walk(FnT &&callback) {
+    return walk(begin(), end(), std::forward<FnT>(callback));
+  }
 
   /// Walk the operations in the specified [begin, end) range of this block in
-  /// postorder, calling the callback for each operation.
-  void walk(Block::iterator begin, Block::iterator end,
-            const std::function<void(Operation *)> &callback);
+  /// postorder, calling the callback for each operation. This method is invoked
+  /// for void return callbacks.
+  /// See Operation::walk for more details.
+  template <typename FnT, typename RetT = detail::walkResultType<FnT>>
+  typename std::enable_if<std::is_same<RetT, void>::value, RetT>::type
+  walk(Block::iterator begin, Block::iterator end, FnT &&callback) {
+    for (auto &op : llvm::make_early_inc_range(llvm::make_range(begin, end)))
+      detail::walkOperations(&op, callback);
+  }
+
+  /// Walk the operations in the specified [begin, end) range of this block in
+  /// postorder, calling the callback for each operation. This method is invoked
+  /// for interruptible callbacks.
+  /// See Operation::walk for more details.
+  template <typename FnT, typename RetT = detail::walkResultType<FnT>>
+  typename std::enable_if<std::is_same<RetT, WalkResult>::value, RetT>::type
+  walk(Block::iterator begin, Block::iterator end, FnT &&callback) {
+    for (auto &op : llvm::make_early_inc_range(llvm::make_range(begin, end)))
+      if (detail::walkOperations(&op, callback).wasInterrupted())
+        return WalkResult::interrupt();
+    return WalkResult::advance();
+  }
 
   //===--------------------------------------------------------------------===//
   // Other
@@ -322,111 +388,36 @@ struct ilist_traits<::mlir::Block> : public ilist_alloc_traits<::mlir::Block> {
                              block_iterator first, block_iterator last);
 
 private:
-  mlir::Region *getContainingRegion();
+  mlir::Region *getParentRegion();
 };
 } // end namespace llvm
 
 namespace mlir {
-
-/// This class contains a list of basic blocks and has a notion of the object it
-/// is part of - a Function or an operation region.
-class Region {
-public:
-  explicit Region(Function *container = nullptr);
-  explicit Region(Operation *container);
-  ~Region();
-
-  using RegionType = llvm::iplist<Block>;
-  RegionType &getBlocks() { return blocks; }
-
-  // Iteration over the block in the function.
-  using iterator = RegionType::iterator;
-  using reverse_iterator = RegionType::reverse_iterator;
-
-  iterator begin() { return blocks.begin(); }
-  iterator end() { return blocks.end(); }
-  reverse_iterator rbegin() { return blocks.rbegin(); }
-  reverse_iterator rend() { return blocks.rend(); }
-
-  bool empty() { return blocks.empty(); }
-  void push_back(Block *block) { blocks.push_back(block); }
-  void push_front(Block *block) { blocks.push_front(block); }
-
-  Block &back() { return blocks.back(); }
-  Block &front() { return blocks.front(); }
-
-  /// getSublistAccess() - Returns pointer to member of region.
-  static RegionType Region::*getSublistAccess(Block *) {
-    return &Region::blocks;
-  }
-
-  /// A Region is either a function body or a part of an operation.  If it is
-  /// part of an operation, then return the operation, otherwise return null.
-  Operation *getContainingOp();
-
-  /// A Region is either a function body or a part of an operation.  If it is
-  /// a Function body, then return this function, otherwise return null.
-  Function *getContainingFunction();
-
-  /// Clone the internal blocks from this region into dest. Any
-  /// cloned blocks are appended to the back of dest. If the mapper
-  /// contains entries for block arguments, these arguments are not included
-  /// in the respective cloned block.
-  void cloneInto(Region *dest, BlockAndValueMapping &mapper,
-                 MLIRContext *context);
-
-  /// Takes body of another region (that region will have no body after this
-  /// operation completes).  The current body of this region is cleared.
-  void takeBody(Region &other) {
-    blocks.clear();
-    blocks.splice(blocks.end(), other.getBlocks());
-  }
-
-private:
-  RegionType blocks;
-
-  /// This is the object we are part of.
-  llvm::PointerUnion<Function *, Operation *> container;
-};
-
 //===----------------------------------------------------------------------===//
 // Predecessors
 //===----------------------------------------------------------------------===//
 
-/// Implement a predecessor iterator as a forward iterator.  This works by
-/// walking the use lists of the blocks.  The entries on this list are the
-/// BlockOperands that are embedded into terminator operations.  From the
-/// operand, we can get the terminator that contains it, and it's parent block
-/// is the predecessor.
-class PredecessorIterator
-    : public llvm::iterator_facade_base<PredecessorIterator,
-                                        std::forward_iterator_tag, Block *> {
+/// Implement a predecessor iterator for blocks. This works by walking the use
+/// lists of the blocks. The entries on this list are the BlockOperands that
+/// are embedded into terminator operations. From the operand, we can get the
+/// terminator that contains it, and its parent block is the predecessor.
+class PredecessorIterator final
+    : public llvm::mapped_iterator<ValueUseIterator<BlockOperand>,
+                                   Block *(*)(BlockOperand &)> {
+  static Block *unwrap(BlockOperand &value);
+
 public:
-  PredecessorIterator(BlockOperand *firstOperand)
-      : bbUseIterator(firstOperand) {}
+  using reference = Block *;
 
-  PredecessorIterator &operator=(const PredecessorIterator &rhs) {
-    bbUseIterator = rhs.bbUseIterator;
-    return *this;
-  }
-
-  bool operator==(const PredecessorIterator &rhs) const {
-    return bbUseIterator == rhs.bbUseIterator;
-  }
-
-  Block *operator*() const;
-
-  PredecessorIterator &operator++() {
-    ++bbUseIterator;
-    return *this;
-  }
+  /// Initializes the operand type iterator to the specified operand iterator.
+  PredecessorIterator(ValueUseIterator<BlockOperand> it)
+      : llvm::mapped_iterator<ValueUseIterator<BlockOperand>,
+                              Block *(*)(BlockOperand &)>(it, &unwrap) {}
+  explicit PredecessorIterator(BlockOperand *operand)
+      : PredecessorIterator(ValueUseIterator<BlockOperand>(operand)) {}
 
   /// Get the successor number in the predecessor terminator.
   unsigned getSuccessorIndex() const;
-
-private:
-  using BBUseIterator = ValueUseIterator<BlockOperand>;
-  BBUseIterator bbUseIterator;
 };
 
 inline auto Block::pred_begin() -> pred_iterator {
@@ -447,12 +438,13 @@ inline auto Block::getPredecessors() -> llvm::iterator_range<pred_iterator> {
 
 /// This template implements the successor iterators for Block.
 class SuccessorIterator final
-    : public IndexedAccessorIterator<SuccessorIterator, Block, Block> {
+    : public indexed_accessor_iterator<SuccessorIterator, Block *, Block *,
+                                       Block *, Block *> {
 public:
   /// Initializes the result iterator to the specified index.
   SuccessorIterator(Block *object, unsigned index)
-      : IndexedAccessorIterator<SuccessorIterator, Block, Block>(object,
-                                                                 index) {}
+      : indexed_accessor_iterator<SuccessorIterator, Block *, Block *, Block *,
+                                  Block *>(object, index) {}
 
   SuccessorIterator(const SuccessorIterator &other)
       : SuccessorIterator(other.object, other.index) {}

@@ -17,6 +17,7 @@
 
 #include "mlir/Pass/AnalysisManager.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Function.h"
 #include "gtest/gtest.h"
 
 using namespace mlir;
@@ -25,32 +26,31 @@ using namespace mlir::detail;
 namespace {
 /// Minimal class definitions for two analyses.
 struct MyAnalysis {
-  MyAnalysis(Function *) {}
-  MyAnalysis(Module *) {}
+  MyAnalysis(Operation *) {}
 };
 struct OtherAnalysis {
-  OtherAnalysis(Function *) {}
-  OtherAnalysis(Module *) {}
+  OtherAnalysis(Operation *) {}
 };
 
 TEST(AnalysisManagerTest, FineGrainModuleAnalysisPreservation) {
   MLIRContext context;
 
   // Test fine grain invalidation of the module analysis manager.
-  std::unique_ptr<Module> module(new Module(&context));
-  ModuleAnalysisManager mam(&*module, /*passInstrumentor=*/nullptr);
+  OwningModuleRef module(ModuleOp::create(UnknownLoc::get(&context)));
+  ModuleAnalysisManager mam(*module, /*passInstrumentor=*/nullptr);
+  AnalysisManager am = mam;
 
   // Query two different analyses, but only preserve one before invalidating.
-  mam.getAnalysis<MyAnalysis>();
-  mam.getAnalysis<OtherAnalysis>();
+  am.getAnalysis<MyAnalysis>();
+  am.getAnalysis<OtherAnalysis>();
 
   detail::PreservedAnalyses pa;
   pa.preserve<MyAnalysis>();
-  mam.invalidate(pa);
+  am.invalidate(pa);
 
   // Check that only MyAnalysis is preserved.
-  EXPECT_TRUE(mam.getCachedAnalysis<MyAnalysis>().hasValue());
-  EXPECT_FALSE(mam.getCachedAnalysis<OtherAnalysis>().hasValue());
+  EXPECT_TRUE(am.getCachedAnalysis<MyAnalysis>().hasValue());
+  EXPECT_FALSE(am.getCachedAnalysis<OtherAnalysis>().hasValue());
 }
 
 TEST(AnalysisManagerTest, FineGrainFunctionAnalysisPreservation) {
@@ -58,15 +58,16 @@ TEST(AnalysisManagerTest, FineGrainFunctionAnalysisPreservation) {
   Builder builder(&context);
 
   // Create a function and a module.
-  std::unique_ptr<Module> module(new Module(&context));
-  Function *func1 =
-      new Function(builder.getUnknownLoc(), "foo",
-                   builder.getFunctionType(llvm::None, llvm::None));
-  module->getFunctions().push_back(func1);
+  OwningModuleRef module(ModuleOp::create(UnknownLoc::get(&context)));
+  FuncOp func1 =
+      FuncOp::create(builder.getUnknownLoc(), "foo",
+                     builder.getFunctionType(llvm::None, llvm::None));
+  module->push_back(func1);
 
   // Test fine grain invalidation of the function analysis manager.
-  ModuleAnalysisManager mam(&*module, /*passInstrumentor=*/nullptr);
-  FunctionAnalysisManager fam = mam.slice(func1);
+  ModuleAnalysisManager mam(*module, /*passInstrumentor=*/nullptr);
+  AnalysisManager am = mam;
+  AnalysisManager fam = am.slice(func1);
 
   // Query two different analyses, but only preserve one before invalidating.
   fam.getAnalysis<MyAnalysis>();
@@ -86,27 +87,31 @@ TEST(AnalysisManagerTest, FineGrainChildFunctionAnalysisPreservation) {
   Builder builder(&context);
 
   // Create a function and a module.
-  std::unique_ptr<Module> module(new Module(&context));
-  Function *func1 =
-      new Function(builder.getUnknownLoc(), "foo",
-                   builder.getFunctionType(llvm::None, llvm::None));
-  module->getFunctions().push_back(func1);
+  OwningModuleRef module(ModuleOp::create(UnknownLoc::get(&context)));
+  FuncOp func1 =
+      FuncOp::create(builder.getUnknownLoc(), "foo",
+                     builder.getFunctionType(llvm::None, llvm::None));
+  module->push_back(func1);
 
   // Test fine grain invalidation of a function analysis from within a module
   // analysis manager.
-  ModuleAnalysisManager mam(&*module, /*passInstrumentor=*/nullptr);
+  ModuleAnalysisManager mam(*module, /*passInstrumentor=*/nullptr);
+  AnalysisManager am = mam;
+
+  // Check that the analysis cache is initially empty.
+  EXPECT_FALSE(am.getCachedChildAnalysis<MyAnalysis>(func1).hasValue());
 
   // Query two different analyses, but only preserve one before invalidating.
-  mam.getFunctionAnalysis<MyAnalysis>(func1);
-  mam.getFunctionAnalysis<OtherAnalysis>(func1);
+  am.getChildAnalysis<MyAnalysis>(func1);
+  am.getChildAnalysis<OtherAnalysis>(func1);
 
   detail::PreservedAnalyses pa;
   pa.preserve<MyAnalysis>();
-  mam.invalidate(pa);
+  am.invalidate(pa);
 
   // Check that only MyAnalysis is preserved.
-  EXPECT_TRUE(mam.getCachedFunctionAnalysis<MyAnalysis>(func1).hasValue());
-  EXPECT_FALSE(mam.getCachedFunctionAnalysis<OtherAnalysis>(func1).hasValue());
+  EXPECT_TRUE(am.getCachedChildAnalysis<MyAnalysis>(func1).hasValue());
+  EXPECT_FALSE(am.getCachedChildAnalysis<OtherAnalysis>(func1).hasValue());
 }
 
 } // end namespace

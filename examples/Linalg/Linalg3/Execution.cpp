@@ -37,25 +37,26 @@ using namespace linalg;
 using namespace linalg::common;
 using namespace linalg::intrinsics;
 
-Function *makeFunctionWithAMatmulOp(Module &module, StringRef name) {
+FuncOp makeFunctionWithAMatmulOp(ModuleOp module, StringRef name) {
   MLIRContext *context = module.getContext();
   auto dynamic2DMemRefType = floatMemRefType<2>(context);
-  mlir::Function *f = linalg::common::makeFunction(
+  mlir::FuncOp f = linalg::common::makeFunction(
       module, name,
       {dynamic2DMemRefType, dynamic2DMemRefType, dynamic2DMemRefType}, {});
 
-  ScopedContext scope(f);
+  mlir::OpBuilder builder(f.getBody());
+  ScopedContext scope(builder, f.getLoc());
   // clang-format off
   ValueHandle
-    M = dim(f->getArgument(0), 0),
-    N = dim(f->getArgument(2), 1),
-    K = dim(f->getArgument(0), 1),
+    M = dim(f.getArgument(0), 0),
+    N = dim(f.getArgument(2), 1),
+    K = dim(f.getArgument(0), 1),
     rM = range(constant_index(0), M, constant_index(1)),
     rN = range(constant_index(0), N, constant_index(1)),
     rK = range(constant_index(0), K, constant_index(1)),
-    vA = view(f->getArgument(0), {rM, rK}),
-    vB = view(f->getArgument(1), {rK, rN}),
-    vC = view(f->getArgument(2), {rM, rN});
+    vA = view(f.getArgument(0), {rM, rK}),
+    vB = view(f.getArgument(1), {rK, rN}),
+    vC = view(f.getArgument(2), {rM, rN});
   matmul(vA, vB, vC);
   ret();
   // clang-format on
@@ -108,16 +109,14 @@ TEST_FUNC(execution) {
   // linalg.matmul operation and lower it all the way down to the LLVM IR
   // dialect through partial conversions.
   MLIRContext context;
-  Module module(&context);
-  mlir::Function *f = makeFunctionWithAMatmulOp(module, "matmul_as_loops");
+  OwningModuleRef module = ModuleOp::create(UnknownLoc::get(&context));
+  mlir::FuncOp f = makeFunctionWithAMatmulOp(*module, "matmul_as_loops");
   lowerToLoops(f);
-  convertLinalg3ToLLVM(module);
+  convertLinalg3ToLLVM(*module);
 
-  // Create an MLIR execution engine.  Note that it takes a null pass manager
-  // to make sure it won't run "default" passes on the MLIR that would trigger
-  // a second conversion to LLVM IR.  The execution engine eagerly JIT-compiles
+  // Create an MLIR execution engine. The execution engine eagerly JIT-compiles
   // the module.
-  auto maybeEngine = mlir::ExecutionEngine::create(&module, /*pm=*/nullptr);
+  auto maybeEngine = mlir::ExecutionEngine::create(*module);
   assert(maybeEngine && "failed to construct an execution engine");
   auto &engine = maybeEngine.get();
 

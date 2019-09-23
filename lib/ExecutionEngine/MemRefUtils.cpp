@@ -41,7 +41,7 @@ allocMemRefDescriptor(Type type, bool allocateData = true,
   auto memRefType = type.dyn_cast<MemRefType>();
   if (!memRefType)
     return make_string_error("non-memref argument not supported");
-  if (memRefType.getNumDynamicDims() != 0)
+  if (!memRefType.hasStaticShape())
     return make_string_error("memref with dynamic shapes not supported");
 
   auto elementType = memRefType.getElementType();
@@ -67,10 +67,10 @@ allocMemRefDescriptor(Type type, bool allocateData = true,
 }
 
 llvm::Expected<SmallVector<void *, 8>>
-mlir::allocateMemRefArguments(Function *func, float initialValue) {
+mlir::allocateMemRefArguments(FuncOp func, float initialValue) {
   SmallVector<void *, 8> args;
-  args.reserve(func->getNumArguments());
-  for (const auto &arg : func->getArguments()) {
+  args.reserve(func.getNumArguments());
+  for (const auto &arg : func.getArguments()) {
     auto descriptor =
         allocMemRefDescriptor(arg->getType(),
                               /*allocateData=*/true, initialValue);
@@ -79,10 +79,10 @@ mlir::allocateMemRefArguments(Function *func, float initialValue) {
     args.push_back(*descriptor);
   }
 
-  if (func->getType().getNumResults() > 1)
+  if (func.getType().getNumResults() > 1)
     return make_string_error("functions with more than 1 result not supported");
 
-  for (Type resType : func->getType().getResults()) {
+  for (Type resType : func.getType().getResults()) {
     auto descriptor = allocMemRefDescriptor(resType, /*allocateData=*/false);
     if (!descriptor)
       return descriptor.takeError();

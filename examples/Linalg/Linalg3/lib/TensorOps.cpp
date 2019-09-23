@@ -46,9 +46,9 @@ SmallVector<AffineMap, 8> linalg::DotOp::loopsToOperandRangeMaps() {
   auto d0 = getAffineDimExpr(0, context); // K
   // A(K), B(K), C()
   //   (d0) -> (d0, d0)(%k)
-  return SmallVector<AffineMap, 8>{AffineMap::get(1, 0, {d0}, {}), // A(K)
-                                   AffineMap::get(1, 0, {d0}, {}), // B(K)
-                                   AffineMap()};                   // C()
+  return SmallVector<AffineMap, 8>{AffineMap::get(1, 0, {d0}), // A(K)
+                                   AffineMap::get(1, 0, {d0}), // B(K)
+                                   AffineMap()};               // C()
 }
 
 void linalg::DotOp::emitScalarImplementation(
@@ -62,8 +62,10 @@ void linalg::DotOp::emitScalarImplementation(
   using edsc::op::operator*;
   using edsc::op::operator==;
   using edsc::intrinsics::select;
-  ScopedContext scope( // account for affine.terminator in loop.
-      FuncBuilder(body, std::prev(body->end(), 1)), innermostLoop.getLoc());
+
+  // Account for affine.terminator in loop.
+  OpBuilder builder(body, std::prev(body->end(), 1));
+  ScopedContext scope(builder, innermostLoop.getLoc());
   FloatType fTy = getOperand(0)
                       ->getType()
                       .cast<ViewType>()
@@ -90,10 +92,9 @@ SmallVector<AffineMap, 8> linalg::MatvecOp::loopsToOperandRangeMaps() {
   auto d1 = getAffineDimExpr(1, context); // K
   // A(M, K), B(K), C(M)
   //   (d0, d1) -> (d0, d1, d1, d0)(%m, %k)
-  return SmallVector<AffineMap, 8>{
-      AffineMap::get(2, 0, {d0, d1}, {}), // A(M, K)
-      AffineMap::get(2, 0, {d1}, {}),     // B(K)
-      AffineMap::get(2, 0, {d0}, {})};    // C(M)
+  return SmallVector<AffineMap, 8>{AffineMap::get(2, 0, {d0, d1}), // A(M, K)
+                                   AffineMap::get(2, 0, {d1}),     // B(K)
+                                   AffineMap::get(2, 0, {d0})};    // C(M)
 }
 
 // The body expression for matvec is: C(i) = scalarC + A(i, r_j) * B(r_j)
@@ -103,21 +104,19 @@ void linalg::MatvecOp::writeAsFinerGrainTensorContraction() {
   auto *op = getOperation();
   auto *vA(getInputView(0)), *vB(getInputView(1)), *vC(getOutputView(0));
   auto indexingPosPair = getViewRootIndexing(vA, 0);
-  assert(indexingPosPair.first->getDefiningOp() &&
-         indexingPosPair.first->getDefiningOp()->isa<RangeOp>());
+  assert(
+      llvm::isa_and_nonnull<RangeOp>(indexingPosPair.first->getDefiningOp()));
   // clang-format off
-  ScopedContext scope(FuncBuilder(op), op->getLoc());
+  OpBuilder builder(op);
+  ScopedContext scope(builder, op->getLoc());
   IndexHandle i;
   using linalg::common::LoopNestRangeBuilder;
-  LoopNestRangeBuilder(&i, ValueHandle(indexingPosPair.first))({
+  LoopNestRangeBuilder(&i, ValueHandle(indexingPosPair.first))(
     [&i, &vA, &vB, &vC]() {
       ValueHandle sliceA = slice(vA, i, 0);
       ValueHandle sliceC = slice(vC, i, 0);
       dot(sliceA, vB, sliceC);
-      /// NestedBuilders expect handles, we thus return an IndexHandle.
-      return IndexHandle();
-    }()
-  });
+    });
   // clang-format on
 }
 
@@ -132,8 +131,9 @@ void linalg::MatvecOp::emitScalarImplementation(
   using edsc::op::operator*;
   using edsc::op::operator==;
   using edsc::intrinsics::select;
-  ScopedContext scope( // account for affine.terminator in loop.
-      FuncBuilder(body, std::prev(body->end(), 1)), innermostLoop.getLoc());
+  // Account for affine.terminator in loop.
+  OpBuilder builder(body, std::prev(body->end(), 1));
+  ScopedContext scope(builder, innermostLoop.getLoc());
   FloatType fTy = getOperand(0)
                       ->getType()
                       .cast<ViewType>()
@@ -162,9 +162,9 @@ SmallVector<AffineMap, 8> linalg::MatmulOp::loopsToOperandRangeMaps() {
   // A(M, K), B(K, N), C(M, N):
   //   (d0, d1, d2) -> (d0, d2, d2, d1, d0, d1)(%m, %n, %k)
   return SmallVector<AffineMap, 8>{
-      AffineMap::get(3, 0, {d0, d2}, {}), // A(M, K)
-      AffineMap::get(3, 0, {d2, d1}, {}), // B(K, N)
-      AffineMap::get(3, 0, {d0, d1}, {})  // C(M, N)
+      AffineMap::get(3, 0, {d0, d2}), // A(M, K)
+      AffineMap::get(3, 0, {d2, d1}), // B(K, N)
+      AffineMap::get(3, 0, {d0, d1})  // C(M, N)
   };
 }
 
@@ -177,20 +177,18 @@ void linalg::MatmulOp::writeAsFinerGrainTensorContraction() {
   auto *op = getOperation();
   auto *vA(getInputView(0)), *vB(getInputView(1)), *vC(getOutputView(0));
   auto indexingPosPair = getViewRootIndexing(vB, 1);
-  assert(indexingPosPair.first->getDefiningOp() &&
-         indexingPosPair.first->getDefiningOp()->isa<RangeOp>());
+  assert(
+      llvm::isa_and_nonnull<RangeOp>(indexingPosPair.first->getDefiningOp()));
   using linalg::common::LoopNestRangeBuilder;
   // clang-format off
-  ScopedContext scope(FuncBuilder(op), op->getLoc());
+  OpBuilder builder(op);
+  ScopedContext scope(builder, op->getLoc());
   IndexHandle j;
-  LoopNestRangeBuilder(&j, ValueHandle(indexingPosPair.first))({
+  LoopNestRangeBuilder(&j, ValueHandle(indexingPosPair.first))(
     [&j, &vA, &vB, &vC]() {
       ValueHandle sliceB = slice(vB, j, 1);
       ValueHandle sliceC = slice(vC, j, 1);
       matvec(vA, sliceB, sliceC);
-      /// NestedBuilders expect handles, we thus return an IndexHandle.
-      return IndexHandle();
-    }()
   });
   // clang-format on
 }
@@ -206,8 +204,9 @@ void linalg::MatmulOp::emitScalarImplementation(
   using edsc::op::operator*;
   using edsc::op::operator==;
   using edsc::intrinsics::select;
-  ScopedContext scope( // account for affine.terminator in loop.
-      FuncBuilder(body, std::prev(body->end(), 1)), innermostLoop.getLoc());
+  // Account for affine.terminator in loop.
+  OpBuilder builder(body, std::prev(body->end(), 1));
+  ScopedContext scope(builder, innermostLoop.getLoc());
   FloatType fTy = getOperand(0)
                       ->getType()
                       .cast<ViewType>()

@@ -22,19 +22,19 @@
 #ifndef MLIR_IR_OPERATION_H
 #define MLIR_IR_OPERATION_H
 
-#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Block.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/IR/Region.h"
 #include "llvm/ADT/Twine.h"
-#include "llvm/ADT/ilist.h"
-#include "llvm/ADT/ilist_node.h"
 
 namespace mlir {
 class BlockAndValueMapping;
 class Location;
 class MLIRContext;
 class OperandIterator;
-class OperationState;
+class OperandTypeIterator;
+struct OperationState;
 class ResultIterator;
 class ResultTypeIterator;
 
@@ -56,7 +56,7 @@ public:
                            ArrayRef<Type> resultTypes,
                            ArrayRef<NamedAttribute> attributes,
                            ArrayRef<Block *> successors, unsigned numRegions,
-                           bool resizableOperandList, MLIRContext *context);
+                           bool resizableOperandList);
 
   /// Overload of create that takes an existing NamedAttributeList to avoid
   /// unnecessarily uniquing a list of attributes.
@@ -65,7 +65,7 @@ public:
                            ArrayRef<Type> resultTypes,
                            const NamedAttributeList &attributes,
                            ArrayRef<Block *> successors, unsigned numRegions,
-                           bool resizableOperandList, MLIRContext *context);
+                           bool resizableOperandList);
 
   /// Create a new Operation from the fields stored in `state`.
   static Operation *create(const OperationState &state);
@@ -79,6 +79,10 @@ public:
     return getName().getAbstractOperation();
   }
 
+  /// Returns true if this operation has a registered operation description,
+  /// otherwise false.
+  bool isRegistered() { return getAbstractOperation(); }
+
   /// Remove this operation from its parent block and delete it.
   void erase();
 
@@ -87,15 +91,20 @@ public:
   /// them alone if no entry is present).  Replaces references to cloned
   /// sub-operations to the corresponding operation that is copied, and adds
   /// those mappings to the map.
-  Operation *clone(BlockAndValueMapping &mapper, MLIRContext *context);
-  Operation *clone(MLIRContext *context);
+  Operation *clone(BlockAndValueMapping &mapper);
+  Operation *clone();
 
-  /// Create a deep copy of this operation but keep the operation regions empty.
+  /// Create a partial copy of this operation without traversing into attached
+  /// regions. The new operation will have the same number of regions as the
+  /// original one, but they will be left empty.
   /// Operands are remapped using `mapper` (if present), and `mapper` is updated
   /// to contain the results.
-  Operation *cloneWithoutRegions(BlockAndValueMapping &mapper,
-                                 MLIRContext *context);
-  Operation *cloneWithoutRegions(MLIRContext *context);
+  Operation *cloneWithoutRegions(BlockAndValueMapping &mapper);
+
+  /// Create a partial copy of this operation without traversing into attached
+  /// regions. The new operation will have the same number of regions as the
+  /// original one, but they will be left empty.
+  Operation *cloneWithoutRegions();
 
   /// Returns the operation block that contains this operation.
   Block *getBlock() { return block; }
@@ -113,14 +122,55 @@ public:
   /// Set the source location the operation was defined or derived from.
   void setLoc(Location loc) { location = loc; }
 
+  /// Returns the region to which the instruction belongs. Returns nullptr if
+  /// the instruction is unlinked.
+  Region *getParentRegion();
+
   /// Returns the closest surrounding operation that contains this operation
   /// or nullptr if this is a top-level operation.
   Operation *getParentOp();
 
-  /// Returns the function that this operation is part of.
-  /// The function is determined by traversing the chain of parent operations.
-  /// Returns nullptr if the operation is unlinked.
-  Function *getFunction();
+  /// Return the closest surrounding parent operation that is of type 'OpTy'.
+  template <typename OpTy> OpTy getParentOfType() {
+    auto *op = this;
+    while ((op = op->getParentOp()))
+      if (auto parentOp = llvm::dyn_cast<OpTy>(op))
+        return parentOp;
+    return OpTy();
+  }
+
+  /// Return true if this operation is a proper ancestor of the `other`
+  /// operation.
+  bool isProperAncestor(Operation *other);
+
+  /// Return true if this operation is an ancestor of the `other` operation. An
+  /// operation is considered as its own ancestor, use `isProperAncestor` to
+  /// avoid this.
+  bool isAncestor(Operation *other) {
+    return this == other || isProperAncestor(other);
+  }
+
+  /// Replace any uses of 'from' with 'to' within this operation.
+  void replaceUsesOfWith(Value *from, Value *to);
+
+  /// Replace all uses of results of this operation with the provided 'values'.
+  template <typename ValuesT,
+            typename = decltype(std::declval<ValuesT>().begin())>
+  void replaceAllUsesWith(ValuesT &&values) {
+    assert(std::distance(values.begin(), values.end()) == getNumResults() &&
+           "expected 'values' to correspond 1-1 with the number of results");
+
+    auto valueIt = values.begin();
+    for (unsigned i = 0, e = getNumResults(); i != e; ++i)
+      getResult(i)->replaceAllUsesWith(*(valueIt++));
+  }
+
+  /// Replace all uses of results of this operation with results of 'op'.
+  void replaceAllUsesWith(Operation *op) {
+    assert(getNumResults() == op->getNumResults());
+    for (unsigned i = 0, e = getNumResults(); i != e; ++i)
+      getResult(i)->replaceAllUsesWith(op->getResult(i));
+  }
 
   /// Destroys this operation and its subclass data.
   void destroy();
@@ -184,11 +234,21 @@ public:
   /// Returns an iterator on the underlying Value's (Value *).
   operand_range getOperands();
 
+  /// Erase the operand at position `idx`.
+  void eraseOperand(unsigned idx) { getOperandStorage().eraseOperand(idx); }
+
   MutableArrayRef<OpOperand> getOpOperands() {
     return getOperandStorage().getOperands();
   }
 
   OpOperand &getOpOperand(unsigned idx) { return getOpOperands()[idx]; }
+
+  // Support operand type iteration.
+  using operand_type_iterator = OperandTypeIterator;
+  using operand_type_range = llvm::iterator_range<operand_type_iterator>;
+  operand_type_iterator operand_type_begin();
+  operand_type_iterator operand_type_end();
+  operand_type_range getOperandTypes();
 
   //===--------------------------------------------------------------------===//
   // Results
@@ -203,9 +263,12 @@ public:
 
   // Support result iteration.
   using result_iterator = ResultIterator;
+  using result_range = llvm::iterator_range<result_iterator>;
+
   result_iterator result_begin();
   result_iterator result_end();
-  llvm::iterator_range<result_iterator> getResults();
+
+  result_range getResults();
 
   MutableArrayRef<OpResult> getOpResults() {
     return {getTrailingObjects<OpResult>(), numResults};
@@ -215,9 +278,10 @@ public:
 
   // Support result type iteration.
   using result_type_iterator = ResultTypeIterator;
+  using result_type_range = llvm::iterator_range<result_type_iterator>;
   result_type_iterator result_type_begin();
   result_type_iterator result_type_end();
-  llvm::iterator_range<result_type_iterator> getResultTypes();
+  result_type_range getResultTypes();
 
   //===--------------------------------------------------------------------===//
   // Attributes
@@ -229,6 +293,14 @@ public:
 
   /// Return all of the attributes on this operation.
   ArrayRef<NamedAttribute> getAttrs() { return attrs.getAttrs(); }
+
+  /// Return the internal attribute list on this operation.
+  NamedAttributeList &getAttrList() { return attrs; }
+
+  /// Set the attribute list on this operation.
+  /// Using a NamedAttributeList is more efficient as it does not require new
+  /// uniquing in the MLIRContext.
+  void setAttrs(NamedAttributeList newAttrs) { attrs = newAttrs; }
 
   /// Return the specified attribute if present, null otherwise.
   Attribute getAttr(Identifier name) { return attrs.get(name); }
@@ -244,9 +316,7 @@ public:
 
   /// If the an attribute exists with the specified name, change it to the new
   /// value.  Otherwise, add a new attribute with the specified name/value.
-  void setAttr(Identifier name, Attribute value) {
-    attrs.set(getContext(), name, value);
-  }
+  void setAttr(Identifier name, Attribute value) { attrs.set(name, value); }
   void setAttr(StringRef name, Attribute value) {
     setAttr(Identifier::get(name, getContext()), value);
   }
@@ -254,7 +324,52 @@ public:
   /// Remove the attribute with the specified name if it exists.  The return
   /// value indicates whether the attribute was present or not.
   NamedAttributeList::RemoveResult removeAttr(Identifier name) {
-    return attrs.remove(getContext(), name);
+    return attrs.remove(name);
+  }
+
+  /// A utility iterator that filters out non-dialect attributes.
+  class dialect_attr_iterator
+      : public llvm::filter_iterator<ArrayRef<NamedAttribute>::iterator,
+                                     bool (*)(NamedAttribute)> {
+    static bool filter(NamedAttribute attr) {
+      // Dialect attributes are prefixed by the dialect name, like operations.
+      return attr.first.strref().count('.');
+    }
+
+    explicit dialect_attr_iterator(ArrayRef<NamedAttribute>::iterator it,
+                                   ArrayRef<NamedAttribute>::iterator end)
+        : llvm::filter_iterator<ArrayRef<NamedAttribute>::iterator,
+                                bool (*)(NamedAttribute)>(it, end, &filter) {}
+
+    // Allow access to the constructor.
+    friend Operation;
+  };
+  using dialect_attr_range = llvm::iterator_range<dialect_attr_iterator>;
+
+  /// Return a range corresponding to the dialect attributes for this operation.
+  dialect_attr_range getDialectAttrs() {
+    auto attrs = getAttrs();
+    return {dialect_attr_iterator(attrs.begin(), attrs.end()),
+            dialect_attr_iterator(attrs.end(), attrs.end())};
+  }
+  dialect_attr_iterator dialect_attr_begin() {
+    auto attrs = getAttrs();
+    return dialect_attr_iterator(attrs.begin(), attrs.end());
+  }
+  dialect_attr_iterator dialect_attr_end() {
+    auto attrs = getAttrs();
+    return dialect_attr_iterator(attrs.end(), attrs.end());
+  }
+
+  /// Set the dialect attributes for this operation, and preserve all dependent.
+  template <typename DialectAttrT>
+  void setDialectAttrs(DialectAttrT &&dialectAttrs) {
+    SmallVector<NamedAttribute, 16> attrs;
+    attrs.assign(std::begin(dialectAttrs), std::end(dialectAttrs));
+    for (auto attr : getAttrs())
+      if (!attr.first.strref().count('.'))
+        attrs.push_back(attr);
+    setAttrs(llvm::makeArrayRef(attrs));
   }
 
   //===--------------------------------------------------------------------===//
@@ -295,6 +410,7 @@ public:
     return getOperand(getSuccessorOperandIndex(succIndex) + opIndex);
   }
 
+  bool hasSuccessors() { return numSuccs != 0; }
   unsigned getNumSuccessors() { return numSuccs; }
   unsigned getNumSuccessorOperands(unsigned index) {
     assert(!isKnownNonTerminator() && "only terminators may have successors");
@@ -365,55 +481,51 @@ public:
     return getTerminatorStatus() == TerminatorStatus::NonTerminator;
   }
 
-  /// Attempt to constant fold this operation with the specified constant
-  /// operand values - the elements in "operands" will correspond directly to
-  /// the operands of the operation, but may be null if non-constant.  If
-  /// constant folding is successful, this fills in the `results` vector.  If
-  /// not, `results` is unspecified.
-  LogicalResult constantFold(ArrayRef<Attribute> operands,
-                             SmallVectorImpl<Attribute> &results);
-
-  /// Attempt to fold this operation using the Op's registered foldHook.
-  LogicalResult fold(SmallVectorImpl<Value *> &results);
-
-  //===--------------------------------------------------------------------===//
-  // Conversions to declared operations like DimOp
-  //===--------------------------------------------------------------------===//
-
-  /// The dyn_cast methods perform a dynamic cast from an Operation to a typed
-  /// Op like DimOp.  This returns a null Op on failure.
-  template <typename OpClass> OpClass dyn_cast() {
-    if (isa<OpClass>())
-      return cast<OpClass>();
-    return OpClass();
+  /// Returns if the operation is known to be completely isolated from enclosing
+  /// regions, i.e. no internal regions reference values defined above this
+  /// operation.
+  bool isKnownIsolatedFromAbove() {
+    if (auto *absOp = getAbstractOperation())
+      return absOp->hasProperty(OperationProperty::IsolatedFromAbove);
+    return false;
   }
 
-  /// The cast methods perform a cast from an Operation to a typed Op like
-  /// DimOp.  This aborts if the parameter to the template isn't an instance of
-  /// the template type argument.
-  template <typename OpClass> OpClass cast() {
-    assert(isa<OpClass>() && "cast<Ty>() argument of incompatible type!");
-    return OpClass(this);
-  }
+  /// Attempt to fold this operation with the specified constant operand values
+  /// - the elements in "operands" will correspond directly to the operands of
+  /// the operation, but may be null if non-constant. If folding is successful,
+  /// this fills in the `results` vector. If not, `results` is unspecified.
+  LogicalResult fold(ArrayRef<Attribute> operands,
+                     SmallVectorImpl<OpFoldResult> &results);
 
-  /// The is methods return true if the operation is a typed op (like DimOp) of
-  /// of the given class.
-  template <typename OpClass> bool isa() { return OpClass::isClassFor(this); }
+  /// Returns if the operation was registered with a particular trait, e.g.
+  /// hasTrait<OperandsAreIntegerLike>().
+  template <template <typename T> class Trait> bool hasTrait() {
+    auto *absOp = getAbstractOperation();
+    return absOp ? absOp->hasTrait<Trait>() : false;
+  }
 
   //===--------------------------------------------------------------------===//
   // Operation Walkers
   //===--------------------------------------------------------------------===//
 
-  /// Walk this operation in postorder, calling the callback for each operation
-  /// including this one.
-  void walk(const std::function<void(Operation *)> &callback);
-
-  /// Specialization of walk to only visit operations of 'OpTy'.
-  template <typename OpTy> void walk(std::function<void(OpTy)> callback) {
-    walk([&](Operation *op) {
-      if (auto derivedOp = op->dyn_cast<OpTy>())
-        callback(derivedOp);
-    });
+  /// Walk the operation in postorder, calling the callback for each nested
+  /// operation(including this one). The callback method can take any of the
+  /// following forms:
+  ///   void(Operation*) : Walk all operations opaquely.
+  ///     * op->walk([](Operation *nestedOp) { ...});
+  ///   void(OpT) : Walk all operations of the given derived type.
+  ///     * op->walk([](ReturnOp returnOp) { ...});
+  ///   WalkResult(Operation*|OpT) : Walk operations, but allow for
+  ///                                interruption/cancellation.
+  ///     * op->walk([](... op) {
+  ///         // Interrupt, i.e cancel, the walk based on some invariant.
+  ///         if (some_invariant)
+  ///           return WalkResult::interrupt();
+  ///         return WalkResult::advance();
+  ///       });
+  template <typename FnT, typename RetT = detail::walkResultType<FnT>>
+  RetT walk(FnT &&callback) {
+    return detail::walkOperations(this, std::forward<FnT>(callback));
   }
 
   //===--------------------------------------------------------------------===//
@@ -421,27 +533,25 @@ public:
   //===--------------------------------------------------------------------===//
 
   /// Emit an error with the op name prefixed, like "'dim' op " which is
-  /// convenient for verifiers.  This function always returns failure.
-  LogicalResult emitOpError(const Twine &message);
+  /// convenient for verifiers.
+  InFlightDiagnostic emitOpError(const Twine &message = {});
 
   /// Emit an error about fatal conditions with this operation, reporting up to
-  /// any diagnostic handlers that may be listening.  This function always
-  /// returns failure.  NOTE: This may terminate the containing application,
-  /// only use when the IR is in an inconsistent state.
-  LogicalResult emitError(const Twine &message);
+  /// any diagnostic handlers that may be listening.
+  InFlightDiagnostic emitError(const Twine &message = {});
 
   /// Emit a warning about this operation, reporting up to any diagnostic
   /// handlers that may be listening.
-  void emitWarning(const Twine &message);
+  InFlightDiagnostic emitWarning(const Twine &message = {});
 
-  /// Emit a note about this operation, reporting up to any diagnostic
+  /// Emit a remark about this operation, reporting up to any diagnostic
   /// handlers that may be listening.
-  void emitNote(const Twine &message);
+  InFlightDiagnostic emitRemark(const Twine &message = {});
 
 private:
   Operation(Location location, OperationName name, unsigned numResults,
             unsigned numSuccessors, unsigned numRegions,
-            const NamedAttributeList &attributes, MLIRContext *context);
+            const NamedAttributeList &attributes);
 
   // Operations are deleted through the destroy() member because they are
   // allocated with malloc.
@@ -452,8 +562,12 @@ private:
     return *getTrailingObjects<detail::OperandStorage>();
   }
 
-  // Provide a 'getParent' method for ilist_node_with_parent methods.
-  Block *getParent() { return getBlock(); }
+  /// Provide a 'getParent' method for ilist_node_with_parent methods.
+  /// We mark it as const function because ilist_node_with_parent specifically
+  /// requires a 'getParent() const' method. Once ilist_node removes this
+  /// constraint, we should drop the const to fit the rest of the MLIR const
+  /// model.
+  Block *getParent() const { return block; }
 
   /// The operation block that containts this operation.
   Block *block = nullptr;
@@ -504,14 +618,30 @@ inline raw_ostream &operator<<(raw_ostream &os, Operation &op) {
 /// This class implements the const/non-const operand iterators for the
 /// Operation class in terms of getOperand(idx).
 class OperandIterator final
-    : public IndexedAccessorIterator<OperandIterator, Operation, Value> {
+    : public indexed_accessor_iterator<OperandIterator, Operation *, Value *,
+                                       Value *, Value *> {
 public:
   /// Initializes the operand iterator to the specified operand index.
   OperandIterator(Operation *object, unsigned index)
-      : IndexedAccessorIterator<OperandIterator, Operation, Value>(object,
-                                                                   index) {}
+      : indexed_accessor_iterator<OperandIterator, Operation *, Value *,
+                                  Value *, Value *>(object, index) {}
 
   Value *operator*() const { return this->object->getOperand(this->index); }
+};
+
+/// This class implements the operand type iterators for the Operation
+/// class in terms of operand_iterator->getType().
+class OperandTypeIterator final
+    : public llvm::mapped_iterator<OperandIterator, Type (*)(Value *)> {
+  static Type unwrap(Value *value) { return value->getType(); }
+
+public:
+  using reference = Type;
+
+  /// Initializes the operand type iterator to the specified operand iterator.
+  OperandTypeIterator(OperandIterator it)
+      : llvm::mapped_iterator<OperandIterator, Type (*)(Value *)>(it, &unwrap) {
+  }
 };
 
 // Implement the inline operand iterator methods.
@@ -527,26 +657,28 @@ inline auto Operation::getOperands() -> operand_range {
   return {operand_begin(), operand_end()};
 }
 
-/// Provide dyn_cast_or_null functionality for Operation casts.
-template <typename T> T dyn_cast_or_null(Operation *op) {
-  return op ? op->dyn_cast<T>() : T();
+inline auto Operation::operand_type_begin() -> operand_type_iterator {
+  return operand_type_iterator(operand_begin());
 }
 
-/// Provide isa_and_nonnull functionality for Operation casts, i.e. if the
-/// operation is non-null and a class of 'T'.
-template <typename T> bool isa_and_nonnull(Operation *op) {
-  return op && op->isa<T>();
+inline auto Operation::operand_type_end() -> operand_type_iterator {
+  return operand_type_iterator(operand_end());
+}
+
+inline auto Operation::getOperandTypes() -> operand_type_range {
+  return {operand_type_begin(), operand_type_end()};
 }
 
 /// This class implements the result iterators for the Operation class
 /// in terms of getResult(idx).
 class ResultIterator final
-    : public IndexedAccessorIterator<ResultIterator, Operation, Value> {
+    : public indexed_accessor_iterator<ResultIterator, Operation *, Value *,
+                                       Value *, Value *> {
 public:
   /// Initializes the result iterator to the specified index.
   ResultIterator(Operation *object, unsigned index)
-      : IndexedAccessorIterator<ResultIterator, Operation, Value>(object,
-                                                                  index) {}
+      : indexed_accessor_iterator<ResultIterator, Operation *, Value *, Value *,
+                                  Value *>(object, index) {}
 
   Value *operator*() const { return this->object->getResult(this->index); }
 };
@@ -558,9 +690,38 @@ class ResultTypeIterator final
   static Type unwrap(Value *value) { return value->getType(); }
 
 public:
+  using reference = Type;
+
   /// Initializes the result type iterator to the specified result iterator.
   ResultTypeIterator(ResultIterator it)
       : llvm::mapped_iterator<ResultIterator, Type (*)(Value *)>(it, &unwrap) {}
+};
+
+/// This class implements use iterator for the Operation. This iterates over all
+/// uses of all results of an Operation.
+class UseIterator final
+    : public llvm::iterator_facade_base<UseIterator, std::forward_iterator_tag,
+                                        Operation *> {
+public:
+  /// Initialize UseIterator for op, specify end to return iterator to last use.
+  explicit UseIterator(Operation *op, bool end = false);
+
+  UseIterator &operator++();
+  Operation *operator->() { return use->getOwner(); }
+  Operation *operator*() { return use->getOwner(); }
+
+  bool operator==(const UseIterator &other) const;
+  bool operator!=(const UseIterator &other) const;
+
+private:
+  void skipOverResultsWithNoUsers();
+
+  /// The operation whose uses are being iterated over.
+  Operation *op;
+  /// The result of op whoses uses are being iterated over.
+  Operation::result_iterator res;
+  /// The use of the result.
+  Value::use_iterator use;
 };
 
 // Implement the inline result iterator methods.
@@ -584,11 +745,36 @@ inline auto Operation::result_type_end() -> result_type_iterator {
   return result_type_iterator(result_end());
 }
 
-inline auto Operation::getResultTypes()
-    -> llvm::iterator_range<result_type_iterator> {
+inline auto Operation::getResultTypes() -> result_type_range {
   return {result_type_begin(), result_type_end()};
 }
 
 } // end namespace mlir
+
+namespace llvm {
+/// Provide isa functionality for operation casts.
+template <typename T> struct isa_impl<T, ::mlir::Operation> {
+  static inline bool doit(const ::mlir::Operation &op) {
+    return T::classof(const_cast<::mlir::Operation *>(&op));
+  }
+};
+
+/// Provide specializations for operation casts as the resulting T is value
+/// typed.
+template <typename T> struct cast_retty_impl<T, ::mlir::Operation *> {
+  using ret_type = T;
+};
+template <typename T> struct cast_retty_impl<T, ::mlir::Operation> {
+  using ret_type = T;
+};
+template <class T>
+struct cast_convert_val<T, ::mlir::Operation, ::mlir::Operation> {
+  static T doit(::mlir::Operation &val) { return T(&val); }
+};
+template <class T>
+struct cast_convert_val<T, ::mlir::Operation *, ::mlir::Operation *> {
+  static T doit(::mlir::Operation *val) { return T(val); }
+};
+} // end namespace llvm
 
 #endif // MLIR_IR_OPERATION_H

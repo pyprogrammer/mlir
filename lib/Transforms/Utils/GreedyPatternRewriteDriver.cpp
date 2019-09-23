@@ -19,10 +19,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/StandardOps/Ops.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/StandardOps/Ops.h"
-#include "mlir/Transforms/ConstantFoldUtils.h"
+#include "mlir/Transforms/FoldUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -34,8 +34,7 @@ using namespace mlir;
 
 static llvm::cl::opt<unsigned> maxPatternMatchIterations(
     "mlir-max-pattern-match-iterations",
-    llvm::cl::desc(
-        "Max number of iterations scanning the functions for pattern match"),
+    llvm::cl::desc("Max number of iterations scanning for pattern match"),
     llvm::cl::init(10));
 
 namespace {
@@ -44,16 +43,15 @@ namespace {
 /// applies the locally optimal patterns in a roughly "bottom up" way.
 class GreedyPatternRewriteDriver : public PatternRewriter {
 public:
-  explicit GreedyPatternRewriteDriver(Function &fn,
-                                      OwningRewritePatternList &&patterns)
-      : PatternRewriter(fn.getContext()), matcher(std::move(patterns), *this),
-        builder(&fn) {
+  explicit GreedyPatternRewriteDriver(MLIRContext *ctx,
+                                      const OwningRewritePatternList &patterns)
+      : PatternRewriter(ctx), matcher(patterns), folder(ctx) {
     worklist.reserve(64);
   }
 
   /// Perform the rewrites. Return true if the rewrite converges in
   /// `maxIterations`.
-  bool simplifyFunction(unsigned maxIterations);
+  bool simplify(Operation *op, int maxIterations);
 
   void addToWorklist(Operation *op) {
     // Check to see if the worklist already contains this op.
@@ -89,7 +87,7 @@ protected:
   // Implement the hook for creating operations, and make sure that newly
   // created ops are added to the worklist for processing.
   Operation *createOperation(const OperationState &state) override {
-    auto *result = builder.createOperation(state);
+    auto *result = OpBuilder::createOperation(state);
     addToWorklist(result);
     return result;
   }
@@ -98,7 +96,10 @@ protected:
   // worklist anymore because we'd get dangling references to it.
   void notifyOperationRemoved(Operation *op) override {
     addToWorklist(op->getOperands());
-    removeFromWorklist(op);
+    op->walk([this](Operation *operation) {
+      removeFromWorklist(operation);
+      folder.notifyRemoval(operation);
+    });
   }
 
   // When the root of a pattern is about to be replaced, it can trigger
@@ -106,9 +107,8 @@ protected:
   // before the root is changed.
   void notifyRootReplaced(Operation *op) override {
     for (auto *result : op->getResults())
-      // TODO: Add a result->getUsers() iterator.
-      for (auto &user : result->getUses())
-        addToWorklist(user.getOwner());
+      for (auto *user : result->getUsers())
+        addToWorklist(user);
   }
 
 private:
@@ -133,28 +133,29 @@ private:
   /// The low-level pattern matcher.
   RewritePatternMatcher matcher;
 
-  /// This builder is used to create new operations.
-  FuncBuilder builder;
-
   /// The worklist for this transformation keeps track of the operations that
   /// need to be revisited, plus their index in the worklist.  This allows us to
-  /// efficiently remove operations from the worklist when they are erased from
-  /// the function, even if they aren't the root of a pattern.
+  /// efficiently remove operations from the worklist when they are erased, even
+  /// if they aren't the root of a pattern.
   std::vector<Operation *> worklist;
   DenseMap<Operation *, unsigned> worklistMap;
+
+  /// Non-pattern based folder for operations.
+  OperationFolder folder;
 };
-}; // end anonymous namespace
+} // end anonymous namespace
 
 /// Perform the rewrites.
-bool GreedyPatternRewriteDriver::simplifyFunction(unsigned maxIterations) {
-  Function *fn = builder.getFunction();
-  ConstantFoldHelper helper(fn);
+bool GreedyPatternRewriteDriver::simplify(Operation *op, int maxIterations) {
+  // Add the given operation to the worklist.
+  auto collectOps = [this](Operation *op) { addToWorklist(op); };
 
   bool changed = false;
   int i = 0;
   do {
-    // Add all operations to the worklist.
-    fn->walk([&](Operation *op) { addToWorklist(op); });
+    // Add all nested operations to the worklist.
+    for (auto &region : op->getRegions())
+      region.walk(collectOps);
 
     // These are scratch vectors used in the folding loop below.
     SmallVector<Value *, 8> originalOperands, resultValues;
@@ -171,96 +172,65 @@ bool GreedyPatternRewriteDriver::simplifyFunction(unsigned maxIterations) {
       // If the operation has no side effects, and no users, then it is
       // trivially dead - remove it.
       if (op->hasNoSideEffect() && op->use_empty()) {
-        // Be careful to update bookkeeping in ConstantHelper to keep
-        // consistency if this is a constant op.
-        if (op->isa<ConstantOp>())
-          helper.notifyRemoval(op);
+        // Be careful to update bookkeeping.
+        notifyOperationRemoved(op);
         op->erase();
         continue;
       }
 
       // Collects all the operands and result uses of the given `op` into work
-      // list.
-      auto collectOperandsAndUses = [this](Operation *op) {
+      // list. Also remove `op` and nested ops from worklist.
+      originalOperands.assign(op->operand_begin(), op->operand_end());
+      auto preReplaceAction = [&](Operation *op) {
         // Add the operands to the worklist for visitation.
-        addToWorklist(op->getOperands());
+        addToWorklist(originalOperands);
+
         // Add all the users of the result to the worklist so we make sure
         // to revisit them.
-        //
-        // TODO: Add a result->getUsers() iterator.
-        for (unsigned i = 0, e = op->getNumResults(); i != e; ++i) {
-          for (auto &operand : op->getResult(i)->getUses())
-            addToWorklist(operand.getOwner());
-        }
+        for (auto *result : op->getResults())
+          for (auto *operand : result->getUsers())
+            addToWorklist(operand);
+
+        notifyOperationRemoved(op);
       };
 
-      // Try to constant fold this op.
-      if (helper.tryToConstantFold(op, collectOperandsAndUses)) {
-        assert(op->hasNoSideEffect() &&
-               "Constant folded op with side effects?");
-        op->erase();
-        changed |= true;
-        continue;
-      }
-
-      // Otherwise see if we can use the generic folder API to simplify the
-      // operation.
-      originalOperands.assign(op->operand_begin(), op->operand_end());
-      resultValues.clear();
-      if (succeeded(op->fold(resultValues))) {
-        // If the result was an in-place simplification (e.g. max(x,x,y) ->
-        // max(x,y)) then add the original operands to the worklist so we can
-        // make sure to revisit them.
-        if (resultValues.empty()) {
-          // Add the operands back to the worklist as there may be more
-          // canonicalization opportunities now.
-          addToWorklist(originalOperands);
-        } else {
-          // Otherwise, the operation is simplified away completely.
-          assert(resultValues.size() == op->getNumResults());
-
-          // Notify that we are replacing this operation.
-          notifyRootReplaced(op);
-
-          // Replace the result values and erase the operation.
-          for (unsigned i = 0, e = resultValues.size(); i != e; ++i) {
-            auto *res = op->getResult(i);
-            if (!res->use_empty())
-              res->replaceAllUsesWith(resultValues[i]);
-          }
-
-          notifyOperationRemoved(op);
-          op->erase();
-        }
+      // Try to fold this op.
+      if (succeeded(folder.tryToFold(op, collectOps, preReplaceAction))) {
         changed |= true;
         continue;
       }
 
       // Make sure that any new operations are inserted at this point.
-      builder.setInsertionPoint(op);
+      setInsertionPoint(op);
 
-      // Try to match one of the canonicalization patterns. The rewriter is
-      // automatically notified of any necessary changes, so there is nothing
-      // else to do here.
-      changed |= matcher.matchAndRewrite(op);
+      // Try to match one of the patterns. The rewriter is automatically
+      // notified of any necessary changes, so there is nothing else to do here.
+      changed |= matcher.matchAndRewrite(op, *this);
     }
   } while (changed && ++i < maxIterations);
   // Whether the rewrite converges, i.e. wasn't changed in the last iteration.
   return !changed;
 }
 
-/// Rewrite the specified function by repeatedly applying the highest benefit
-/// patterns in a greedy work-list driven manner. Return true if no more
-/// patterns can be matched in the result function.
+/// Rewrite the regions of the specified operation, which must be isolated from
+/// above, by repeatedly applying the highest benefit patterns in a greedy
+/// work-list driven manner. Return true if no more patterns can be matched in
+/// the result operation regions.
+/// Note: This does not apply patterns to the top-level operation itself.
 ///
-bool mlir::applyPatternsGreedily(Function &fn,
-                                 OwningRewritePatternList &&patterns) {
-  GreedyPatternRewriteDriver driver(fn, std::move(patterns));
-  bool converged = driver.simplifyFunction(maxPatternMatchIterations);
+bool mlir::applyPatternsGreedily(Operation *op,
+                                 const OwningRewritePatternList &patterns) {
+  // The top-level operation must be known to be isolated from above to
+  // prevent performing canonicalizations on operations defined at or above
+  // the region containing 'op'.
+  if (!op->isKnownIsolatedFromAbove())
+    return false;
+
+  GreedyPatternRewriteDriver driver(op->getContext(), patterns);
+  bool converged = driver.simplify(op, maxPatternMatchIterations);
   LLVM_DEBUG(if (!converged) {
-    llvm::dbgs()
-        << "The pattern rewrite doesn't converge after scanning the function "
-        << maxPatternMatchIterations << " times";
+    llvm::dbgs() << "The pattern rewrite doesn't converge after scanning "
+                 << maxPatternMatchIterations << " times";
   });
   return converged;
 }

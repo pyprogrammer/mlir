@@ -1,18 +1,29 @@
-set(LIBS
+add_llvm_executable(mlir-cpu-runner
+  mlir-cpu-runner.cpp
+)
+llvm_update_compile_flags(mlir-cpu-runner)
+whole_archive_link(mlir-cpu-runner
+  MLIRAffineOps
+  MLIRLLVMIR
+  MLIRStandardOps
+  MLIRTargetLLVMIR
+  MLIRTransforms
+  MLIRTranslation
+)
+target_link_libraries(mlir-cpu-runner PRIVATE
   MLIRAffineOps
   MLIRAnalysis
+  MLIRControlFlowToCFG
   MLIREDSC
   MLIRExecutionEngine
   MLIRIR
+  MLIRJitRunner
+  MLIRLLVMIR
   MLIRParser
+  MLIRTargetLLVMIR
   MLIRTransforms
+  MLIRStandardToLLVM
   MLIRSupport
   LLVMCore
   LLVMSupport
 )
-add_executable(mlir-cpu-runner
-  mlir-cpu-runner.cpp
-)
-llvm_update_compile_flags(mlir-cpu-runner)
-whole_archive_link(mlir-cpu-runner MLIRLLVMIR MLIRStandardOps MLIRTargetLLVMIR MLIRTransforms MLIRTranslation)
-target_link_libraries(mlir-cpu-runner MLIRIR ${LIBS})
